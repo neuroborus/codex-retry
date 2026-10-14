@@ -44,6 +44,100 @@ proc json_dump {value} {
     }
 }
 
+namespace eval resume {
+    variable armed 0
+    variable pending {}
+    variable failure ""
+}
+
+proc resume::reset {} {
+    variable armed; variable pending; variable failure
+    set armed 0
+    set pending {}
+    set failure ""
+}
+
+proc resume::reject {message} {
+    variable armed; variable failure
+    set armed 0
+    set failure $message
+    error $message
+}
+
+# Only the launch resume is overridden. Later settings and turns stay native-owned.
+proc resume::client {json} {
+    variable armed; variable pending; variable failure
+    if {$failure ne ""} { error $failure }
+    if {!$armed && $pending eq ""} { return $json }
+    set message [json::json2dict $json]
+    set method [field $message method]
+    if {$method eq ""} { return $json }
+    if {$armed && $method eq "thread/resume"} {
+        set armed 0
+        set object [::huddle::json2huddle $json]
+        if {[catch {
+            set id [huddle get $object id]
+            set thread [huddle get $object params threadId]
+            set valid [expr {[huddle type [huddle get $object params]] eq "dict" && \
+                [huddle type $id] in {string number} && \
+                [huddle type $thread] eq "string" && [huddle get_stripped $thread] ne ""}]
+        }] || !$valid} { reject "cannot identify the launch resume for --yolo" }
+        if {[dict exists $message params permissions] && \
+            [huddle type [huddle get $object params permissions]] ne "null"} {
+            reject "resume --yolo cannot be combined with a named permissions profile"
+        }
+        huddle set object params approvalPolicy [huddle string never]
+        huddle set object params sandbox [huddle string danger-full-access]
+        set pending [dict create rpcId [json_dump $id] threadId [huddle get_stripped $thread]]
+        return [json_dump $object]
+    }
+    if {[string match "turn/*" $method] || $method in {
+        review/start thread/shellCommand thread/compact/start thread/inject_items
+        thread/queue/add thread/queue/update thread/queue/start
+        thread/realtime/start thread/realtime/appendText
+        thread/realtime/appendAudio thread/realtime/appendSpeech
+        thread/goal/set thread/prediction/request
+        command/exec process/spawn process/writeStdin mcpServer/tool/call
+    }} { reject "work requested before resume --yolo permissions were confirmed" }
+    if {$method in {
+        thread/start thread/resume thread/fork thread/revert thread/archive
+        thread/delete thread/unsubscribe thread/settings/update
+    }} {
+        set armed 0
+        if {$pending ne ""} { reject "resume --yolo verification canceled by a manual thread or permission change" }
+    }
+    return $json
+}
+
+# A failure is latched before forwarding an error, so no callback can leak work.
+proc resume::acknowledge {object} {
+    variable pending; variable failure
+    if {[huddle exists $object error]} {
+        set message ""
+        catch {set message [huddle get_stripped $object error message]}
+        set failure "server rejected resume --yolo: $message"
+        return 1
+    }
+    if {[catch {
+        set result [huddle get $object result]
+        set thread [huddle get $result thread id]
+        set approval [huddle get $result approvalPolicy]
+        set sandbox [huddle get $result sandbox type]
+        set valid [expr {[huddle type $result] eq "dict" && \
+            [huddle type [huddle get $result thread]] eq "dict" && \
+            [huddle type $thread] eq "string" && \
+            [huddle get_stripped $thread] eq [dict get $pending threadId] && \
+            [huddle type $approval] eq "string" && [huddle get_stripped $approval] eq "never" && \
+            [huddle type [huddle get $result sandbox]] eq "dict" && \
+            [huddle type $sandbox] eq "string" && [huddle get_stripped $sandbox] eq "dangerFullAccess"}]
+    }] || !$valid} {
+        set failure "server did not confirm resume --yolo permissions for the requested thread"
+        return 0
+    }
+    set pending {}
+    return 1
+}
+
 proc retry::reset {} {
     variable current; variable timer; variable delay
     after cancel $timer
@@ -186,19 +280,32 @@ proc retry::response_id {json} {
     return ""
 }
 
-# Return false only for responses to our own requests; all events reach the TUI.
+# Hide internal replay replies and unconfirmed resume success; forward other traffic.
 proc retry::server {json} {
     variable current; variable internal; variable finished
     set id [response_id $json]
-    if {$id ne "" && ![dict exists $internal $id] && \
+    if {$id ne "" && $id ne [field $::resume::pending rpcId] && ![dict exists $internal $id] && \
         ($current eq "" || $id ne [field $current rpcId])} { return 1 }
     set message [json::json2dict $json]
     set method [field $message method]
     set response [expr {$method eq "" && [dict exists $message id] && \
         ([dict exists $message result] || [dict exists $message error])}]
-    if {$response} {
+    if {[dict exists $message id] && ($method eq "" || $::resume::pending ne "")} {
         set object [::huddle::json2huddle $json]
         set id [json_dump [huddle get $object id]]
+        if {$id eq [field $::resume::pending rpcId]} {
+            # Only a non-empty JSON string identifies a colliding server request.
+            set hasMethod [huddle exists $object method]
+            set serverRequest [expr {$hasMethod && [huddle type $object method] eq "string" && \
+                [huddle get_stripped $object method] ne ""}]
+            if {!$serverRequest} {
+                if {!$response || $hasMethod} {
+                    set ::resume::failure "malformed acknowledgement for resume --yolo"
+                    return 0
+                }
+                return [resume::acknowledge $object]
+            }
+        }
     }
     set visible [expr {!$response || ![dict exists $internal $id]}]
     if {$response} { dict unset internal $id }
@@ -284,10 +391,13 @@ proc backend_read {} {
     set channel $::backend
     set client $::client
     while {[gets $channel json] >= 0} {
-        if {[retry::server $json] && [websocket::send $client text $json] < 0} {
-            cleanup
+        set visible [retry::server $json]
+        set failure $::resume::failure
+        if {$visible && [websocket::send $client text $json] < 0} {
+            if {$failure ne ""} { bgerror $failure } else { cleanup }
             return
         }
+        if {$failure ne ""} { bgerror $failure; return }
         # Sending can synchronously close the connection and its backend.
         if {![info exists ::backend] || $::backend ne $channel || \
             ![info exists ::client] || $::client ne $client} { return }
@@ -295,6 +405,7 @@ proc backend_read {} {
     if {[eof $channel]} {
         fileevent $channel readable ""
         retry::reset
+        resume::reset
         catch {websocket::close $client}
     }
 }
@@ -310,7 +421,11 @@ proc connection {socket type message} {
                 foreach pending [array names ::handshakes] { drop_handshake $pending }
                 fileevent $::backend readable backend_read
             }
-            text { retry::client $message; backend_send $message }
+            text {
+                set message [resume::client $message]
+                retry::client $message
+                backend_send $message
+            }
             disconnect - close { cleanup }
             error - timeout { error $message }
         }
@@ -383,6 +498,7 @@ proc handshake {socket} {
 
 proc cleanup {} {
     retry::reset
+    resume::reset
     catch {close $::listener}
     unset -nocomplain ::listener
     foreach socket [array names ::handshakes] { drop_handshake $socket }
@@ -411,7 +527,7 @@ proc cleanup {} {
 
 proc bgerror {message} {
     set ::proxyError 1
-    puts stderr "codex-retry: $message"
+    catch {puts stderr "codex-retry: $message"}
     cleanup
     catch {exec kill -TERM $::tuiPid}
 }
@@ -421,6 +537,37 @@ proc resize {} {
         lassign [exec stty size <@stdin] rows columns
         stty rows $rows columns $columns < $::spawn_out(slave,name)
     }
+}
+
+# The interactive options that take one value. Attached values need no skipping.
+proc detached_value {argument} {
+    return [expr {$argument in {
+        -c --config --enable --disable -m --model --local-provider -p --profile
+        -s --sandbox -a --ask-for-approval -C --cd --add-dir -i --image
+        --remote --remote-auth-token-env
+    }}]
+}
+
+proc resume_arguments {arguments} {
+    set command ""
+    set flags {}
+    set conflicts {}
+    for {set i 0} {$i < [llength $arguments]} {incr i} {
+        set argument [lindex $arguments $i]
+        if {$argument eq "--"} { break }
+        if {$argument in {--yolo --dangerously-bypass-approvals-and-sandbox}} {
+            lappend flags $i
+        }
+        # 0.162.1 conflicts: explicit approval policy and automatic review aliases.
+        if {$argument in {--approve-for-me --not-so-yolo -a --ask-for-approval} || \
+            [regexp {^--ask-for-approval=|^-a.+} $argument]} { lappend conflicts $argument }
+        if {[detached_value $argument]} { incr i; continue }
+        if {$command eq "" && ![string match -* $argument]} { set command $argument }
+    }
+    if {$command ne "resume" || ![llength $flags]} { return [list $arguments 0] }
+    if {[llength $conflicts]} { error "resume --yolo conflicts with [join $conflicts {, }]" }
+    foreach index [lreverse $flags] { set arguments [lreplace $arguments $index $index] }
+    return [list $arguments 1]
 }
 
 proc backend_options {arguments} {
@@ -442,6 +589,8 @@ proc backend_options {arguments} {
             lappend options $argument $value
         } elseif {[regexp {^--(config|enable|disable)=|^-c.+} $argument]} {
             lappend options $argument
+        } elseif {[detached_value $argument]} {
+            incr i
         }
     }
     return $options
@@ -451,6 +600,9 @@ proc main {arguments} {
     global spawn_out
     package require websocket
     set options [backend_options $arguments]
+    lassign [resume_arguments $arguments] arguments yolo
+    resume::reset
+    set ::resume::armed $yolo
     set random [open /dev/urandom rb]
     set token [binary encode hex [read $random 16]]
     set retry::prefix "codex-retry-[binary encode hex [read $random 16]]"

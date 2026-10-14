@@ -51,16 +51,22 @@ proc begin {{acknowledge 1}} {
 # Large startup catalogs must not stall keyboard forwarding in the event loop.
 set catalogItem {{"name":"fixture","id":"fixture","nested":{"description":"sample \"text\" {} []","method":"fixture/request","enabled":true,"values":[1,2,3]}}}
 set catalog "{\"id\":99,\"result\":{\"items\":\[[join [lrepeat 30000 $catalogItem] ,]\]}}"
-foreach active {0 1} {
+foreach active {0 1 2} {
     retry::reset
-    if {$active} { begin 0 }
+    if {$active == 1} { begin 0 }
+    if {$active == 2} {
+        set resume::armed 1
+        resume::client {{"id":31,"method":"thread/resume","params":{"threadId":"t1"}}}
+    }
     set previous $retry::current
+    set previousResume $resume::pending
     set before [clock milliseconds]
     check {[retry::server $catalog] == 1} "an unrelated startup catalog was hidden"
     check {[clock milliseconds] - $before < 1000} "startup catalog processing stalled terminal input"
     if {$active} {
-        check {$retry::current eq $previous && [dict size $timers] == 0} "an unrelated response changed the tracked request"
+        check {$retry::current eq $previous && $resume::pending eq $previousResume && [dict size $timers] == 0} "an unrelated response changed the tracked request"
     }
+    resume::reset
 }
 unset catalog catalogItem
 
@@ -377,12 +383,215 @@ foreach arguments {{--remote ws://invalid} {--remote-auth-token-env=OTHER} {-c} 
     check {[catch {backend_options $arguments}]} "invalid wrapper options were accepted"
 }
 
+# Only actual resume flags are consumed; values and prompts remain native-owned.
+foreach {arguments expected yolo} {
+    {resume session --yolo} {resume session} 1
+    {--yolo resume --last} {resume --last} 1
+    {resume --last --dangerously-bypass-approvals-and-sandbox} {resume --last} 1
+    {--dangerously-bypass-approvals-and-sandbox resume session --yolo} {resume session} 1
+    {resume session {quoted prompt é} --yolo -c {model="with spaces"}}
+        {resume session {quoted prompt é} -c {model="with spaces"}} 1
+    {resume session --yolo -- --yolo resume} {resume session -- --yolo resume} 1
+    {resume --last} {resume --last} 0
+    {--yolo} {--yolo} 0
+    {--yolo {new prompt}} {--yolo {new prompt}} 0
+    {exec --yolo resume} {exec --yolo resume} 0
+    {{prompt} resume --yolo} {{prompt} resume --yolo} 0
+    {-- resume --yolo} {-- resume --yolo} 0
+    {--yolo -- resume} {--yolo -- resume} 0
+    {resume session -- --yolo} {resume session -- --yolo} 0
+    {resume session {a prompt containing --yolo and resume}}
+        {resume session {a prompt containing --yolo and resume}} 0
+    {resume --last --config=--yolo -mresume -C--yolo}
+        {resume --last --config=--yolo -mresume -C--yolo} 0
+    {resume --last -c -- --yolo} {resume --last -c --} 1
+} {
+    lassign [resume_arguments $arguments] actual enabled
+    check {$actual eq $expected && $enabled == $yolo} "resume flag ownership changed arguments: $arguments"
+}
+foreach option {-c --config --enable --disable -m --model --local-provider -p --profile
+    -s --sandbox -a --ask-for-approval -C --cd --add-dir -i --image} {
+    foreach value {resume --yolo --dangerously-bypass-approvals-and-sandbox} {
+        set arguments [list $option $value resume --last]
+        check {[resume_arguments $arguments] eq [list $arguments 0]} "an option value enabled YOLO: $option $value"
+    }
+}
+foreach arguments {
+    {resume --yolo -a never}
+    {--ask-for-approval=never --yolo resume --last}
+    {resume --last --dangerously-bypass-approvals-and-sandbox -anever}
+    {--approve-for-me resume --last --yolo}
+    {resume session --yolo --not-so-yolo}
+} {
+    check {[catch {resume_arguments $arguments} message] && [string match *conflicts* $message]} "consumption hid a native permission conflict"
+}
+check {[resume_arguments {resume --last -s read-only --yolo}] eq {{resume --last -s read-only} 1}} "an unrelated sandbox flag gained a speculative conflict"
+check {[resume_arguments {resume --last -c --approve-for-me --yolo}] eq {{resume --last -c --approve-for-me} 1}} "a value was mistaken for a conflicting flag"
+check {[resume_arguments {--yolo -a never}] eq {{--yolo -a never} 0}} "new-session conflicts stopped being native-owned"
+check {[backend_options {resume --last -m --remote -p --config -i -c --cd --enable -- --config=prompt}] eq {}} "backend extraction interpreted another option's value"
+
+set resumeRequest {{"id":31,"method":"thread/resume","params":{"threadId":"t1","approvalPolicy":"on-request","sandbox":"read-only","permissions":null,"config":{"sample":true},"initialTurnsPage":{"limit":3},"optional":null,"empty":[]}}}
+set resumeReply {{"id":31,"result":{"thread":{"id":"t1","turns":[]},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"activePermissionProfile":{"id":"fixture","extends":null}}}}
+proc arm_resume {} {
+    retry::reset
+    set ::retry::finished {}
+    resume::reset
+    set ::resume::armed 1
+}
+arm_resume
+set translated [::huddle::json2huddle [resume::client $resumeRequest]]
+set expected [::huddle::json2huddle $resumeRequest]
+huddle set expected params approvalPolicy [huddle string never]
+huddle set expected params sandbox [huddle string danger-full-access]
+check {[huddle equal $translated $expected]} "resume translation changed other parameters or JSON types"
+check {[retry::server [string map {31 {"31"}} $resumeReply]] == 1 && $resume::pending ne ""} "string and numeric resume IDs were conflated"
+check {[retry::server {{"id":"31","method":null,"result":{}}}] == 1 && $resume::pending ne "" && $resume::failure eq ""} "an invalid method on another typed ID failed resume verification"
+check {[retry::server {{"id":31,"method":"fixture/request","params":{}}}] == 1 && $resume::pending ne ""} "a server request consumed resume verification"
+foreach methodKey {{"method"} {"\u006dethod"}} {
+    foreach method {fixture/request null} {
+        set event [format {{"id":31,"result":{},%s:"%s","params":{}}} $methodKey $method]
+        check {[retry::server $event] == 1 && $resume::pending ne "" && $resume::failure eq ""} "a valid server request with a colliding resume ID was rejected"
+    }
+}
+check {[retry::server {{"id":31,"result":{"thread":{"id":"t1"},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}},"id":99}}] == 1 && $resume::pending ne ""} "a duplicate header ID confirmed the wrong resume"
+check {[resume::client {{"id":32,"method":"thread/read","params":{"threadId":"other"}}}] eq {{"id":32,"method":"thread/read","params":{"threadId":"other"}}}} "unrelated read traffic was intercepted"
+check {[retry::server $resumeReply] == 1 && $resume::pending eq ""} "effective YOLO permissions were not confirmed"
+check {[resume::client $resumeRequest] eq $resumeRequest} "YOLO was reapplied on a later resume"
+
+foreach id {31 {"31"} {"quoted\u0022id"}} {
+    foreach layout {
+        {{"id":%s,"result":{"thread":{"id":"t1"},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}}}}
+        {{"result":{"thread":{"id":"t1"},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}},"id":%s}}
+    } {
+        arm_resume
+        resume::client [format {{"id":%s,"method":"thread/resume","params":{"threadId":"t1"}}} $id]
+        check {[retry::server [format $layout $id]] == 1 && $resume::pending eq ""} "a typed resume ID or response layout lost verification"
+    }
+}
+foreach result {
+    {"thread":{"id":"other"},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}}
+    {"thread":{"id":"t1"},"approvalPolicy":"on-request","sandbox":{"type":"dangerFullAccess"}}
+    {"thread":{"id":"t1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}
+    {"thread":{"id":"t1"},"approvalPolicy":"never"}
+    {"thread":{"id":["t1"]},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}}
+    {"thread":{"id":"t1"},"approvalPolicy":["never"],"sandbox":{"type":"dangerFullAccess"}}
+    {"thread":{"id":"t1"},"approvalPolicy":"never","sandbox":{"type":["dangerFullAccess"]}}
+} {
+    arm_resume
+    resume::client $resumeRequest
+    check {[retry::server "\{\"id\":31,\"result\":\{$result\}\}"] == 0 && $resume::failure ne ""} "an invalid permission acknowledgement continued as success"
+    check {[catch {resume::client $request}]} "a failed permission acknowledgement allowed work"
+}
+foreach payload {{{}} null {"malformed"} {[]}} {
+    arm_resume
+    resume::client $resumeRequest
+    check {[retry::server [format {{"id":31,"result":%s}} $payload]] == 0 && $resume::failure ne ""} "a malformed resume result was accepted"
+}
+foreach response {
+    {"id":31}
+    {"id":31,"method":"","result":{}}
+} {
+    arm_resume
+    resume::client $resumeRequest
+    check {[retry::server "\{$response\}"] == 0 && $resume::failure ne ""} "a malformed reply envelope left verification active"
+}
+foreach methodKey {{"method"} {"\u006dethod"}} {
+    foreach invalidMethod {null true false 0 {[]} {["fixture/request"]} {{}} {{"nested":"fixture/request"}} {""}} {
+        arm_resume
+        resume::client $resumeRequest
+        set response [string map [list {,"result":} ",${methodKey}:${invalidMethod},\"result\":"] $resumeReply]
+        check {[retry::server $response] == 0 && $resume::failure ne ""} "a non-request method exposed an unverified resume result"
+        check {[catch {resume::client $request}]} "a malformed acknowledgement allowed subsequent work"
+    }
+}
+foreach parameters {
+    {"threadId":"t1","permissions":"named"}
+    {"threadId":"t1","permissions":""}
+    {"threadId":null}
+} {
+    arm_resume
+    check {[catch {resume::client "\{\"id\":31,\"method\":\"thread/resume\",\"params\":\{$parameters\}\}"}]} "a conflicting or unidentified resume was forwarded"
+    check {[catch {resume::client $request}]} "a rejected resume allowed subsequent work"
+}
+
+# Dispatch must record the actual forwarded turn, and never leak guarded work.
+rename bgerror native_bgerror
+proc bgerror {message} { lappend ::proxyFailures $message; retry::reset }
+set proxyFailures {}
+set prediction {{"id":42,"method":"thread/prediction/request","params":{"threadId":"t1","sourceTurnId":"fixture-turn"}}}
+foreach stage {armed waiting rejected} {
+    foreach method {turn/start review/start thread/shellCommand thread/queue/start thread/realtime/start
+        command/exec process/spawn mcpServer/tool/call thread/goal/set thread/prediction/request} {
+        arm_resume
+        if {$stage ne "armed"} { connection fixture text $resumeRequest }
+        if {$stage eq "rejected"} {
+            set rejection {{"id":31,"error":{"code":-32000,"message":"fixture rejection","data":{"detail":"original"}}}}
+            check {[retry::server $rejection] == 1} "native resume rejection was hidden"
+        }
+        set before [llength $sent]
+        set work [format {{"id":40,"method":"%s","params":{"threadId":"t1","input":[]}}} $method]
+        if {$method eq "thread/prediction/request"} { set work $prediction }
+        connection fixture text $work
+        check {[llength $sent] == $before && $retry::current eq ""} "unconfirmed permissions leaked work or a retry snapshot"
+    }
+}
+check {[llength $proxyFailures] == 30} "guarded work did not fail visibly"
+foreach mutation {
+    {"id":32,"method":"thread/start","params":{}}
+    {"id":32,"method":"thread/fork","params":{"threadId":"other"}}
+    {"id":32,"method":"thread/settings/update","params":{"threadId":"t1","approvalPolicy":"on-request"}}
+} {
+    arm_resume
+    set action "\{$mutation\}"
+    check {[resume::client $action] eq $action && !$resume::armed} "a manual change did not disarm launch YOLO"
+    check {[resume::client $resumeRequest] eq $resumeRequest} "a later thread inherited a canceled launch override"
+    arm_resume
+    connection fixture text $resumeRequest
+    set before [llength $sent]
+    connection fixture text $action
+    connection fixture text $request
+    check {[llength $sent] == $before} "a change during verification leaked unconfirmed work"
+}
+arm_resume
+connection fixture disconnect ""
+check {!$resume::armed && $resume::pending eq ""} "disconnect retained launch YOLO"
+
+arm_resume
+connection fixture text $resumeRequest
+check {[huddle equal [::huddle::json2huddle [lindex $sent end]] $expected]} "real dispatch did not translate the resume request"
+retry::server $resumeReply
+set before [llength $sent]
+connection fixture text $prediction
+check {[llength $sent] == $before + 1 && [lindex $sent end] eq $prediction} "confirmed resume blocked or changed a prediction request"
+set yoloTurn [::huddle::json2huddle $request]
+huddle set yoloTurn params approvalPolicy [huddle string never]
+huddle set yoloTurn params sandboxPolicy type [huddle string dangerFullAccess]
+set yoloTurn [json_dump $yoloTurn]
+connection fixture text $yoloTurn
+reply 7 turn1
+completed turn1
+fire
+check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] [huddle get [::huddle::json2huddle $yoloTurn] params]]} "YOLO overload replay changed effective permissions or input"
+connection fixture text {{"id":41,"method":"thread/settings/update","params":{"threadId":"t1","approvalPolicy":"on-request","sandboxPolicy":{"type":"readOnly"}}}}
+check {[dict size $timers] == 0} "manual permission changes retained an overload retry"
+connection fixture text $request
+check {[lindex $sent end] eq $request} "launch YOLO replaced subsequent manual turn permissions"
+reply 7 manual-turn
+completed manual-turn
+fire
+check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] [huddle get [::huddle::json2huddle $request] params]]} "manual permissions changed on overload replay"
+retry::reset
+resume::reset
+rename bgerror {}
+rename native_bgerror bgerror
+
 package require websocket
 
 # A send can remove both channels before buffered backend reads finish.
 rename websocket::send websocket::native_send
 proc websocket::send {socket type message} {
     lappend ::forwarded $message
+    if {$::sendMode eq "record"} { return 1 }
     if {$::sendMode ne "failed"} { connection $socket $::sendMode "" }
     return [expr {$::sendMode eq "close" ? 1 : -1}]
 }
@@ -402,6 +611,35 @@ foreach sendMode {failed close disconnect} {
     check {!$failed} "forwarding after disconnect accessed a removed channel: $message"
     check {$stopped && [llength $forwarded] == 1 && [dict size $timers] == 0} "failed forwarding left a connection or retry active"
 }
+rename bgerror native_bgerror
+proc bgerror {message} { lappend ::proxyFailures $message; cleanup }
+foreach outcome {confirmed rejected mismatch disconnected-rejection null-method} {
+    arm_resume
+    resume::client $resumeRequest
+    set sendMode record
+    switch $outcome {
+        confirmed { set response $resumeReply }
+        rejected { set response $rejection }
+        mismatch { set response [string map {dangerFullAccess readOnly} $resumeReply] }
+        disconnected-rejection { set response $rejection; set sendMode disconnect }
+        null-method { set response [string map {{,"result":} {,"method":null,"result":}} $resumeReply] }
+    }
+    set backend [file tempfile scratch]
+    puts $backend $response
+    seek $backend 0
+    set client fixture
+    set forwarded {}
+    set proxyFailures {}
+    backend_read
+    cleanup
+    file delete $scratch
+    set expectedForwarded {}
+    if {$outcome ni {mismatch null-method}} { set expectedForwarded [list $response] }
+    check {$forwarded eq $expectedForwarded} "resume routing altered an authoritative response or exposed unconfirmed success"
+    check {[llength $proxyFailures] == ($outcome ne "confirmed")} "resume verification failure did not halt visibly"
+}
+rename bgerror {}
+rename native_bgerror bgerror
 rename websocket::send {}
 rename websocket::native_send websocket::send
 
@@ -662,4 +900,195 @@ set env(PATH) $savedPath
 file delete -force $scratch
 check {!$failed} "fake TUI forwarding teardown failed: $message"
 
-puts "PASS: structured retry ordering, original input, backoff, cancellation, progress guards, IDs, arguments, authentication, and cleanup"
+# Exercise launch flag consumption and permission verification over the real proxy.
+set channel [file tempfile scratch]
+close $channel
+file delete $scratch
+file mkdir $scratch
+set channel [open [file join $scratch codex] w]
+puts $channel {#!/usr/bin/env tclsh}
+puts $channel {
+    package require json
+    package require websocket
+    fconfigure stdin -encoding utf-8 -translation lf
+    fconfigure stdout -encoding utf-8 -translation lf
+    set mode $env(YOLO_FIXTURE_MODE)
+    set effective $env(YOLO_FIXTURE_ENABLED)
+    set confirmation {{"id":31,"result":{"thread":{"id":"t1","turns":[]},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"activePermissionProfile":{"id":"server-profile","extends":"fixture-parent"}}}}
+    if {!$effective} { set confirmation [string map {never on-request dangerFullAccess readOnly} $confirmation] }
+    set turn {{"id":7,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"quoted \"input\" é"}],"approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}}}}
+    if {!$effective} { set turn [string map {never on-request dangerFullAccess readOnly} $turn] }
+    if {[lindex $argv 0] eq "app-server"} {
+        if {$argv ne {app-server --listen stdio:// -c {fixture="with spaces"} --enable fixture}} { exit 2 }
+        set log [open $env(YOLO_FIXTURE_LOG) w]
+        puts stderr "YOLO_BACKEND_PID=[pid]"
+        flush stderr
+        while {[gets stdin line] >= 0} {
+            puts $log $line
+            flush $log
+            set message [json::json2dict $line]
+            switch [dict get $message method] {
+                thread/resume {
+                    if {[dict get $message params threadId] eq "t1"} {
+                        set approval [expr {$effective ? "never" : "on-request"}]
+                        set sandbox [expr {$effective ? "danger-full-access" : "read-only"}]
+                        if {[dict get $message params approvalPolicy] ne $approval || \
+                            [dict get $message params sandbox] ne $sandbox || \
+                            [dict get $message params config] ne {sample true}} { exit 3 }
+                        switch $mode {
+                            rejection { puts {{"id":31,"error":{"code":-32000,"message":"fixture rejection","data":{"detail":"unchanged"}}}} }
+                            mismatch { puts [string map {dangerFullAccess readOnly} $confirmation] }
+                            malformed { puts {{"id":31,"result":{}}} }
+                            premature { continue }
+                            default { puts $confirmation }
+                        }
+                    } else {
+                        if {[dict get $message params approvalPolicy] ne "on-request" || \
+                            [dict get $message params sandbox] ne "read-only"} { exit 4 }
+                        puts {{"id":35,"result":{"thread":{"id":"other"},"approvalPolicy":"on-request","sandbox":{"type":"readOnly"}}}}
+                    }
+                }
+                turn/start {
+                    if {$line ne $turn} { exit 5 }
+                    puts {{"id":7,"result":{"turn":{"id":"fixture-turn","items":[]}}}}
+                }
+                thread/settings/update {
+                    if {[dict get $message params approvalPolicy] ne "on-request"} { exit 6 }
+                    puts {{"id":34,"result":{}}}
+                }
+                default { exit 8 }
+            }
+            flush stdout
+        }
+        exit
+    }
+    if {[lrange $argv 4 end] ne $env(YOLO_FIXTURE_ARGUMENTS)} { exit 9 }
+    set ready 0
+    proc receive {socket type message} {
+        if {$type eq "connect"} {
+            websocket::send $socket text {{"id":31,"method":"thread/resume","params":{"threadId":"t1","approvalPolicy":"on-request","sandbox":"read-only","config":{"sample":true},"permissions":null}}}
+            if {$::mode eq "premature"} { websocket::send $socket text $::turn }
+        }
+        if {$type ne "text"} { return }
+        set response [json::json2dict $message]
+        switch [dict get $response id] {
+            31 {
+                if {$::mode in {rejection mismatch malformed premature}} {
+                    # A rejected launch must not proceed even if the TUI tries recovery.
+                    websocket::send $socket text $::turn
+                    return
+                }
+                if {$message ne $::confirmation} { exit 10 }
+                websocket::send $socket text $::turn
+            }
+            7 {
+                websocket::send $socket text {{"id":34,"method":"thread/settings/update","params":{"threadId":"t1","approvalPolicy":"on-request","sandboxPolicy":{"type":"readOnly"}}}}
+                websocket::send $socket text {{"id":35,"method":"thread/resume","params":{"threadId":"other","approvalPolicy":"on-request","sandbox":"read-only"}}}
+            }
+            35 { set ::ready 1 }
+        }
+    }
+    websocket::open [lindex $argv 1] receive \
+        -headers [list Authorization "Bearer $env([lindex $argv 3])"] -timeout 2000
+    if {!$ready} { vwait ready }
+    puts YOLO_PROXY_OK
+    flush stdout
+    if {[gets stdin line] < 0 || $line ne "forwarded"} { exit 11 }
+    puts YOLO_INPUT_OK
+    flush stdout
+    exit 7
+}
+close $channel
+file attributes [file join $scratch codex] -permissions 0755
+set resumeDriver {
+    set wrapperSpawn $spawn_id
+    set wrapper [exp_pid]
+    set failed [catch {
+        expect {
+            -re {YOLO_BACKEND_PID=([0-9]+)} { set backend $expect_out(1,string) }
+            eof { error "resume backend exited during startup" }
+            timeout { error "resume backend startup timed out" }
+        }
+        if {$::failureText eq ""} {
+            expect {
+                -exact YOLO_PROXY_OK {}
+                eof { error "resume permission exchange failed" }
+                timeout { error "resume permission exchange timed out" }
+            }
+            send -- "forwarded\r"
+            expect {
+                -exact YOLO_INPUT_OK {}
+                eof { error "resume terminal forwarding failed" }
+                timeout { error "resume terminal forwarding timed out" }
+            }
+            set expectedStatus 7
+        } else {
+            expect {
+                -exact $::failureText {}
+                eof { error "guarded resume failed without visible guidance" }
+                timeout { error "guarded resume failure timed out" }
+            }
+            set expectedStatus 1
+        }
+        expect {
+            eof {}
+            timeout { error "resume wrapper exit timed out" }
+        }
+        set result [wait -i $wrapperSpawn]
+        if {[lindex $result 2] != 0 || [lindex $result 3] != $expectedStatus} {
+            error "resume exit status changed: $result"
+        }
+        if {![catch {exec kill -0 $backend}]} { error "resume backend survived cleanup" }
+    } message]
+    if {$failed} {
+        catch {exec kill -TERM $wrapper}
+        if {[info exists backend]} { catch {exec kill -TERM $backend} }
+        catch {expect -timeout 2 eof}
+        catch {exec kill -KILL $wrapper}
+        puts stderr $message
+        exit 1
+    }
+    exit 0
+}
+set env(PATH) "$scratch:$savedPath"
+set failed [catch {
+    foreach mode {session last alias ordinary rejection mismatch malformed premature} {
+        set env(YOLO_FIXTURE_MODE) $mode
+        set env(YOLO_FIXTURE_ENABLED) [expr {$mode ne "ordinary"}]
+        set env(YOLO_FIXTURE_LOG) [file join $scratch $mode.jsonl]
+        set launch {resume fixture-session --yolo}
+        set remaining {resume fixture-session}
+        switch $mode {
+            last { set launch {--yolo resume --last}; set remaining {resume --last} }
+            alias { set launch {resume fixture-session --dangerously-bypass-approvals-and-sandbox} }
+            ordinary { set launch $remaining }
+        }
+        set shared [list -c {fixture="with spaces"} --enable fixture]
+        set env(YOLO_FIXTURE_ARGUMENTS) [concat $remaining $shared]
+        set failureText ""
+        switch $mode {
+            rejection { set failureText "fixture rejection" }
+            mismatch - malformed { set failureText "did not confirm resume --yolo permissions" }
+            premature { set failureText "work requested before resume --yolo permissions were confirmed" }
+        }
+        set configuredDriver "set timeout 8\n[list set failureText $failureText]\n"
+        append configuredDriver "[list spawn -noecho $wrapper {*}$launch {*}$shared]\n$resumeDriver"
+        exec expect -c $configuredDriver 2>@1
+        set channel [open $env(YOLO_FIXTURE_LOG) r]
+        set messages [split [string trim [read $channel]] \n]
+        close $channel
+        set turns 0
+        foreach json $messages {
+            if {$json eq ""} { continue }
+            set message [json::json2dict $json]
+            if {[field $message method] eq "turn/start"} { incr turns }
+        }
+        check {$turns == ($failureText eq "")} "a guarded launch leaked work or an ordinary launch lost its turn"
+    }
+} message]
+set env(PATH) $savedPath
+unset -nocomplain env(YOLO_FIXTURE_MODE) env(YOLO_FIXTURE_ENABLED) env(YOLO_FIXTURE_LOG) env(YOLO_FIXTURE_ARGUMENTS)
+file delete -force $scratch
+check {!$failed} "fake resume launch/proxy check failed: $message"
+
+puts "PASS: structured retries, input/settings, backoff, cancellation, progress, IDs, arguments, resume permissions, proxy/PTY forwarding, authentication, and cleanup"
