@@ -481,6 +481,11 @@ proc main {arguments} {
     close -i $tuiSpawn
     unset ::tuiPid
     cleanup
+    # Optional guidance must preserve the TUI's exit status even if stderr fails.
+    catch {
+        puts stderr "codex-retry: private app-server stopped; native remote reconnect commands no longer apply."
+        puts stderr "codex-retry: reopen a saved session with ./codex-retry resume SESSION_ID or ./codex-retry resume --last."
+    }
     if {[info exists ::proxyError]} { return 1 }
     if {[lindex $result 2] != 0} { error "failed to wait for Codex: $result" }
     if {[lindex $result 4] eq "CHILDKILLED"} {

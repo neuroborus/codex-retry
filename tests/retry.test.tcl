@@ -584,13 +584,21 @@ append fixture {
         fileevent $::backend readable backend_read
         return $result
     }
+    rename wait native_wait
+    proc wait {args} {
+        set result [uplevel 1 [list native_wait {*}$args]]
+        # Model stderr becoming unavailable after the TUI exits.
+        if {$::closedStderr} { close stderr }
+        return $result
+    }
+    set terminalMode [exec stty -g <@stdin]
     set status [main {}]
     if {$forwarded != 1 || [info exists backend] || [info exists client] || \
         [info exists proxyError]} { error "forwarding teardown failed" }
+    if {[exec stty -g <@stdin] ne $terminalMode} { error "terminal mode was not restored" }
     exit $status
 }
-set driver "set timeout 10\nset stty_init {rows 24 columns 80}\n[list spawn -noecho expect -c $fixture]\n"
-append driver {
+set driver {
     set wrapperSpawn $spawn_id
     fconfigure $wrapperSpawn -encoding utf-8
     set wrapper [exp_pid]
@@ -643,7 +651,13 @@ append driver {
 }
 set savedPath $env(PATH)
 set env(PATH) "$scratch:$env(PATH)"
-set failed [catch {exec expect -c $driver 2>@1} message]
+foreach closedStderr {0 1} {
+    set configuredFixture "[list set closedStderr $closedStderr]\n$fixture"
+    set configuredDriver "set timeout 10\nset stty_init {rows 24 columns 80}\n"
+    append configuredDriver "[list spawn -noecho expect -c $configuredFixture]\n$driver"
+    set failed [catch {exec expect -c $configuredDriver 2>@1} message]
+    if {$failed} { break }
+}
 set env(PATH) $savedPath
 file delete -force $scratch
 check {!$failed} "fake TUI forwarding teardown failed: $message"

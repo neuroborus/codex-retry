@@ -20,6 +20,15 @@ Large unrelated startup replies use their request ID and envelope boundaries
 for routing without decoding the payload, keeping keyboard forwarding responsive.
 Other response layouts use the full JSON parser.
 
+The private app-server stops when the TUI exits or disconnects. The native TUI's
+remote reconnect commands and "running work continues" message assume a server
+that stays alive; that assumption does not apply to this wrapper. Reopen a saved
+session with `./codex-retry resume SESSION_ID` or `./codex-retry resume --last`.
+
+`CODEX_RETRY_TOKEN` names a temporary environment variable available to the child
+TUI, not a token value to paste into the command. It is not exported back to
+your shell, and displaying its value would not restore the stopped server.
+
 ## Arguments and compatibility
 
 The wrapper forwards your argument list unchanged to the native Codex TUI,
