@@ -16,6 +16,9 @@ The wrapper starts a private `codex app-server` process and relays its JSON-RPC
 traffic to the TUI through one authenticated loopback WebSocket connection.
 It never examines terminal text or types `continue`.
 Terminal input/output, window resizing, and TUI exit status pass through.
+Large unrelated startup replies use their request ID and envelope boundaries
+for routing without decoding the payload, keeping keyboard forwarding responsive.
+Other response layouts use the full JSON parser.
 
 ## Arguments and compatibility
 

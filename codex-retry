@@ -154,14 +154,48 @@ proc retry::fire {} {
     backend_send [json_dump $request]
 }
 
+# Recognize App Server's two-field replies without decoding large catalogs.
+# Strings are opaque; check container boundaries so later envelope fields
+# (including method or a duplicate ID) always use the full Tcllib parser.
+proc retry::response_id {json} {
+    if {![regexp {^[ \t\r\n]*\{[ \t\r\n]*"id"[ \t\r\n]*:[ \t\r\n]*("(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4}))*"|-?(?:0|[1-9][0-9]*))[ \t\r\n]*,[ \t\r\n]*"(?:result|error)"[ \t\r\n]*:[ \t\r\n]*} \
+        [string range $json 0 255] header encodedId]} { return "" }
+    if {[catch {set id [json_dump [::huddle::json2huddle $encodedId]]}]} { return "" }
+    set payload [string range $json [string length $header] end]
+    if {[string index $payload 0] ni {\{ \[}} { return "" }
+    regsub -all {"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4}))*"} $payload 0 structure
+    if {[regexp {["\\]} $structure]} { return "" }
+    set closing ""
+    foreach span [regexp -all -inline -indices {[][{}]} $structure] {
+        set index [lindex $span 0]
+        set character [string index $structure $index]
+        switch -- $character {
+            \{ { append closing \} }
+            \[ { append closing \] }
+            default {
+                if {$character ne [string index $closing end]} { return "" }
+                set closing [string range $closing 0 end-1]
+                if {$closing eq ""} {
+                    if {[regexp {^[ \t\r\n]*\}[ \t\r\n]*$} \
+                        [string range $structure [expr {$index + 1}] end]]} { return $id }
+                    return ""
+                }
+            }
+        }
+    }
+    return ""
+}
+
 # Return false only for responses to our own requests; all events reach the TUI.
 proc retry::server {json} {
     variable current; variable internal; variable finished
+    set id [response_id $json]
+    if {$id ne "" && ![dict exists $internal $id] && \
+        ($current eq "" || $id ne [field $current rpcId])} { return 1 }
     set message [json::json2dict $json]
     set method [field $message method]
     set response [expr {$method eq "" && [dict exists $message id] && \
         ([dict exists $message result] || [dict exists $message error])}]
-    set id ""
     if {$response} {
         set object [::huddle::json2huddle $json]
         set id [json_dump [huddle get $object id]]

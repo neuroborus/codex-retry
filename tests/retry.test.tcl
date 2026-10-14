@@ -48,6 +48,22 @@ proc begin {{acknowledge 1}} {
     if {$acknowledge} { reply 7 turn1; started turn1 }
 }
 
+# Large startup catalogs must not stall keyboard forwarding in the event loop.
+set catalogItem {{"name":"fixture","id":"fixture","nested":{"description":"sample \"text\" {} []","method":"fixture/request","enabled":true,"values":[1,2,3]}}}
+set catalog "{\"id\":99,\"result\":{\"items\":\[[join [lrepeat 30000 $catalogItem] ,]\]}}"
+foreach active {0 1} {
+    retry::reset
+    if {$active} { begin 0 }
+    set previous $retry::current
+    set before [clock milliseconds]
+    check {[retry::server $catalog] == 1} "an unrelated startup catalog was hidden"
+    check {[clock milliseconds] - $before < 1000} "startup catalog processing stalled terminal input"
+    if {$active} {
+        check {$retry::current eq $previous && [dict size $timers] == 0} "an unrelated response changed the tracked request"
+    }
+}
+unset catalog catalogItem
+
 begin
 check {[retry::server {{"id":99,"result":{}}}] == 1} "empty JSON objects broke protocol forwarding"
 retry::server {{"method":"error","params":{"threadId":"t1","turnId":"turn1","willRetry":true,"error":{"codexErrorInfo":"serverOverloaded"}}}}
@@ -104,6 +120,77 @@ reply {"7"} turn1
 check {[dict size $timers] == 0} "string and numeric request IDs were conflated"
 reply 7 turn1
 check {[dict size $timers] == 1} "the matching numeric acknowledgement was lost"
+
+foreach acknowledgement {
+    {"result":{"turn":{"id":"turn1","items":[]}},"id":7}
+    {"jsonrpc":"2.0","id":7,"result":{"turn":{"id":"turn1","items":[]}}}
+    {"id":7,"result":{"turn":{"id":"turn1","items":[]}},"jsonrpc":"2.0"}
+} {
+    begin 0
+    completed turn1
+    retry::server "\{$acknowledgement\}"
+    check {[dict size $timers] == 1} "alternate response field order lost the acknowledgement"
+}
+retry::reset
+retry::client {{"id":"request,\"quoted","method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"sample"}]}}}
+completed quoted-turn
+retry::server {{"id":"request,\u0022quoted","result":{"turn":{"id":"quoted-turn","items":[]}}}}
+check {[dict size $timers] == 1} "a quoted request ID lost the acknowledgement"
+fire
+set cancelledId [json_dump [huddle get [dict get $retry::current request] id]]
+retry::reset
+set escapedId [string map [list c {\u0063}] $cancelledId]
+check {[retry::server [format {{"id":%s,"result":{}}} $escapedId]] == 0} "an escaped cancelled internal response leaked to the TUI"
+
+retry::reset
+set longId [json::write string [string repeat x 300]]
+retry::client [format {{"id":%s,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"sample"}]}}} $longId]
+completed long-id-turn
+reply $longId long-id-turn
+check {[dict size $timers] == 1} "a request ID beyond the bounded header lost its acknowledgement"
+
+# A later ID must be interpreted by the full parser, even if the header matches.
+begin 0
+completed turn1
+retry::server {{"id":7,"result":{"turn":{"id":"turn1","items":[]}},"id":99}}
+check {![field $retry::current accepted] && [dict size $timers] == 0} "an ambiguous header acknowledged the wrong request"
+reply 7 turn1
+check {[dict size $timers] == 1} "an ambiguous header consumed the matching acknowledgement"
+
+# Server requests can share an internal ID; only an actual reply consumes it.
+foreach methodKey {{"method"} {"\u006dethod"}} {
+    begin
+    completed turn1
+    fire
+    set id [json_dump [huddle get [dict get $retry::current request] id]]
+    set event [format {{"id":%s,"result":{},%s:"hook/started","params":{"threadId":"t1","turnId":null}}} $id $methodKey]
+    check {[retry::server $event] == 1} "a later method field hid a server request"
+    check {[reply $id turn2] == 0} "a server request consumed the internal reply marker"
+    completed turn2
+    check {[dict size $timers] == 0} "a later method field hid hook progress"
+}
+
+# Cancellation preserves internal reply visibility across fallback layouts.
+foreach layout {
+    {"result":{},"id":%s}
+    {"id":%s,"result":{},"jsonrpc":"2.0"}
+    {"id":99,"result":{},"id":%s}
+} {
+    begin
+    completed turn1
+    fire
+    set id [json_dump [huddle get [dict get $retry::current request] id]]
+    retry::reset
+    check {[retry::server [format "\{$layout\}" $id]] == 0} "a cancelled internal reply leaked through a fallback layout"
+}
+begin
+completed turn1
+fire
+set id [json_dump [huddle get [dict get $retry::current request] id]]
+retry::reset
+check {[retry::server [format {{"id":%s,"result":{},"id":99}} $id]] == 1} "a duplicate header ID hid an unrelated reply"
+check {[reply $id turn2] == 0} "a duplicate header ID consumed the internal reply marker"
+check {[catch {retry::server {{"id":,"result":{}}}}]} "a malformed response header bypassed JSON parsing"
 
 begin
 retry::server {{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"turn1","status":"completed","items":[],"error":null}}}}
@@ -450,6 +537,19 @@ puts $channel {
         flush stdout
         vwait forever
     }
+    set terminalMode [exec stty -g <@stdin]
+    exec stty raw -echo <@stdin
+    fconfigure stdin -encoding utf-8 -translation lf
+    puts INPUT_READY
+    flush stdout
+    foreach expected {q я} {
+        if {[read stdin 1] ne $expected} { exit 4 }
+        puts "CHAR_FORWARDED:$expected"
+        flush stdout
+    }
+    exec stty $terminalMode <@stdin
+    puts LINE_INPUT_READY
+    flush stdout
     if {[gets stdin line] < 0 || $line ne "exit"} { exit 2 }
     if {[exec stty size <@stdin] ne "24 80"} { exit 3 }
     # Closing the terminal is not process exit. A premature PTY close sends HUP.
@@ -492,12 +592,35 @@ append fixture {
 set driver "set timeout 10\nset stty_init {rows 24 columns 80}\n[list spawn -noecho expect -c $fixture]\n"
 append driver {
     set wrapperSpawn $spawn_id
+    fconfigure $wrapperSpawn -encoding utf-8
     set wrapper [exp_pid]
     set failed [catch {
+        set disconnected 0
+        set inputReady 0
         expect {
-            -exact FORWARDING_DISCONNECTED {}
+            -exact FORWARDING_DISCONNECTED {
+                set disconnected 1
+                if {!$inputReady} { exp_continue -continue_timer }
+            }
+            -exact INPUT_READY {
+                set inputReady 1
+                if {!$disconnected} { exp_continue -continue_timer }
+            }
             eof { error "wrapper exited before forwarding teardown" }
-            timeout { error "forwarding teardown timed out" }
+            timeout { error "forwarding teardown or raw input readiness timed out" }
+        }
+        foreach character {q я} {
+            send -- $character
+            expect -timeout 2 {
+                -exact "CHAR_FORWARDED:$character" {}
+                timeout { error "terminal input was buffered until newline" }
+                eof { error "TUI exited before forwarding input" }
+            }
+        }
+        expect -timeout 2 {
+            -exact LINE_INPUT_READY {}
+            timeout { error "line input readiness timed out" }
+            eof { error "TUI exited before restoring terminal mode" }
         }
         send -- "exit\r"
         expect {
