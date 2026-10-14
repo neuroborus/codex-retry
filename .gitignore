@@ -1,0 +1,21 @@
+# Local artifacts, logs, and temporary files
+LOCAL_ARTIFACTS/
+*.log
+*.tmp
+*.swp
+*~
+
+# Local environment and agent settings
+.env
+.env.*
+!.env.example
+/.agent-runner.json
+/.codex/config.toml
+/.claude/settings.local.json
+/.agents/**/agents/*.yaml
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
