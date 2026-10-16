@@ -44,6 +44,256 @@ proc json_dump {value} {
     }
 }
 
+# Recovery outlives retry cancellation, disconnection and backend cleanup.
+namespace eval recovery {
+    variable target ""
+    variable pending {}
+    variable deleted {}
+    variable seen {}
+    variable yolo 0
+    variable launcher [file normalize [info script]]
+}
+
+proc recovery::client {json} {
+    variable target; variable pending; variable deleted; variable seen; variable yolo
+    set object [::huddle::json2huddle $json]
+    if {[huddle type $object] ne "dict" || ![huddle exists $object method] || \
+        [huddle type $object method] ne "string"} { return }
+    set message [json::json2dict $json]
+    set method [field $message method]
+    set params [field $message params]
+    if {$method in {thread/start thread/resume thread/fork}} {
+        # A pending activation is not proof that either the old or new UI
+        # selection is resumable. Only the latest successful reply can select it.
+        set target ""
+        set pending {}
+        if {[huddle exists $object id] && [huddle type $object id] in {string number} && \
+            [huddle exists $object params] && [huddle type $object params] eq "dict"} {
+            set id [json_dump [huddle get $object id]]
+            if {![dict exists $seen $id]} {
+                set expected ""
+                if {$method eq "thread/resume" && \
+                    (![huddle exists $object params history] || [huddle type $object params history] eq "null") && \
+                    (![huddle exists $object params path] || [huddle type $object params path] eq "null" || \
+                     ([huddle type $object params path] eq "string" && \
+                      [huddle get_stripped $object params path] eq ""))} { set expected [field $params threadId] }
+                set pending [dict create rpcId $id expected $expected \
+                    ephemeral [expr {[field $params ephemeral] eq "true"}]]
+                if {$method ne "thread/start" && (![huddle exists $object params threadId] || \
+                    [huddle type $object params threadId] ne "string" || \
+                    [huddle get_stripped $object params threadId] eq "")} { set pending {} }
+            }
+            # Reused activation IDs cannot distinguish a late duplicate reply.
+            dict set seen $id 1
+        }
+    }
+    if {![huddle exists $object params] || [huddle type $object params] ne "dict"} { return }
+    if {$method in {thread/delete thread/archive}} {
+        set id [field $params threadId]
+        dict set deleted $id 1
+        if {$target eq $id} { set target "" }
+    }
+    if {[string match "turn/*" $method] && \
+        [field $params threadId] ne "" && [field $params threadId] ne $target} {
+        set target ""
+        set pending {}
+    }
+    # Once permissions change manually, never reintroduce launch escalation.
+    foreach {key desired} {approvalPolicy never sandbox danger-full-access sandboxPolicy dangerFullAccess} {
+        if {[dict exists $params $key] && [huddle type $object params $key] ne "null"} {
+            set value [dict get $params $key]
+            if {$key eq "sandboxPolicy"} { set value [field $value type] }
+            if {$value ne $desired} { set yolo 0 }
+        }
+    }
+    if {[dict exists $params permissions] && [huddle type $object params permissions] ne "null"} { set yolo 0 }
+}
+
+proc recovery::server {object message} {
+    variable target; variable pending; variable deleted; variable yolo
+    # Reuse Tcllib's dictionary; Huddle is needed only for typed field access.
+    if {[field $message method] in {thread/deleted thread/archived}} {
+        set id [field $message params threadId]
+        dict set deleted $id 1
+        if {$target eq $id} { set target "" }
+    }
+    if {[huddle exists $object method] || ![huddle exists $object id] || \
+        [json_dump [huddle get $object id]] ne [field $pending rpcId]} { return }
+    set expected [field $pending expected]
+    set ephemeral [field $pending ephemeral]
+    set pending {}
+    if {$ephemeral || [huddle exists $object error] || \
+        ![huddle exists $object result thread id] || \
+        [huddle type $object result] ne "dict" || [huddle type $object result thread] ne "dict" || \
+        [huddle type $object result thread id] ne "string"} { return }
+    set id [huddle get_stripped $object result thread id]
+    if {$id eq "" || ($expected ne "" && $id ne $expected) || [dict exists $deleted $id] || \
+        [field $message result thread ephemeral] eq "true"} { return }
+    set target $id
+    if {![huddle exists $object result approvalPolicy] || \
+        [huddle type $object result approvalPolicy] ne "string" || \
+        [huddle get_stripped $object result approvalPolicy] ne "never" || \
+        ![huddle exists $object result sandbox type] || \
+        [huddle type $object result sandbox] ne "dict" || \
+        [huddle type $object result sandbox type] ne "string" || \
+        [huddle get_stripped $object result sandbox type] ne "dangerFullAccess"} { set yolo 0 }
+}
+
+proc recovery::invocation {} {
+    variable launcher
+    set installed [lindex [auto_execok codex-retry] 0]
+    if {$installed ne "" && [file pathtype $installed] eq "absolute" && ![catch {
+        file stat $installed a
+        file stat $launcher b
+        expr {$a(dev) == $b(dev) && $a(ino) == $b(ino)}
+    } same] && $same} { return codex-retry }
+    return $launcher
+}
+
+proc shell_quote {value} {
+    if {[regexp {^[a-zA-Z0-9_./:-]+$} $value]} { return $value }
+    return "'[string map [list ' {'\''}] $value]'"
+}
+
+proc recovery::advice {} {
+    variable target; variable yolo
+    set arguments [list [invocation] resume]
+    if {[string match -* $target]} {
+        if {$yolo} { lappend arguments --yolo }
+        lappend arguments -- $target
+    } else {
+        if {$target ne ""} { lappend arguments $target }
+        if {$yolo && $target ne ""} { lappend arguments --yolo }
+    }
+    set quoted {}
+    foreach argument $arguments { lappend quoted [shell_quote $argument] }
+    set heading "To resume this session, run:"
+    if {$target eq ""} { set heading "To choose a saved session, run:" }
+    return "$heading\n  [join $quoted { }]\n"
+}
+
+# Native 0.162.1 restores bracketed paste before its combined-PTY exit
+# epilogue. Forward live bytes immediately, retaining only a split marker.
+# After restoration, buffer only a possible native disconnect prefix and its
+# bounded epilogue. Unrelated output and TUI re-entry flush it immediately.
+# No terminal text participates in retry decisions.
+namespace eval presentation {
+    variable buffer ""
+    variable held 0
+    variable replaced 0
+    variable endpoint ""
+    variable boundary "\033\[?2004l"
+    variable disconnects {
+        {Disconnected from this task. The current turn was stopped.}
+        {Disconnected from this task. Any running work continues.}
+        {Disconnected from this task. Work may still be running.}
+    }
+}
+proc presentation::write {bytes} {
+    puts -nonewline stdout $bytes
+    flush stdout
+}
+proc presentation::probe {} {
+    variable buffer; variable disconnects
+    # An external terminal application may await a cursor-query response.
+    while {[regexp {^(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[ \t\r\n]+)} $buffer leading]} {
+        write $leading
+        set buffer [string range $buffer [string length $leading] end]
+    }
+    # Native title/state OSCs can split anywhere, including inside ESC-backslash.
+    # feed bounds this incomplete leading prefix just like the epilogue itself.
+    if {[regexp {^\x1b\][^\x07\x1b]*(?:\x1b)?$} $buffer]} { return 1 }
+    regsub -all {\x1b\[[0-?]*[ -/]*[@-~]} $buffer {} text
+    # A split restoration/color sequence can precede the native prefix.
+    regsub {\x1b(?:\[[0-?]*[ -/]*)?$} $text {} text
+    set text [string trimleft $text]
+    if {$text eq ""} { return 1 }
+    foreach prefix $disconnects {
+        if {[string first $text $prefix] == 0 || \
+            ([string first $prefix $text] == 0 && \
+             [regexp {^[ \t]*(?:\r|\n|$)} [string range $text [string length $prefix] end]])} { return 1 }
+    }
+    return 0
+}
+proc presentation::feed {bytes} {
+    variable buffer; variable held; variable boundary
+    append buffer $bytes
+    if {$held} {
+        if {[string first "\033\[?2004h" $buffer] < 0 && [string length $buffer] <= 16384 && \
+            [probe]} { return }
+        # An editor prompt must be visible before it can receive input.
+        set held 0
+    }
+    set index [string last $boundary $buffer]
+    if {$index >= 0} {
+        set end [expr {$index + [string length $boundary] - 1}]
+        write [string range $buffer 0 $end]
+        set buffer [string range $buffer $end+1 end]
+        set held 1
+        if {[string length $buffer] <= 16384 && [string first "\033\[?2004h" $buffer] < 0 && \
+            [probe]} { return }
+        set held 0
+    }
+    set retain 0
+    for {set n 1} {$n < [string length $boundary]} {incr n} {
+        if {[string range $buffer end-[expr {$n - 1}] end] eq [string range $boundary 0 $n-1]} { set retain $n }
+    }
+    set end [expr {[string length $buffer] - $retain - 1}]
+    write [string range $buffer 0 $end]
+    set buffer [string range $buffer $end+1 end]
+}
+proc presentation::finish {} {
+    variable buffer; variable held; variable replaced; variable endpoint; variable disconnects
+    # Match individual complete lines only inside the characterized exit
+    # channel. ANSI is ignored for comparison; every retained byte stays intact.
+    set lines [regexp -all -inline {[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+$} $buffer]
+    set plain {}
+    foreach line $lines {
+        regsub -all {\x1b\[[0-?]*[ -/]*[@-~]} $line {} text
+        lappend plain [string trim $text]
+    }
+    set disconnect -1
+    set reconnect -1
+    set command -1
+    set stop -1
+    set prefix "codex --remote $endpoint --remote-auth-token-env CODEX_RETRY_TOKEN"
+    set stopCommand "$prefix agents"
+    for {set i 0} {$i < [llength $plain]} {incr i} {
+        set line [lindex $plain $i]
+        if {$disconnect < 0 && $line in $disconnects} { set disconnect $i }
+        if {$disconnect >= 0 && $line eq "To reconnect, run:"} { set reconnect $i }
+        if {$reconnect >= 0 && ($line eq $prefix || $line eq "$prefix resume" || \
+            [string first "$prefix resume " $line] == 0)} { set command $i }
+        set index [string first $stopCommand $line]
+        if {$command >= 0 && $index >= 0 && \
+            [regexp {^(?:$|[ \t`'".,])} [string range $line [expr {$index + [string length $stopCommand]}] end]]} {
+            set stop $i
+            break
+        }
+    }
+    if {$held && !$replaced && $disconnect >= 0 && $reconnect > $disconnect && \
+        $command > $reconnect} {
+        set remove [list $disconnect $reconnect $command]
+        if {$stop > $command} {
+            lappend remove $stop
+            set previous [expr {$stop - 1}]
+            while {$previous > $command && [lindex $plain $previous] eq ""} { incr previous -1 }
+            if {$previous > $command && [lindex $plain $stop] eq $stopCommand && \
+                [lindex $plain $previous] eq "To stop this task, run:"} { lappend remove $previous }
+        }
+        # Restoration/cursor sequences can share a line with the native text.
+        # Keep them, including color resets, even on the replaced lines.
+        foreach index $remove {
+            lset lines $index [join [regexp -all -inline {\x1b\[[0-?]*[ -/]*[@-~]} [lindex $lines $index]] ""]
+        }
+        lset lines $disconnect "[lindex $lines $disconnect][encoding convertto utf-8 [string map [list \n \r\n] [recovery::advice]]]"
+        set replaced 1
+    }
+    write [join $lines ""]
+    set buffer ""
+    set held 0
+}
+
 namespace eval resume {
     variable armed 0
     variable pending {}
@@ -284,7 +534,8 @@ proc retry::response_id {json} {
 proc retry::server {json} {
     variable current; variable internal; variable finished
     set id [response_id $json]
-    if {$id ne "" && $id ne [field $::resume::pending rpcId] && ![dict exists $internal $id] && \
+    if {$id ne "" && $id ne [field $::resume::pending rpcId] && \
+        $id ne [field $::recovery::pending rpcId] && ![dict exists $internal $id] && \
         ($current eq "" || $id ne [field $current rpcId])} { return 1 }
     set message [json::json2dict $json]
     set method [field $message method]
@@ -303,9 +554,15 @@ proc retry::server {json} {
                     set ::resume::failure "malformed acknowledgement for resume --yolo"
                     return 0
                 }
-                return [resume::acknowledge $object]
+                set visible [resume::acknowledge $object]
+                if {$::resume::failure eq ""} { recovery::server $object $message }
+                return $visible
             }
         }
+    }
+    if {($response && $id eq [field $::recovery::pending rpcId]) || \
+        $method in {thread/deleted thread/archived}} {
+        recovery::server [::huddle::json2huddle $json] $message
     }
     set visible [expr {!$response || ![dict exists $internal $id]}]
     if {$response} { dict unset internal $id }
@@ -421,6 +678,7 @@ proc connection {socket type message} {
             }
             text {
                 set message [resume::client $message]
+                recovery::client $message
                 retry::client $message
                 backend_send $message
             }
@@ -635,6 +893,7 @@ proc resume_arguments {arguments} {
         if {[detached_value $argument]} { incr i; continue }
         if {$command eq "" && ![string match -* $argument]} { set command $argument }
     }
+    set ::recovery::yolo [expr {[llength $flags] > 0}]
     if {$command ne "resume" || ![llength $flags]} { return [list $arguments 0] }
     if {[llength $conflicts]} { error "resume --yolo conflicts with [join $conflicts {, }]" }
     foreach index [lreverse $flags] { set arguments [lreplace $arguments $index $index] }
@@ -680,6 +939,7 @@ proc main {arguments} {
     close $random
     set ::listener [socket -server accept -myaddr 127.0.0.1 0]
     set port [lindex [fconfigure $::listener -sockname] 2]
+    set ::presentation::endpoint ws://127.0.0.1:$port/
     # A parent can close our PTY after EOF while Tcl is still finalizing.
     exit -onexit {trap SIG_IGN {SIGHUP SIGWINCH}}
     trap {shutdown 143} SIGTERM
@@ -695,26 +955,35 @@ proc main {arguments} {
     fconfigure $::backend -blocking 0 -buffering line -encoding utf-8 -translation lf
     # Only the TUI needs the proxy credential.
     set ::env(CODEX_RETRY_TOKEN) $token
-    spawn -noecho codex --remote ws://127.0.0.1:$port \
+    spawn -noecho codex --remote $::presentation::endpoint \
         --remote-auth-token-env CODEX_RETRY_TOKEN {*}$arguments
     set tuiSpawn $spawn_id
     set ::tuiPid [exp_pid]
     # EOF can precede exit; keep the PTY open so close cannot hang up the TUI.
     close_on_eof -i $tuiSpawn 0
+    # The adapter handles bytes, including split UTF-8 and terminal sequences.
+    fconfigure $tuiSpawn -encoding binary -translation binary
+    fconfigure stdin -encoding binary -translation binary
+    fconfigure stdout -encoding binary -translation binary
+    fconfigure $::user_spawn_id -encoding binary -translation binary
+    remove_nulls -i $tuiSpawn 0
     resize
     trap resize SIGWINCH
-    interact -i $tuiSpawn
+    interact -i $tuiSpawn -o -re {[^\x00]+} {
+        presentation::feed $interact_out(0,string)
+    } null { presentation::feed "\x00" }
     trap SIG_IGN SIGWINCH
     set result [wait -i $tuiSpawn]
     close -i $tuiSpawn
     unset ::tuiPid tuiSpawn
     cleanup
+    presentation::finish
     diagnostics::report
     if {[info exists ::proxyMessage]} { catch {puts stderr "codex-retry: $::proxyMessage"} }
     # Optional guidance must preserve the TUI's exit status even if stderr fails.
     catch {
-        puts stderr "codex-retry: private app-server stopped; native remote reconnect commands no longer apply."
-        puts stderr "codex-retry: reopen a saved session with ./codex-retry resume SESSION_ID or ./codex-retry resume --last."
+        puts stderr "codex-retry: private app-server stopped."
+        if {!$::presentation::replaced} { puts -nonewline stderr [recovery::advice] }
     }
     if {[info exists ::signalStatus]} { return $::signalStatus }
     if {[info exists ::proxyError]} { return 1 }
@@ -732,6 +1001,7 @@ if {[file normalize [info script]] eq [file normalize $argv0]} {
         catch {close -i $::tuiSpawn}
         unset -nocomplain ::tuiPid ::tuiSpawn
         cleanup
+        catch {presentation::finish}
         diagnostics::report
         catch {puts stderr "codex-retry: $result"}
         if {[info exists ::signalStatus]} { exit $::signalStatus }

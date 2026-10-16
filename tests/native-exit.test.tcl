@@ -29,11 +29,44 @@ proc bgerror {message} {
 }
 proc plain {bytes} {
     regsub -all {\x1b\[[0-?]*[ -/]*[@-~]} $bytes {} bytes
-    return [string map [list \r\n \n \r \n] $bytes]
+    regsub -all {\r+\n} $bytes \n bytes
+    return [string map [list \r \n] $bytes]
+}
+
+# The wrapped run uses the same rejecting backend through a Tcllib bridge in
+# place of `codex app-server`. The actual native TUI still owns both PTY streams.
+if {$argv eq {--backend}} {
+    fconfigure stdin -blocking 0 -encoding utf-8 -translation lf
+    fconfigure stdout -buffering line -encoding utf-8 -translation lf
+    proc bridge {socket type message} {
+        switch -- $type {
+            connect { set ::bridge $socket; fileevent stdin readable bridge_input }
+            text {
+                # WebSocket JSON can be formatted across lines; stdio is JSONL.
+                # Valid JSON strings escape CR/LF, so their content is unchanged.
+                puts [string map [list \r " " \n " "] $message]
+                flush stdout
+            }
+            close - disconnect { exit 0 }
+            error - timeout { exit 1 }
+        }
+    }
+    proc bridge_input {} {
+        while {[gets stdin line] >= 0} {
+            if {[string length $line] > 1048576} { exit 1 }
+            websocket::send $::bridge text $line
+        }
+        if {[eof stdin]} { exit 0 }
+    }
+    websocket::open $env(NATIVE_EXIT_ENDPOINT) bridge \
+        -headers [list Authorization "Bearer $env(NATIVE_EXIT_TOKEN)"] -timeout 2000
+    vwait forever
 }
 
 set scratch [file normalize [lindex $argv 0]]
-check {[llength $argv] == 1 && [file isdirectory $scratch]} "private fixture directory required"
+set wrapped [expr {[lindex $argv 1] eq "wrapped"}]
+check {[llength $argv] in {1 2} && [file isdirectory $scratch]} "private fixture directory required"
+if {$wrapped} { set env(PATH) "[file join $scratch bin]:$env(PATH)" }
 set threadId 01900000-0000-7000-8000-000000000001
 set turnId 01900000-0000-7000-8000-000000000002
 set random [open /dev/urandom rb]
@@ -245,7 +278,8 @@ proc observe {event} {
             }
             set boundary [string last $::disablePaste $::output]
             if {$::quitOffset >= 0 && $boundary >= $::quitOffset && \
-                [string first "Disconnected from this task." $::output $boundary] >= 0} {
+                ([string first "Disconnected from this task." $::output $boundary] >= 0 || \
+                 ($::wrapped && [string first "To resume this session, run:" $::output $boundary] >= 0))} {
                 check {[dict get $event restored]} "native footer arrived before terminal restoration"
                 set ::footerRestored 1
             }
@@ -283,20 +317,44 @@ proc finish {} {
         [string first $::disablePaste $::output $::quitOffset] == $boundary} "missing ordered terminal restoration sequence"
     set live [plain [string range $::output 0 [expr {$boundary - 1}]]]
     foreach text {FIXTURE_LIVE_BEGIN {Disconnected from this task.} {To reconnect, run:} LIVE_LOOKALIKE FIXTURE_LIVE_END} {
-        check {[string first $text $live] >= 0} "live history was not rendered before terminal restoration"
+        if {$::wrapped} {
+            # Ratatui may place spaces with cursor movements instead of bytes.
+            # Keep all marker/content/punctuation checks; fake PTYs check bytes.
+            regsub -all {[ \t\n]} $live {} compactLive
+            regsub -all {[ \t\n]} $text {} compactText
+            check {[string first $compactText $compactLive] >= 0} "live history was not rendered before terminal restoration"
+        } else {
+            check {[string first $text $live] >= 0} "live history was not rendered before terminal restoration"
+        }
     }
     # This byte boundary, not the terminal's later mode, excludes buffered live
-    # lookalikes. A future adapter can preserve the entire preceding byte stream.
+    # lookalikes. The adapter must preserve the entire preceding byte stream.
     set footer [plain [string range $::output [expr {$boundary + [string length $::disablePaste]}] end]]
     check {[string first FIXTURE_LIVE $footer] < 0} "live history crossed the exit boundary"
-    check {[regexp -all {Disconnected from this task\.} $footer] == 1 && \
-        [regexp -all {To reconnect, run:} $footer] == 1} "missing or duplicate native exit advice"
-    set disconnect [string first "Disconnected from this task." $footer]
-    set reconnect [string first "To reconnect, run:" $footer]
-    set command [string first "codex --remote $::endpoint --remote-auth-token-env CODEX_RETRY_TOKEN resume $::threadId" $footer]
-    set stop [string first agents $footer $command]
-    check {$disconnect >= 0 && $reconnect > $disconnect && $command > $reconnect && \
-        $stop > $command} "native reconnect or remote stop advice was incomplete or out of order"
+    if {$::wrapped} {
+        check {[regexp -all {To resume this session, run:} $footer] == 1} "missing or duplicate wrapper recovery"
+        set launcher [file normalize [file join [file dirname [info script]] .. codex-retry]]
+        check {[regexp {To resume this session, run:\n[ \t]*([^\n]+)} $footer -> command]} "wrapper recovery was not copyable"
+        set words [split [exec sh -c "set -- $command; printf '%s\\n' \"\$@\""] \n]
+        check {$words eq [list codex-retry resume $::threadId]} "wrapper recovery changed launcher or session arguments"
+        set resolved [exec sh -c {command -v "$1"} sh [lindex $words 0]]
+        file stat $resolved actualIdentity
+        file stat $launcher expectedIdentity
+        check {$actualIdentity(dev) == $expectedIdentity(dev) && \
+            $actualIdentity(ino) == $expectedIdentity(ino)} "wrapper recovery resolved to another launcher"
+        foreach obsolete {{Disconnected from this task.} {To reconnect, run:} --remote CODEX_RETRY_TOKEN agents} {
+            check {[string first $obsolete $footer] < 0} "obsolete remote advice survived wrapper exit"
+        }
+    } else {
+        check {[regexp -all {Disconnected from this task\.} $footer] == 1 && \
+            [regexp -all {To reconnect, run:} $footer] == 1} "missing or duplicate native exit advice"
+        set disconnect [string first "Disconnected from this task." $footer]
+        set reconnect [string first "To reconnect, run:" $footer]
+        set command [string first "codex --remote $::endpoint --remote-auth-token-env CODEX_RETRY_TOKEN resume $::threadId" $footer]
+        set stop [string first agents $footer $command]
+        check {$disconnect >= 0 && $reconnect > $disconnect && $command > $reconnect && \
+            $stop > $command} "native reconnect or remote stop advice was incomplete or out of order"
+    }
     check {[regexp -all {Token usage(?: so far)?:} $footer] == 1} "native synthetic token summary was missing or duplicated"
     regexp {Token usage(?: so far)?:([^\n]*)} $footer -> summary
     foreach pattern {{total\s*=\s*17\M} {input\s*=\s*11\M} {output\s*=\s*6\M}} {

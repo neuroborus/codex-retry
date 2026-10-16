@@ -18,7 +18,7 @@ Run the wrapper with interactive Codex arguments:
 
 The wrapper starts a private `codex app-server` process and relays its JSON-RPC
 traffic to the TUI through one authenticated loopback WebSocket connection.
-It never examines terminal text or types `continue`.
+Retry decisions use structured events exclusively; it never types `continue`.
 Terminal input/output, window resizing, and TUI exit status pass through.
 Large unrelated startup replies use their request ID and envelope boundaries
 for routing without decoding the payload, keeping keyboard forwarding responsive.
@@ -30,10 +30,25 @@ with a diagnostic heading. Only the latest 64 KiB are retained in memory; a
 truncation notice appears when earlier output was discarded. Startup failures
 are reported directly if no TUI launched. No diagnostic log is saved to disk.
 
-The private app-server stops when the TUI exits or disconnects. The native TUI's
-remote reconnect commands and "running work continues" message assume a server
-that stays alive; that assumption does not apply to this wrapper. Reopen a saved
-session with `./codex-retry resume SESSION_ID` or `./codex-retry resume --last`.
+The private app-server stops when the TUI exits or disconnects. On supported
+native 0.162.1 exits, an adapter buffers at most 16 KiB of the possible exit
+epilogue after terminal restoration, replacing remote reconnect/stop instructions
+and the continued-work claim. Live terminal content and token usage remain intact.
+The final output offers one
+copyable wrapper command for the last successfully selected session, for example:
+
+```sh
+codex-retry resume 01900000-0000-7000-8000-000000000001 --yolo
+```
+
+The command uses the installed launcher when available, otherwise its absolute
+path, with shell quoting so it also works outside this checkout. Explicit launch
+YOLO is retained only while confirmed permissions still apply; manual permission
+changes stop it from being carried forward. The session comes from correlated
+successful App Server replies, never terminal text or saved history. If activation
+fails or no resumable session is confirmed, the command opens the `resume` picker
+instead of inventing a session ID. You can also open that picker yourself with
+`codex-retry resume` (or the absolute launcher path shown at exit).
 
 `CODEX_RETRY_TOKEN` names a temporary environment variable available to the child
 TUI, not a token value to paste into the command. It is not exported back to
@@ -88,8 +103,9 @@ session.
 
 Offline fixtures and fake Codex PTY checks cover resume permissions, config and
 input forwarding, and failure without model work. Native connection checks block
-inference and cover TUI initialization; neither initialization nor an empty-thread
-metadata probe verifies stored-session resume behavior. Checks do not cover every
+inference and cover TUI initialization and both native and wrapped exits using
+synthetic history, live lookalikes, token totals, terminal restoration and cleanup.
+These checks do not verify real stored-session resume behavior or cover every
 Codex flag or subcommand. App Server is experimental, so check compatibility when
 upgrading Codex.
 

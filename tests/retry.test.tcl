@@ -51,22 +51,26 @@ proc begin {{acknowledge 1}} {
 # Large startup catalogs must not stall keyboard forwarding in the event loop.
 set catalogItem {{"name":"fixture","id":"fixture","nested":{"description":"sample \"text\" {} []","method":"fixture/request","enabled":true,"values":[1,2,3]}}}
 set catalog "{\"id\":99,\"result\":{\"items\":\[[join [lrepeat 30000 $catalogItem] ,]\]}}"
-foreach active {0 1 2} {
+foreach active {0 1 2 3} {
     retry::reset
     if {$active == 1} { begin 0 }
     if {$active == 2} {
         set resume::armed 1
         resume::client {{"id":31,"method":"thread/resume","params":{"threadId":"t1"}}}
     }
+    if {$active == 3} { set recovery::pending {rpcId 32 expected t1} }
     set previous $retry::current
     set previousResume $resume::pending
+    set previousRecovery $recovery::pending
     set before [clock milliseconds]
     check {[retry::server $catalog] == 1} "an unrelated startup catalog was hidden"
     check {[clock milliseconds] - $before < 1000} "startup catalog processing stalled terminal input"
     if {$active} {
         check {$retry::current eq $previous && $resume::pending eq $previousResume && [dict size $timers] == 0} "an unrelated response changed the tracked request"
+        check {$recovery::pending eq $previousRecovery} "an unrelated response changed recovery correlation"
     }
     resume::reset
+    set recovery::pending {}
 }
 unset catalog catalogItem
 
@@ -430,6 +434,177 @@ check {[resume_arguments {resume --last -c --approve-for-me --yolo}] eq {{resume
 check {[resume_arguments {--yolo -a never}] eq {{--yolo -a never} 0}} "new-session conflicts stopped being native-owned"
 check {[backend_options {resume --last -m --remote -p --config -i -c --cd --enable -- --config=prompt}] eq {}} "backend extraction interpreted another option's value"
 
+# Recovery requires the newest typed activation reply, independently of retries.
+proc activate {id method {thread t1}} {
+    recovery::client [format {{"id":%s,"method":"%s","params":{"threadId":"%s"}}} $id $method $thread]
+}
+proc activated {id thread} {
+    retry::server [format {{"id":%s,"result":{"thread":{"id":%s},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}}}} $id [json::write string $thread]]
+}
+set recovery::deleted {}
+set recovery::seen {}
+activate 71 thread/start
+activated {"71"} unrelated
+retry::server {{"method":"thread/started","params":{"thread":{"id":"subagent"}}}}
+check {$recovery::target eq ""} "an uncorrelated activation selected a recovery target"
+activated 71 first
+check {$recovery::target eq "first"} "a confirmed start was lost"
+retry::reset
+resume::reset
+check {$recovery::target eq "first"} "retry or permission cleanup discarded recovery"
+activate {"switch"} thread/resume second
+check {$recovery::target eq ""} "pending activation retained a stale selection"
+activate 72 thread/fork
+activated {"switch"} second
+check {$recovery::target eq ""} "a stale activation selected recovery"
+activated 72 forked
+check {$recovery::target eq "forked"} "a confirmed fork was lost"
+recovery::client {{"method":"thread/read","params":{"threadId":"other"}}}
+check {$recovery::target eq "forked"} "a background read changed selected recovery"
+recovery::client {{"id":70,"method":"turn/start","params":{"threadId":"other","input":[]}}}
+check {$recovery::target eq ""} "unconfirmed thread work retained a stale selection"
+activate 90 thread/start
+check {[retry::server {{"id":90,"result":{"thread":{"id":"empty-metadata","extra":{"empty":{},"items":[]}},"approvalPolicy":"on-request","sandbox":{"type":"readOnly"}}}}] == 1} "empty activation metadata changed response forwarding"
+check {$recovery::target eq "empty-metadata"} "empty JSON objects prevented confirmed recovery"
+set activationId 80
+foreach result {
+    {"error":{"code":-1,"message":"fixture"}}
+    {"result":{}}
+    {"result":{"thread":{"id":null}}}
+    {"result":{"thread":{"id":73}}}
+    {"result":{"thread":{"id":""}}}
+    {"result":{"thread":{"id":"wrong-thread"}}}
+    {"result":{"thread":{"id":"t1","ephemeral":true}}}
+} {
+    activate [incr activationId] thread/resume
+    retry::server "\{\"id\":$activationId,$result\}"
+    check {$recovery::target eq ""} "an unsafe activation fabricated recovery"
+}
+activate 74 thread/resume
+retry::server {{"id":74,"method":"hook/started","params":{}}}
+check {$recovery::pending ne ""} "a server request consumed recovery correlation"
+activated 74 t1
+retry::server {{"method":"thread/deleted","params":{"threadId":"unrelated"}}}
+check {$recovery::target eq "t1"} "unrelated deletion removed recovery"
+retry::server {{"method":"thread/deleted","params":{"threadId":"t1"}}}
+check {$recovery::target eq ""} "deleted thread remained resumable"
+activate 75 thread/resume t1
+activated 75 t1
+check {$recovery::target eq ""} "a delayed reply revived deleted recovery"
+activate 76 thread/start
+recovery::client {{"id":77,"method":"thread/delete","params":{"threadId":"removed"}}}
+activated 76 removed
+check {$recovery::target eq ""} "deletion during activation revived recovery"
+set recovery::deleted {}
+activate 76 thread/start
+activated 76 removed
+check {$recovery::target eq ""} "a reused request ID accepted a stale reply"
+recovery::client {{"id":91,"method":["thread/start"],"params":{}}}
+activated 91 invalid-method
+check {$recovery::target eq ""} "an untyped method selected recovery"
+activate 92 thread/start
+recovery::client {{"id":93,"method":"turn/start","params":{"threadId":"other","input":[]}}}
+activated 92 stale-after-turn
+check {$recovery::target eq ""} "unconfirmed thread work accepted a stale activation"
+
+foreach arguments {{--yolo} {--dangerously-bypass-approvals-and-sandbox} {--config=--yolo} {-m --yolo} {-- --yolo}} expected {1 1 0 0 0} {
+    resume_arguments $arguments
+    check {$recovery::yolo == $expected} "launch YOLO intent ignored argument boundaries"
+}
+resume_arguments {--yolo}
+activate 78 thread/start
+activated 78 actual-session
+check {[string match {*resume actual-session --yolo*} [recovery::advice]]} "new-session YOLO was missing from recovery"
+recovery::client {{"id":79,"method":"thread/settings/update","params":{"threadId":"actual-session","model":"fixture"}}}
+check {$recovery::yolo} "a model-only change removed applicable YOLO"
+recovery::client {{"id":80,"method":"turn/start","params":{"threadId":"actual-session","approvalPolicy":"on-request","sandboxPolicy":{"type":"readOnly"}}}}
+check {![string match {*--yolo*} [recovery::advice]]} "manual permissions were escalated again"
+set activationId 94
+foreach permissions {
+    {"approvalPolicy":["never"],"sandbox":{"type":"dangerFullAccess"}}
+    {"approvalPolicy":"never","sandbox":{"type":["dangerFullAccess"]}}
+} {
+    resume_arguments {--yolo}
+    activate [incr activationId] thread/start
+    retry::server "\{\"id\":$activationId,\"result\":\{\"thread\":\{\"id\":\"typed-session\"\},$permissions\}\}"
+    check {$recovery::target eq "typed-session" && !$recovery::yolo} "untyped permissions retained YOLO"
+}
+set activationId 100
+foreach extra {
+    {"history":[]}
+    {"path":"null"}
+    {"history":null,"path":""}
+} selected {history-session path-session source-thread} {
+    recovery::client [format {{"id":%d,"method":"thread/resume","params":{"threadId":"source-thread",%s}}} [incr activationId] $extra]
+    activated $activationId $selected
+    check {$recovery::target eq $selected} "resume history/path precedence lost confirmed recovery"
+}
+
+# Execute only the shell parser, never a product command, to prove exact quoting.
+set recovery::target {session 'quoted' $value; with spaces}
+set advice [recovery::advice]
+set command [string trim [lindex [split $advice \n] 1]]
+set words [exec sh -c "set -- $command; printf '%s\\n' \"\$@\""]
+check {[split $words \n] eq [list [recovery::invocation] resume $recovery::target]} "recovery command changed shell arguments"
+set recovery::target ""
+check {[string first "To choose a saved session, run:" [recovery::advice]] == 0 && \
+    [string first SESSION_ID [recovery::advice]] < 0} "unknown recovery did not offer a truthful picker"
+
+# A temporary release, incomplete epilogue and an oversized tail are lossless.
+rename presentation::write presentation::native_write
+proc presentation::write {bytes} { append ::presented $bytes }
+set marker $presentation::boundary
+foreach content [list "plain\x00utf8:é" "live${marker}temporary\033\[?2004hstill live" \
+    "live${marker}unrecognized exit" "live${marker}[string repeat x 17000]" \
+    "live${marker}\033\]0;incomplete" "live${marker}\033\]7501;state=clear\033" \
+    "live${marker}\033\]0;[string repeat x 17000]"] {
+    set presented ""
+    set presentation::buffer ""
+    set presentation::held 0
+    set presentation::replaced 0
+    foreach byte [split $content ""] { presentation::feed $byte }
+    presentation::finish
+    check {$presented eq $content && !$presentation::replaced} "unsupported exit presentation lost bytes"
+}
+# A read can end at restoration or anywhere inside CSI/OSC, including OSC's ST.
+set presentation::endpoint ws://127.0.0.1:12345/
+set prefix "codex --remote $presentation::endpoint --remote-auth-token-env CODEX_RETRY_TOKEN"
+set recovery::target confirmed-session
+foreach controls [list "" "\033\]0;\007" "\033\]7501;state=clear\033\\" \
+    "\033\]0;\007\033\]7501;state=clear\033\\"] {
+    foreach stop [list "To stop this task, run $prefix agents" \
+        "To stop this task, run $prefix agents, select this task, and press x." \
+        "To stop this task, run:\r\n  $prefix agents"] {
+        set unrelated "codex agents documentation stays\r\nagents server diagnostic\r\n"
+        set content "live${marker}\r\n${controls}\033\[?25h\033\[32mDisconnected from this task. Work may still be running.\033\[0m\r\nTo reconnect, run:\r\n  $prefix resume untrusted\r\n${unrelated}$stop\r\nToken usage so far: total=17 input=11 output=6\r\n"
+        set expected "live${marker}\r\n${controls}\033\[?25h\033\[32m\033\[0m[encoding convertto utf-8 [string map [list \n \r\n] [recovery::advice]]]${unrelated}Token usage so far: total=17 input=11 output=6\r\n"
+        foreach width [list 1 7 [string length $content]] {
+            set presented ""
+            set presentation::buffer ""
+            set presentation::held 0
+            set presentation::replaced 0
+            for {set i 0} {$i < [string length $content]} {incr i $width} {
+                presentation::feed [string range $content $i [expr {$i + $width - 1}]]
+            }
+            presentation::finish
+            check {$presentation::replaced && $presented eq $expected} "split native epilogue changed replacement or retained bytes"
+        }
+    }
+}
+# Forward completed controls and an editor prompt before any input or TUI re-entry.
+set presented ""
+set presentation::buffer ""
+set presentation::held 0
+presentation::feed "${marker}\033\]7501;state="
+check {$presented eq $marker && $presentation::held} "incomplete leading OSC was flushed early"
+presentation::feed "clear\033"
+check {$presented eq $marker && $presentation::held} "split OSC terminator was flushed early"
+presentation::feed "\\\033\[6nEDITOR_PROMPT> "
+check {$presented eq "${marker}\033\]7501;state=clear\033\\\033\[6nEDITOR_PROMPT> " && \
+    !$presentation::held && $presentation::buffer eq ""} "OSC handling hid editor output or cursor queries"
+rename presentation::write {}
+rename presentation::native_write presentation::write
+
 set resumeRequest {{"id":31,"method":"thread/resume","params":{"threadId":"t1","approvalPolicy":"on-request","sandbox":"read-only","permissions":null,"config":{"sample":true},"initialTurnsPage":{"limit":3},"optional":null,"empty":[]}}}
 set resumeReply {{"id":31,"result":{"thread":{"id":"t1","turns":[]},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"activePermissionProfile":{"id":"fixture","extends":null}}}}
 proc arm_resume {} {
@@ -437,6 +612,11 @@ proc arm_resume {} {
     set ::retry::finished {}
     resume::reset
     set ::resume::armed 1
+    set ::recovery::target ""
+    set ::recovery::pending {}
+    set ::recovery::seen {}
+    set ::recovery::deleted {}
+    set ::recovery::yolo 1
 }
 arm_resume
 set translated [::huddle::json2huddle [resume::client $resumeRequest]]
@@ -615,7 +795,7 @@ rename bgerror native_bgerror
 proc bgerror {message} { lappend ::proxyFailures $message; cleanup }
 foreach outcome {confirmed rejected mismatch disconnected-rejection null-method} {
     arm_resume
-    resume::client $resumeRequest
+    recovery::client [resume::client $resumeRequest]
     set sendMode record
     switch $outcome {
         confirmed { set response $resumeReply }
@@ -637,6 +817,7 @@ foreach outcome {confirmed rejected mismatch disconnected-rejection null-method}
     if {$outcome ni {mismatch null-method}} { set expectedForwarded [list $response] }
     check {$forwarded eq $expectedForwarded} "resume routing altered an authoritative response or exposed unconfirmed success"
     check {[llength $proxyFailures] == ($outcome ne "confirmed")} "resume verification failure did not halt visibly"
+    check {$recovery::target eq ($outcome eq "confirmed" ? "t1" : "")} "resume recovery bypassed permission verification or cleanup lost confirmation"
 }
 rename bgerror {}
 rename native_bgerror bgerror
@@ -1137,6 +1318,19 @@ puts $channel {
         proc request {} {
             if {[gets stdin line] < 0} { return }
             set id [dict get [json::json2dict $line] id]
+            if {$id == 6} {
+                puts {{"id":6,"error":{"code":-1,"message":"fixture activation rejection"}}}
+                flush stdout
+                return
+            }
+            if {$id in {4 5}} {
+                set selected [expr {$id == 4 ? "confirmed-session" : "switched-session"}]
+                set approval [expr {$id == 4 ? "never" : "on-request"}]
+                set sandbox [expr {$id == 4 ? "dangerFullAccess" : "readOnly"}]
+                puts [format {{"id":%d,"result":{"thread":{"id":"%s"},"approvalPolicy":"%s","sandbox":{"type":"%s"}}}} $id $selected $approval $sandbox]
+                flush stdout
+                return
+            }
             if {$id == 2} {
                 if {$::mode eq "burst"} {
                     puts {{"method":"fixture/burst","params":{}}}
@@ -1158,10 +1352,22 @@ puts $channel {
     if {[string match signal-* $mode]} { trap SIG_IGN SIGTERM }
     set terminalMode [exec stty -g <@stdin]
     exec stty raw -echo <@stdin
+    puts "\033\[?2004hLIVE_BEGIN\nDisconnected from this task. Any running work continues.\nTo reconnect, run:\nLIVE_LOOKALIKE\nLIVE_END"
+    flush stdout
     fconfigure stdin -blocking 0 -encoding utf-8 -translation lf
+    set editorActive 0
     proc receive {socket type message} {
         if {$type eq "connect"} {
             set ::socket $socket
+            if {$::mode ne "no-thread"} {
+                websocket::send $socket text {{"id":4,"method":"thread/start","params":{"approvalPolicy":"never","sandbox":"danger-full-access"}}}
+                if {$::mode eq "switched"} {
+                    websocket::send $socket text {{"id":5,"method":"thread/resume","params":{"threadId":"switched-session","approvalPolicy":"on-request","sandbox":"read-only"}}}
+                }
+                if {$::mode eq "activation-error"} {
+                    websocket::send $socket text {{"id":6,"method":"thread/resume","params":{"threadId":"not-confirmed"}}}
+                }
+            }
             websocket::send $socket text {{"id":1,"method":"fixture/ready","params":{}}}
         } elseif {$type eq "text"} {
             set response [json::json2dict $message]
@@ -1169,6 +1375,7 @@ puts $channel {
                 puts BURST_READY
             } else {
                 set id [dict get $response id]
+                if {$id in {4 5 6}} { return }
                 puts [dict get {1 INPUT_READY 2 PROTOCOL_OK 3 BURST_PROTOCOL_OK} $id]
             }
             flush stdout
@@ -1178,10 +1385,27 @@ puts $channel {
         }
     }
     proc input {} {
+        if {$::editorActive} {
+            if {[gets stdin line] < 0} { return }
+            if {$line ne "edited"} { exit 12 }
+            set ::editorActive 0
+            exec stty raw -echo <@stdin
+            puts "\033\[?2004hEDITOR_INPUT_OK"
+            flush stdout
+            websocket::send $::socket text {{"id":2,"method":"fixture/ping","params":{}}}
+            return
+        }
         set character [read stdin 1]
         if {$character eq "q"} {
             puts CHAR_FORWARDED
             flush stdout
+            if {$::mode eq "external-editor"} {
+                set ::editorActive 1
+                exec stty $::terminalMode <@stdin
+                puts -nonewline stdout "\033\[?2004l\033\[?25hEDITOR_PROMPT> "
+                flush stdout
+                return
+            }
             websocket::send $::socket text {{"id":2,"method":"fixture/ping","params":{}}}
         } elseif {$character eq "r"} {
             puts BURST_INPUT_OK
@@ -1189,6 +1413,18 @@ puts $channel {
             websocket::send $::socket text {{"id":3,"method":"fixture/ping","params":{}}}
         } elseif {$character eq "x"} {
             exec stty $::terminalMode <@stdin
+            set prefix "codex --remote [lindex $::argv 1] --remote-auth-token-env CODEX_RETRY_TOKEN"
+            set reconnect "$prefix resume native-untrusted"
+            if {$::mode eq "no-thread"} { set reconnect $prefix }
+            set stop "To stop this task, run $prefix agents, select this task, and press x."
+            if {$::mode eq "switched"} { set stop "To stop this task, run:\r\n  $prefix agents" }
+            set footer "\033\[?2004l\r\n\033\]0;\007\033\]7501;state=clear\033\\\033\[?25h\033\[32mDisconnected from this task. Work may still be running.\033\[0m\r\nTo reconnect, run:\r\n  $reconnect\r\nUNRELATED_EXIT_TEXT\r\ncodex agents documentation stays\r\nagents server diagnostic\r\n$stop\r\nToken usage so far: total=17 input=11 output=6\r\n"
+            # Include split writes and both PTY streams, with native-style ANSI.
+            for {set i 0} {$i < [string length $footer]} {incr i 7} {
+                puts -nonewline stderr [string range $footer $i $i+6]
+                flush stderr
+                after 1
+            }
             # EOF must not close the PTY and hang up this still-running child.
             close stdin
             close stdout
@@ -1206,7 +1442,7 @@ close $channel
 file attributes [file join $scratch codex] -permissions 0755
 set diagnosticFixture {
     # Expect -c runs before normal script argument initialization.
-    set argv {}
+    set argv {--yolo}
     set terminalMode [exec stty -g <@stdin]
     rename wait native_wait
     proc wait {args} {
@@ -1238,6 +1474,7 @@ set diagnosticDriver {
     match_max 131072
     set output ""
     set sentInput 0
+    set sentEditorInput 0
     set sentBurstInput 0
     set sentExit 0
     set mode $env(DIAGNOSTIC_MODE)
@@ -1248,6 +1485,7 @@ set diagnosticDriver {
                 append output $expect_out(0,string)
                 if {[string length $output] > 80000} { error "unbounded backend diagnostics reached the terminal" }
                 set released [string first NATIVE_WAIT_COMPLETE $output]
+                if {$::actualLaunch} { set released [string first "To resume this session, run:" $output] }
                 if {$active} {
                     set live $output
                     if {$released >= 0} { set live [string range $output 0 $released-1] }
@@ -1270,6 +1508,15 @@ set diagnosticDriver {
                     send -- q
                     set sentInput 1
                 }
+                if {$mode eq "external-editor" && !$sentEditorInput && \
+                    [string first "EDITOR_PROMPT> " $output] >= 0} {
+                    set release [string last "\033\[?2004l" $output]
+                    if {$release < 0 || [string first "\033\[?2004h" $output $release] >= 0} {
+                        error "editor prompt was not visible before TUI re-entry"
+                    }
+                    send -- "edited\r"
+                    set sentEditorInput 1
+                }
                 if {!$sentBurstInput && [string first BURST_READY $output] >= 0} {
                     send -- r
                     set sentBurstInput 1
@@ -1287,7 +1534,12 @@ set diagnosticDriver {
                 exp_continue -continue_timer
             }
             eof {}
-            timeout { error "diagnostic capture blocked keyboard, protocol, or shutdown" }
+            timeout {
+                if {$mode eq "external-editor" && !$sentEditorInput} {
+                    error "temporary terminal release hid the editor prompt"
+                }
+                error "diagnostic capture blocked keyboard, protocol, or shutdown"
+            }
         }
         set result [wait -i $wrapperSpawn]
         set expected 7
@@ -1301,8 +1553,54 @@ set diagnosticDriver {
         if {[lindex $result 2] != 0 || [lindex $result 3] != $expected} {
             error "diagnostic reporting changed exit status: $result; output: $output"
         }
-        if {$active && (!$sentExit || [string first NATIVE_WAIT_COMPLETE $output] < 0)} {
+        if {$active && (!$sentExit || (!$::actualLaunch && [string first NATIVE_WAIT_COMPLETE $output] < 0))} {
             error "native input, wait, or terminal restoration was lost: $output"
+        }
+        if {$mode eq "external-editor" && (!$sentEditorInput || [string first EDITOR_INPUT_OK $output] < 0)} {
+            error "external editor did not receive input before TUI re-entry"
+        }
+        if {$active && ![string match signal-* $mode]} {
+            set boundary [string last "\033\[?2004l" $output]
+            if {$boundary < 0} { error "native exit boundary was lost" }
+            set live [string range $output 0 $boundary-1]
+            set footer [string range $output $boundary end]
+            foreach text {LIVE_BEGIN {Disconnected from this task.} {To reconnect, run:} LIVE_LOOKALIKE LIVE_END} {
+                if {[string first $text $live] < 0} { error "live lookalike was filtered" }
+            }
+            foreach obsolete {{Disconnected from this task.} {To reconnect, run:} {To stop this task} --remote CODEX_RETRY_TOKEN native-untrusted} {
+                if {[string first $obsolete $footer] >= 0} { error "unusable native advice survived exit" }
+            }
+            foreach text {UNRELATED_EXIT_TEXT {codex agents documentation stays} {agents server diagnostic} {Token usage so far: total=17 input=11 output=6}} {
+                if {[string first $text $footer] < 0} { error "unrelated epilogue output was lost" }
+            }
+            if {[string first "\033\[?25h" $footer] < 0} { error "native terminal restoration bytes were lost" }
+            foreach control [list "\033\]0;\007" "\033\]7501;state=clear\033\\"] {
+                if {[string first $control $footer] < 0} { error "native OSC bytes were lost" }
+            }
+            if {[regexp -all {To (?:resume this|choose a saved) session, run:} $footer] != 1} {
+                error "wrapper recovery was missing or duplicated in the epilogue"
+            }
+        }
+        if {$active} {
+            if {[regexp -all {To (?:resume this|choose a saved) session, run:} $output] != 1} {
+                error "wrapper recovery was missing or duplicated"
+            }
+            set selected confirmed-session
+            if {$mode eq "switched"} { set selected switched-session }
+            if {![regexp {To (?:resume this|choose a saved) session, run:\r*\n[ \t]*([^\r\n]+)} $output -> command]} {
+                error "recovery command was not copyable"
+            }
+            set actual [split [exec sh -c "set -- $command; printf '%s\\n' \"\$@\""] \n]
+            set expected [list $::expectedLauncher resume]
+            if {$mode ni {no-thread activation-error}} { lappend expected $selected }
+            if {$mode ni {no-thread activation-error switched}} { lappend expected --yolo }
+            if {$actual ne $expected} { error "recovery command changed arguments" }
+            set resolved [exec sh -c {command -v "$1"} sh [lindex $actual 0]]
+            file stat $resolved actualIdentity
+            file stat $::launcherPath expectedIdentity
+            if {$actualIdentity(dev) != $expectedIdentity(dev) || $actualIdentity(ino) != $expectedIdentity(ino)} {
+                error "recovery command resolved to another launcher"
+            }
         }
         if {$mode ni {closed launchfail-closed missing}} {
             if {[regexp -all {background app-server diagnostics} $output] != 1} {
@@ -1364,15 +1662,26 @@ set diagnosticDriver {
     exit 0
 }
 set env(PATH) "$scratch:$savedPath"
+# Own launcher discovery instead of inheriting a developer's installation.
+file link -symbolic [file join $scratch codex-retry] $wrapper
 set env(DIAGNOSTIC_EMPTY_PATH) [file join $scratch empty]
 file mkdir $env(DIAGNOSTIC_EMPTY_PATH)
+set quotedWrapper [file join $scratch {launcher 'with spaces} codex-retry]
+file mkdir [file dirname $quotedWrapper]
+file copy $wrapper $quotedWrapper
 set failed [catch {
-    foreach mode {normal error burst shutdown closed backend-eof signal-term signal-hup signal-int launchfail launchfail-closed missing} {
+    foreach mode {normal error burst shutdown closed backend-eof signal-term signal-hup signal-int launchfail launchfail-closed missing no-thread activation-error switched installed quoted external-editor} {
         set env(DIAGNOSTIC_MODE) $mode
         set env(DIAGNOSTIC_PID) [file join $scratch $mode.backend.pid]
         set env(DIAGNOSTIC_TUI_PID) [file join $scratch $mode.tui.pid]
-        set configuredFixture "$diagnosticFixture\n[list set argv0 $wrapper]\n[list source $wrapper]\n"
-        set configuredDriver "set timeout 6\n[list spawn -noecho expect -c $configuredFixture]\n$diagnosticDriver"
+        set launchedWrapper $wrapper
+        set expectedLauncher codex-retry
+        if {$mode eq "quoted"} { set launchedWrapper $quotedWrapper; set expectedLauncher $quotedWrapper }
+        set configuredFixture "$diagnosticFixture\n[list set argv0 $launchedWrapper]\n[list source $launchedWrapper]\n"
+        set actualLaunch [expr {$mode in {installed quoted}}]
+        set launch [list expect -c $configuredFixture]
+        if {$actualLaunch} { set launch [list $expectedLauncher --yolo] }
+        set configuredDriver "set timeout 6\n[list set expectedLauncher $expectedLauncher]\n[list set launcherPath $launchedWrapper]\n[list set actualLaunch $actualLaunch]\n[list cd $scratch]\n[list spawn -noecho {*}$launch]\n$diagnosticDriver"
         exec expect -c $configuredDriver 2>@1
     }
 } message]
