@@ -760,6 +760,18 @@ check {[clock milliseconds] - $before < 3000} "backend cleanup was not bounded"
 check {[catch {exec kill -0 $child}]} "backend survived cleanup"
 cleanup
 
+# Cleanup also owns both stderr pipe ends when launching the backend fails.
+set channels [lsort [chan names]]
+lassign [chan pipe] ::diagnostics::channel ::diagnostics::writer
+fconfigure $::diagnostics::channel -blocking 0 -encoding binary -translation binary
+puts -nonewline $::diagnostics::writer STARTUP_PARTIAL
+flush $::diagnostics::writer
+cleanup
+cleanup
+check {[lsort [chan names]] eq $channels} "repeated cleanup leaked a diagnostic pipe end"
+check {$::diagnostics::tail eq "STARTUP_PARTIAL"} "cleanup lost partial startup diagnostics"
+set ::diagnostics::tail ""
+
 # Exercise the real main/PTY lifecycle with synchronous forwarding teardown.
 set channel [file tempfile scratch]
 close $channel
@@ -921,8 +933,9 @@ puts $channel {
     if {[lindex $argv 0] eq "app-server"} {
         if {$argv ne {app-server --listen stdio:// -c {fixture="with spaces"} --enable fixture}} { exit 2 }
         set log [open $env(YOLO_FIXTURE_LOG) w]
-        puts stderr "YOLO_BACKEND_PID=[pid]"
-        flush stderr
+        set identity [open $env(YOLO_FIXTURE_PID) w]
+        puts $identity [pid]
+        close $identity
         while {[gets stdin line] >= 0} {
             puts $log $line
             flush $log
@@ -1004,11 +1017,15 @@ set resumeDriver {
     set wrapperSpawn $spawn_id
     set wrapper [exp_pid]
     set failed [catch {
-        expect {
-            -re {YOLO_BACKEND_PID=([0-9]+)} { set backend $expect_out(1,string) }
-            eof { error "resume backend exited during startup" }
-            timeout { error "resume backend startup timed out" }
+        set deadline [expr {[clock milliseconds] + 2000}]
+        while {![file exists $env(YOLO_FIXTURE_PID)] || [file size $env(YOLO_FIXTURE_PID)] == 0} {
+            if {[clock milliseconds] >= $deadline} { error "resume backend startup timed out" }
+            after 10
         }
+        set identity [open $env(YOLO_FIXTURE_PID) r]
+        set backend [string trim [read $identity]]
+        close $identity
+        if {![string is integer -strict $backend] || $backend <= 0} { error "invalid resume backend PID" }
         if {$::failureText eq ""} {
             expect {
                 -exact YOLO_PROXY_OK {}
@@ -1056,6 +1073,7 @@ set failed [catch {
         set env(YOLO_FIXTURE_MODE) $mode
         set env(YOLO_FIXTURE_ENABLED) [expr {$mode ne "ordinary"}]
         set env(YOLO_FIXTURE_LOG) [file join $scratch $mode.jsonl]
+        set env(YOLO_FIXTURE_PID) [file join $scratch $mode.pid]
         set launch {resume fixture-session --yolo}
         set remaining {resume fixture-session}
         switch $mode {
@@ -1087,8 +1105,280 @@ set failed [catch {
     }
 } message]
 set env(PATH) $savedPath
-unset -nocomplain env(YOLO_FIXTURE_MODE) env(YOLO_FIXTURE_ENABLED) env(YOLO_FIXTURE_LOG) env(YOLO_FIXTURE_ARGUMENTS)
+unset -nocomplain env(YOLO_FIXTURE_MODE) env(YOLO_FIXTURE_ENABLED) env(YOLO_FIXTURE_LOG) env(YOLO_FIXTURE_PID) env(YOLO_FIXTURE_ARGUMENTS)
 file delete -force $scratch
 check {!$failed} "fake resume launch/proxy check failed: $message"
+
+# Backend diagnostics must never cross the live TUI, including unterminated
+# messages and bursts larger than both a pipe and the retained diagnostic tail.
+set channel [file tempfile scratch]
+close $channel
+file delete $scratch
+file mkdir $scratch
+set channel [open [file join $scratch codex] w]
+puts $channel {#!/usr/bin/env expect}
+puts $channel {
+    package require json
+    package require websocket
+    set mode $env(DIAGNOSTIC_MODE)
+    fconfigure stdout -buffering line -encoding utf-8 -translation lf
+    fconfigure stderr -encoding utf-8 -translation lf
+    if {[lindex $argv 0] eq "app-server"} {
+        puts stderr BACKEND_START
+        flush stderr
+        trap SIG_IGN SIGTERM
+        if {$mode eq "shutdown"} {
+            trap {puts -nonewline stderr BACKEND_SHUTDOWN; flush stderr; exit 23} SIGTERM
+        }
+        set identity [open $env(DIAGNOSTIC_PID) w]
+        puts $identity [pid]
+        close $identity
+        fconfigure stdin -blocking 0 -encoding utf-8 -translation lf
+        proc request {} {
+            if {[gets stdin line] < 0} { return }
+            set id [dict get [json::json2dict $line] id]
+            if {$id == 2} {
+                if {$::mode eq "burst"} {
+                    puts {{"method":"fixture/burst","params":{}}}
+                    flush stdout
+                    puts -nonewline stderr "BACKEND_DROPPED\n[string repeat x 2097152]\nBACKEND_TAIL"
+                } else { puts -nonewline stderr BACKEND_PARTIAL }
+                flush stderr
+            }
+            puts [format {{"id":%d,"result":{}}} $id]
+            flush stdout
+            if {$id == 2 && $::mode eq "backend-eof"} { exit 0 }
+        }
+        fileevent stdin readable request
+        vwait forever
+    }
+    set identity [open $env(DIAGNOSTIC_TUI_PID) w]
+    puts $identity [pid]
+    close $identity
+    if {[string match signal-* $mode]} { trap SIG_IGN SIGTERM }
+    set terminalMode [exec stty -g <@stdin]
+    exec stty raw -echo <@stdin
+    fconfigure stdin -blocking 0 -encoding utf-8 -translation lf
+    proc receive {socket type message} {
+        if {$type eq "connect"} {
+            set ::socket $socket
+            websocket::send $socket text {{"id":1,"method":"fixture/ready","params":{}}}
+        } elseif {$type eq "text"} {
+            set response [json::json2dict $message]
+            if {[dict exists $response method]} {
+                puts BURST_READY
+            } else {
+                set id [dict get $response id]
+                puts [dict get {1 INPUT_READY 2 PROTOCOL_OK 3 BURST_PROTOCOL_OK} $id]
+            }
+            flush stdout
+        } elseif {$type in {close disconnect}} {
+            puts TUI_DISCONNECTED
+            flush stdout
+        }
+    }
+    proc input {} {
+        set character [read stdin 1]
+        if {$character eq "q"} {
+            puts CHAR_FORWARDED
+            flush stdout
+            websocket::send $::socket text {{"id":2,"method":"fixture/ping","params":{}}}
+        } elseif {$character eq "r"} {
+            puts BURST_INPUT_OK
+            flush stdout
+            websocket::send $::socket text {{"id":3,"method":"fixture/ping","params":{}}}
+        } elseif {$character eq "x"} {
+            exec stty $::terminalMode <@stdin
+            # EOF must not close the PTY and hang up this still-running child.
+            close stdin
+            close stdout
+            close stderr
+            after 100
+            exit [expr {$::mode eq "normal" ? 0 : 7}]
+        }
+    }
+    websocket::open [lindex $argv 1] receive \
+        -headers [list Authorization "Bearer $env([lindex $argv 3])"] -timeout 2000
+    fileevent stdin readable input
+    vwait forever
+}
+close $channel
+file attributes [file join $scratch codex] -permissions 0755
+set diagnosticFixture {
+    # Expect -c runs before normal script argument initialization.
+    set argv {}
+    set terminalMode [exec stty -g <@stdin]
+    rename wait native_wait
+    proc wait {args} {
+        set result [uplevel 1 [list native_wait {*}$args]]
+        if {[exec stty -g <@stdin] ne $::terminalMode} { error "terminal mode was not restored" }
+        puts NATIVE_WAIT_COMPLETE
+        flush stdout
+        if {$::env(DIAGNOSTIC_MODE) eq "closed"} { close stderr }
+        return $result
+    }
+    if {[string match launchfail* $env(DIAGNOSTIC_MODE)]} {
+        rename spawn native_spawn
+        proc spawn {args} {
+            set deadline [expr {[clock milliseconds] + 2000}]
+            while {![file exists $::env(DIAGNOSTIC_PID)] || [file size $::env(DIAGNOSTIC_PID)] == 0} {
+                if {[clock milliseconds] >= $deadline} { error "backend startup timed out" }
+                after 10
+            }
+            if {$::env(DIAGNOSTIC_MODE) eq "launchfail-closed"} { close stderr }
+            error "fixture TUI launch failure"
+        }
+    }
+    if {$env(DIAGNOSTIC_MODE) eq "missing"} { set env(PATH) $env(DIAGNOSTIC_EMPTY_PATH) }
+}
+set diagnosticDriver {
+    set wrapperSpawn $spawn_id
+    set wrapper [exp_pid]
+    log_user 0
+    match_max 131072
+    set output ""
+    set sentInput 0
+    set sentBurstInput 0
+    set sentExit 0
+    set mode $env(DIAGNOSTIC_MODE)
+    set active [expr {$mode ni {launchfail launchfail-closed missing}}]
+    set failed [catch {
+        expect {
+            -re {(?s).+} {
+                append output $expect_out(0,string)
+                if {[string length $output] > 80000} { error "unbounded backend diagnostics reached the terminal" }
+                set released [string first NATIVE_WAIT_COMPLETE $output]
+                if {$active} {
+                    set live $output
+                    if {$released >= 0} { set live [string range $output 0 $released-1] }
+                    if {[string first BACKEND_ $live] >= 0 || \
+                        [string first "background app-server diagnostics" $live] >= 0} {
+                        error "backend diagnostics crossed the live TUI"
+                    }
+                }
+                if {!$sentInput && [string first INPUT_READY $output] >= 0} {
+                    set identity [open $env(DIAGNOSTIC_PID) r]
+                    set backend [string trim [read $identity]]
+                    close $identity
+                    set identity [open $env(DIAGNOSTIC_TUI_PID) r]
+                    set tui [string trim [read $identity]]
+                    close $identity
+                    foreach child [list $backend $tui] {
+                        if {![string is integer -strict $child] || $child <= 0} { error "invalid diagnostic fixture PID" }
+                        exec kill -0 $child
+                    }
+                    send -- q
+                    set sentInput 1
+                }
+                if {!$sentBurstInput && [string first BURST_READY $output] >= 0} {
+                    send -- r
+                    set sentBurstInput 1
+                }
+                if {!$sentExit && [string first PROTOCOL_OK $output] >= 0 && \
+                    ($mode ne "burst" || ([string first BURST_INPUT_OK $output] >= 0 && \
+                        [string first BURST_PROTOCOL_OK $output] >= 0)) && \
+                    ($mode ne "backend-eof" || [string first TUI_DISCONNECTED $output] >= 0)} {
+                    if {[string first CHAR_FORWARDED $output] < 0} { error "protocol response preceded input" }
+                    if {[string match signal-* $mode]} {
+                        exec kill -[string toupper [string range $mode 7 end]] $wrapper
+                    } else { send -- x }
+                    set sentExit 1
+                }
+                exp_continue -continue_timer
+            }
+            eof {}
+            timeout { error "diagnostic capture blocked keyboard, protocol, or shutdown" }
+        }
+        set result [wait -i $wrapperSpawn]
+        set expected 7
+        switch $mode {
+            normal { set expected 0 }
+            launchfail - launchfail-closed - missing { set expected 1 }
+            signal-term { set expected 143 }
+            signal-hup { set expected 129 }
+            signal-int { set expected 130 }
+        }
+        if {[lindex $result 2] != 0 || [lindex $result 3] != $expected} {
+            error "diagnostic reporting changed exit status: $result; output: $output"
+        }
+        if {$active && (!$sentExit || [string first NATIVE_WAIT_COMPLETE $output] < 0)} {
+            error "native input, wait, or terminal restoration was lost: $output"
+        }
+        if {$mode ni {closed launchfail-closed missing}} {
+            if {[regexp -all {background app-server diagnostics} $output] != 1} {
+                error "missing or duplicate diagnostic guidance: $output"
+            }
+            if {$mode eq "burst"} {
+                if {[string first BACKEND_TAIL $output] < 0 || \
+                    [string first BACKEND_DROPPED $output] >= 0 || \
+                    [string first "output truncated" $output] < 0} { error "diagnostic tail or truncation was lost" }
+                set start [string first "\n" $output [string first "output truncated" $output]]
+                set end [string first "codex-retry: private app-server stopped" $output]
+                set retained [string range $output $start+1 $end-1]
+                # Strip terminal-added CRs: 64 KiB of data plus puts' final LF.
+                set retained [string map [list "\r" ""] $retained]
+                if {[string length $retained] != 65537} {
+                    error "diagnostic retention bound changed"
+                }
+            } else {
+                if {[string first BACKEND_START $output] < 0 || \
+                    [string first "output truncated" $output] >= 0} { error "short startup diagnostics changed" }
+                if {$active && [string first BACKEND_PARTIAL $output] < 0} { error "partial diagnostic was lost" }
+                if {$mode eq "shutdown" && [string first BACKEND_SHUTDOWN $output] < 0} {
+                    error "shutdown diagnostic was lost"
+                }
+            }
+        }
+        if {$mode eq "launchfail" && [string first "fixture TUI launch failure" $output] < 0} {
+            error "TUI launch failure was masked"
+        }
+        if {$mode eq "missing" && [string first "codex-retry:" $output] < 0} { error "backend launch failure was masked" }
+        if {$mode in {closed launchfail-closed} && [string first BACKEND_ $output] >= 0} {
+            error "closed stderr was bypassed"
+        }
+        foreach identity [list $env(DIAGNOSTIC_PID) $env(DIAGNOSTIC_TUI_PID)] {
+            if {![file exists $identity]} { continue }
+            set channel [open $identity r]
+            set child [string trim [read $channel]]
+            close $channel
+            if {![string is integer -strict $child] || $child <= 0} { error "invalid diagnostic fixture PID" }
+            if {![catch {exec kill -0 $child}]} { error "diagnostic fixture child survived cleanup" }
+        }
+    } message]
+    if {$failed} {
+        catch {exec kill -TERM $wrapper}
+        catch {expect -timeout 2 eof}
+        catch {exec kill -KILL $wrapper}
+        foreach identity [list $env(DIAGNOSTIC_PID) $env(DIAGNOSTIC_TUI_PID)] {
+            catch {
+                set channel [open $identity r]
+                set child [string trim [read $channel]]
+                close $channel
+                if {[string is integer -strict $child] && $child > 0} { exec kill -KILL $child }
+            }
+        }
+        set detail [string map [list "\r" {\r} "\n" {\n}] [string range $message 0 1023]]
+        puts stderr "diagnostic fixture $mode: $detail"
+        exit 1
+    }
+    exit 0
+}
+set env(PATH) "$scratch:$savedPath"
+set env(DIAGNOSTIC_EMPTY_PATH) [file join $scratch empty]
+file mkdir $env(DIAGNOSTIC_EMPTY_PATH)
+set failed [catch {
+    foreach mode {normal error burst shutdown closed backend-eof signal-term signal-hup signal-int launchfail launchfail-closed missing} {
+        set env(DIAGNOSTIC_MODE) $mode
+        set env(DIAGNOSTIC_PID) [file join $scratch $mode.backend.pid]
+        set env(DIAGNOSTIC_TUI_PID) [file join $scratch $mode.tui.pid]
+        set configuredFixture "$diagnosticFixture\n[list set argv0 $wrapper]\n[list source $wrapper]\n"
+        set configuredDriver "set timeout 6\n[list spawn -noecho expect -c $configuredFixture]\n$diagnosticDriver"
+        exec expect -c $configuredDriver 2>@1
+    }
+} message]
+set env(PATH) $savedPath
+unset -nocomplain env(DIAGNOSTIC_MODE) env(DIAGNOSTIC_PID) env(DIAGNOSTIC_TUI_PID) env(DIAGNOSTIC_EMPTY_PATH)
+file delete -force $scratch
+check {!$failed} "fake backend diagnostic isolation failed: $message"
 
 puts "PASS: structured retries, input/settings, backoff, cancellation, progress, IDs, arguments, resume permissions, proxy/PTY forwarding, authentication, and cleanup"

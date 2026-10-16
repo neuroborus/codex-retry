@@ -403,10 +403,8 @@ proc backend_read {} {
             ![info exists ::client] || $::client ne $client} { return }
     }
     if {[eof $channel]} {
-        fileevent $channel readable ""
-        retry::reset
-        resume::reset
         catch {websocket::close $client}
+        cleanup
     }
 }
 
@@ -496,6 +494,77 @@ proc handshake {socket} {
         [chan pending input $socket] > 16384} { drop_handshake $socket }
 }
 
+namespace eval diagnostics {
+    variable channel ""
+    variable writer ""
+    variable tail ""
+    variable truncated 0
+}
+
+# Binary reads retain at most 64 KiB, with at most 16 KiB of work per callback.
+proc diagnostics::drain {} {
+    variable channel; variable tail; variable truncated
+    if {$channel eq ""} { return }
+    for {set i 0} {$i < 4} {incr i} {
+        if {[catch {read $channel 4096} data]} {
+            set truncated 1
+        } else {
+            append tail $data
+            if {[string length $tail] > 65536} {
+                set tail [string range $tail end-65535 end]
+                set truncated 1
+            }
+            if {![eof $channel]} {
+                if {$data eq ""} { return }
+                continue
+            }
+        }
+        catch {close $channel}
+        set channel ""
+        return
+    }
+}
+
+proc diagnostics::finish {} {
+    variable channel; variable writer
+    catch {close $writer}
+    set writer ""
+    # The backend has been reaped. Bound the final drain even if a descendant
+    # inherited stderr; reading more than the retained tail also marks truncation.
+    for {set i 0} {$i < 5} {incr i} { drain }
+    catch {close $channel}
+    set channel ""
+}
+
+proc diagnostics::report {} {
+    variable tail; variable truncated
+    if {$tail eq "" && !$truncated} { return }
+    catch {
+        puts stderr "codex-retry: background app-server diagnostics (shown after terminal release):"
+        if {$truncated} { puts stderr "codex-retry: output truncated; showing up to 64 KiB of retained diagnostics." }
+        puts stderr [encoding convertfrom utf-8 $tail]
+        flush stderr
+    }
+    set tail ""
+    set truncated 0
+}
+
+proc terminate {children} {
+    if {![llength $children]} { return }
+    catch {exec kill -TERM {*}$children}
+    # Bound graceful shutdown, then reap even a child that ignores SIGTERM.
+    for {set i 0} {$i < 20 && [llength $children]} {incr i} {
+        diagnostics::drain
+        set alive {}
+        foreach child $children {
+            if {![catch {exec kill -0 $child}]} { lappend alive $child }
+        }
+        set children $alive
+        if {[llength $children]} { after 25 }
+    }
+    if {[llength $children]} { catch {exec kill -KILL {*}$children} }
+}
+
 proc cleanup {} {
     retry::reset
     resume::reset
@@ -509,27 +578,29 @@ proc cleanup {} {
         unset ::backend
         set children [pid $channel]
         fileevent $channel readable ""
-        catch {exec kill -TERM {*}$children}
-        # Bound graceful shutdown, then reap even a child that ignores SIGTERM.
-        for {set i 0} {$i < 20 && [llength $children]} {incr i} {
-            set alive {}
-            foreach child $children {
-                if {![catch {exec kill -0 $child}]} { lappend alive $child }
-            }
-            set children $alive
-            if {[llength $children]} { after 25 }
-        }
-        if {[llength $children]} { catch {exec kill -KILL {*}$children} }
+        terminate $children
         fconfigure $channel -blocking 1
         catch {close $channel}
+    }
+    diagnostics::finish
+}
+
+proc shutdown {status} {
+    set ::signalStatus $status
+    cleanup
+    if {[info exists ::tuiPid]} {
+        terminate [list $::tuiPid]
+    } else {
+        diagnostics::report
+        exit $status
     }
 }
 
 proc bgerror {message} {
     set ::proxyError 1
-    catch {puts stderr "codex-retry: $message"}
+    if {![info exists ::proxyMessage]} { set ::proxyMessage $message }
     cleanup
-    catch {exec kill -TERM $::tuiPid}
+    if {[info exists ::tuiPid]} { terminate [list $::tuiPid] }
 }
 
 proc resize {} {
@@ -597,7 +668,7 @@ proc backend_options {arguments} {
 }
 
 proc main {arguments} {
-    global spawn_out
+    global spawn_out tuiSpawn
     package require websocket
     set options [backend_options $arguments]
     lassign [resume_arguments $arguments] arguments yolo
@@ -609,16 +680,21 @@ proc main {arguments} {
     close $random
     set ::listener [socket -server accept -myaddr 127.0.0.1 0]
     set port [lindex [fconfigure $::listener -sockname] 2]
+    # A parent can close our PTY after EOF while Tcl is still finalizing.
+    exit -onexit {trap SIG_IGN {SIGHUP SIGWINCH}}
+    trap {shutdown 143} SIGTERM
+    trap {shutdown 129} SIGHUP
+    trap {shutdown 130} SIGINT
+    lassign [chan pipe] ::diagnostics::channel ::diagnostics::writer
+    fconfigure $::diagnostics::channel -blocking 0 -encoding binary -translation binary
     set ::backend [open [concat [list | codex app-server --listen stdio://] $options \
-        [list 2>@stderr]] r+]
+        [list 2>@$::diagnostics::writer]] r+]
+    close $::diagnostics::writer
+    set ::diagnostics::writer ""
+    fileevent $::diagnostics::channel readable diagnostics::drain
     fconfigure $::backend -blocking 0 -buffering line -encoding utf-8 -translation lf
     # Only the TUI needs the proxy credential.
     set ::env(CODEX_RETRY_TOKEN) $token
-    # A parent can close our PTY after EOF while Tcl is still finalizing.
-    exit -onexit {trap SIG_IGN {SIGHUP SIGWINCH}}
-    trap {cleanup; catch {exec kill -TERM $::tuiPid}; exit 143} SIGTERM
-    trap {cleanup; catch {exec kill -TERM $::tuiPid}; exit 129} SIGHUP
-    trap {cleanup; catch {exec kill -TERM $::tuiPid}; exit 130} SIGINT
     spawn -noecho codex --remote ws://127.0.0.1:$port \
         --remote-auth-token-env CODEX_RETRY_TOKEN {*}$arguments
     set tuiSpawn $spawn_id
@@ -631,13 +707,16 @@ proc main {arguments} {
     trap SIG_IGN SIGWINCH
     set result [wait -i $tuiSpawn]
     close -i $tuiSpawn
-    unset ::tuiPid
+    unset ::tuiPid tuiSpawn
     cleanup
+    diagnostics::report
+    if {[info exists ::proxyMessage]} { catch {puts stderr "codex-retry: $::proxyMessage"} }
     # Optional guidance must preserve the TUI's exit status even if stderr fails.
     catch {
         puts stderr "codex-retry: private app-server stopped; native remote reconnect commands no longer apply."
         puts stderr "codex-retry: reopen a saved session with ./codex-retry resume SESSION_ID or ./codex-retry resume --last."
     }
+    if {[info exists ::signalStatus]} { return $::signalStatus }
     if {[info exists ::proxyError]} { return 1 }
     if {[lindex $result 2] != 0} { error "failed to wait for Codex: $result" }
     if {[lindex $result 4] eq "CHILDKILLED"} {
@@ -648,9 +727,14 @@ proc main {arguments} {
 
 if {[file normalize [info script]] eq [file normalize $argv0]} {
     if {[catch {main $argv} result]} {
-        puts stderr "codex-retry: $result"
-        catch {exec kill -TERM $::tuiPid}
+        if {[info exists ::tuiPid]} { terminate [list $::tuiPid] }
+        catch {wait -i $::tuiSpawn}
+        catch {close -i $::tuiSpawn}
+        unset -nocomplain ::tuiPid ::tuiSpawn
         cleanup
+        diagnostics::report
+        catch {puts stderr "codex-retry: $result"}
+        if {[info exists ::signalStatus]} { exit $::signalStatus }
         exit 1
     }
     exit $result

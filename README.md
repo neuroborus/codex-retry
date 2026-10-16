@@ -24,6 +24,12 @@ Large unrelated startup replies use their request ID and envelope boundaries
 for routing without decoding the payload, keeping keyboard forwarding responsive.
 Other response layouts use the full JSON parser.
 
+Background app-server diagnostics are kept out of the interactive terminal.
+After the TUI exits and releases the terminal, the wrapper prints them to stderr
+with a diagnostic heading. Only the latest 64 KiB are retained in memory; a
+truncation notice appears when earlier output was discarded. Startup failures
+are reported directly if no TUI launched. No diagnostic log is saved to disk.
+
 The private app-server stops when the TUI exits or disconnects. The native TUI's
 remote reconnect commands and "running work continues" message assume a server
 that stays alive; that assumption does not apply to this wrapper. Reopen a saved
