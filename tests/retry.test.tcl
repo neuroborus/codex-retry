@@ -1,6 +1,15 @@
 #!/usr/bin/env tclsh
 
 source [file join [file dirname [info script]] .. codex-retry]
+set proxyFixture [file normalize [file join [file dirname [info script]] proxy-fixture.tcl]]
+# Every fake child inherits an empty wrapper configuration, never the user's.
+set configEnvironment [array get env XDG_CONFIG_HOME]
+set configChannel [file tempfile configScratch]
+try {
+    close $configChannel
+    file delete $configScratch
+    file mkdir $configScratch
+    set env(XDG_CONFIG_HOME) $configScratch
 
 proc check {condition message} {
     if {![uplevel 1 [list expr $condition]]} { error $message }
@@ -41,12 +50,923 @@ proc elicitation {turn {thread t1}} {
     retry::server [format {{"id":"elicitation","method":"mcpServer/elicitation/request","params":{"threadId":"%s","turnId":%s,"serverName":"fixture","mode":"form","_meta":null,"message":"sample input","requestedSchema":{"type":"object","properties":{}}}}} $thread $turn]
 }
 set request {{"id":7,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"original\nrequest \"quoted\" é\u0001"},{"type":"localImage","path":"sample.png"}],"effort":"high","sandboxPolicy":{"type":"readOnly"},"special":{"odd\"key":"escaped"},"optional":null,"flag":true,"count":3,"emptyObject":{},"emptyArray":[]}}}
+set userItem {{"type":"userMessage","id":"original-user","clientId":null,"content":[{"text_elements":[],"text":"original\nrequest \"quoted\" é\u0001","type":"text"},{"path":"sample.png","type":"localImage"}]}}
+set userItems [json::write array $userItem]
+proc user_event {method {item ""} {turn turn1} {thread t1}} {
+    if {$item eq ""} { set item $::userItem }
+    retry::server [format {{"method":"%s","params":{"threadId":"%s","turnId":"%s","item":%s}}} $method $thread $turn $item]
+}
 proc begin {{acknowledge 1}} {
     retry::reset
     set ::retry::finished {}
     retry::client $::request
     if {$acknowledge} { reply 7 turn1; started turn1 }
 }
+
+# Opt-in recovery uses the same controlled timers and transport as overloads.
+rename automatic::notify automatic::native_notify
+set notices {}
+proc automatic::notify {json} { lappend ::notices [::huddle::json2huddle $json]; return 1 }
+proc configure_fixture {json} {
+    set path [file join $::configScratch codex-retry config.json]
+    file mkdir [file dirname $path]
+    set channel [open $path w]
+    puts -nonewline $channel $json
+    close $channel
+    automatic::configure
+}
+automatic::configure
+check {$automatic::flags eq {auto_reset_limit 0 auto_continue_after_stop 0}} "missing config enabled recovery"
+foreach json {
+    {{}}
+    {{"unknown":true}}
+    {{"auto_reset_limit":false,"auto_continue_after_stop":false}}
+} {
+    configure_fixture $json
+    check {$automatic::flags eq {auto_reset_limit 0 auto_continue_after_stop 0} && $automatic::configWarning eq ""} "default flags changed"
+}
+foreach value {null 0 1 {"true"} {"false"} {[]} {{}}} {
+    configure_fixture [format {{"auto_reset_limit":true,"auto_continue_after_stop":%s}} $value]
+    check {$automatic::flags eq {auto_reset_limit 0 auto_continue_after_stop 0} && $automatic::configWarning ne ""} "invalid JSON flag did not disable both modes"
+}
+foreach json [list {[]} {true} {} {{"auto_reset_limit":true} trailing} \
+    {{"auto_reset_limit":true},{}} {{"auto_reset_limit":true,}} \
+    {{"auto_reset_limit":"true","auto_reset_limit":true}} \
+    "\{\"auto_reset_limit\":true,\"unknown\":\"raw\nnewline\"\}" \
+    "\{\"auto_reset_limit\":true,\u00a0\"unknown\":null\}" \
+    {/* comment */ "auto_reset_limit":true} [string repeat x 16385]] {
+    configure_fixture $json
+    check {$automatic::flags eq {auto_reset_limit 0 auto_continue_after_stop 0} && $automatic::configWarning ne ""} "malformed config enabled recovery"
+}
+set path [file join $configScratch codex-retry config.json]
+file delete $path
+file mkdir $path
+automatic::configure
+check {$automatic::configWarning ne ""} "unreadable config was silently accepted"
+file delete $path
+retry::client {{"method":"initialized"}}
+retry::client {{"method":"initialized"}}
+check {[llength $notices] == 1 && [huddle get_stripped [lindex $notices 0] method] eq "warning"} "config warning was missing or repeated"
+foreach reset {0 1} {
+    foreach follow {0 1} {
+        configure_fixture [format {{"auto_reset_limit":%s,"auto_continue_after_stop":%s}} \
+            [expr {$reset ? "true" : "false"}] [expr {$follow ? "true" : "false"}]]
+        check {[dict get $automatic::flags auto_reset_limit] == $reset && \
+            [dict get $automatic::flags auto_continue_after_stop] == $follow && \
+            $automatic::configWarning eq ""} "JSON boolean combination was not preserved"
+    }
+}
+file delete [file join $configScratch codex-retry config.json]
+automatic::configure
+set autoSequence 0
+proc auto_begin {{reset 0} {follow 1} {acknowledge 1}} {
+    automatic::cancel
+    retry::reset
+    set ::sent {}
+    set ::notices {}
+    set ::automatic::live {}
+    set ::automatic::flags [list auto_reset_limit $reset auto_continue_after_stop $follow]
+    automatic::selected [::huddle::json2huddle {{"model":"fixture-model","modelProvider":"openai"}}] t1
+    set ::autoRequest [::huddle::json2huddle $::request]
+    set ::autoId [json::write string manual-[incr ::autoSequence]]
+    set ::autoTurn own-$::autoSequence
+    huddle set ::autoRequest id [::huddle::json2huddle $::autoId]
+    huddle set ::autoRequest params toolOutput [huddle create text [huddle string old-output]]
+    huddle set ::autoRequest params additionalContext [huddle create old [huddle string context]]
+    huddle set ::autoRequest params parentTurnId [huddle string old-parent]
+    retry::client [json_dump $::autoRequest]
+    if {$acknowledge} { reply $::autoId $::autoTurn; started $::autoTurn }
+}
+proc auto_reply {result {id ""}} {
+    if {$id eq ""} { set id [dict get $::automatic::current opId] }
+    retry::server [format {{"id":%s,"result":%s}} $id $result]
+}
+proc limits_fixture {json path value} {
+    set object [::huddle::json2huddle $json]
+    huddle set object {*}$path [::huddle::json2huddle $value]
+    return [json_dump $object]
+}
+proc auto_followup {} {
+    set follow [::huddle::json2huddle [lindex $::sent end]]
+    set params [huddle get $follow params]
+    check {[huddle get_stripped $follow method] eq "turn/start" && \
+        [huddle get_stripped $params threadId] eq "t1"} "follow-up changed thread or method"
+    check {[huddle type $params input] eq "list" && [huddle llength [huddle get $params input]] == 1 && \
+        [huddle get_stripped $params input 0 type] eq "text" && \
+        [huddle get_stripped $params input 0 text] eq "continue"} "follow-up was not exactly plain ASCII continue"
+    check {[huddle type $params clientUserMessageId] eq "string" && \
+        [huddle get_stripped $params clientUserMessageId] ne ""} "follow-up omitted its fresh user identity"
+    foreach key {effort sandboxPolicy} {
+        check {[huddle equal [huddle get $params $key] [huddle get $::autoRequest params $key]]} "follow-up changed effective settings"
+    }
+    foreach key {toolOutput additionalContext parentTurnId rootTurnId special flag count} {
+        check {![huddle exists $params $key]} "follow-up replayed original context or metadata"
+    }
+    return [json_dump [huddle get $follow id]]
+}
+set exhausted {{"accountId":"account-A","ordinaryUsageAllowed":false,"rateLimits":{"limitId":"codex","normalModelSlug":null,"spendControlReached":false,"rateLimitReachedType":"rate_limit_reached","primary":{"usedPercent":100,"resetsAt":1000},"secondary":null},"rateLimitsByLimitId":null,"rateLimitResetCredits":{"availableCount":1,"credits":null}}}
+set restored [string map [list {"ordinaryUsageAllowed":false} {"ordinaryUsageAllowed":true} \
+    {"rateLimitReachedType":"rate_limit_reached"} {"rateLimitReachedType":null}] $exhausted]
+proc auto_until {stage} {
+    auto_begin 1 1
+    completed $::autoTurn failed usageLimitExceeded
+    if {$stage eq "queued_read"} { return }
+    fire
+    if {$stage eq "read"} { return }
+    auto_reply $::exhausted
+    if {$stage eq "queued_consume"} { return }
+    fire
+    if {$stage eq "consume"} { return }
+    auto_reply {{"outcome":"reset"}}
+    if {$stage eq "verify"} { return }
+    auto_reply $::restored
+}
+
+# Both flags default off, and each flag authorizes only its own terminal code.
+foreach reset {0 1} {
+    foreach follow {0 1} {
+        auto_begin $reset $follow
+        completed $autoTurn failed cyberPolicy
+        check {[dict size $timers] == $follow} "content-stop flag combination scheduled the wrong action"
+        if {$follow} { fire; auto_followup; check {[llength $sent] == 1} "content stop also tried a reset" }
+        auto_begin $reset $follow
+        completed $autoTurn failed usageLimitExceeded
+        check {[dict size $timers] == $reset} "usage-limit flag combination scheduled the wrong action"
+        if {$reset} {
+            fire
+            check {[field [json::json2dict [lindex $sent end]] method] eq "account/rateLimits/read"} "usage failure skipped the authoritative read"
+        }
+    }
+}
+foreach code {other misalignmentPolicyViolation rateLimitExceeded sessionBudgetExceeded contextWindowExceeded unauthorized} {
+    auto_begin 1 1
+    completed $autoTurn failed $code
+    check {[dict size $timers] == 0 && $sent eq ""} "an unrelated error triggered opt-in recovery"
+}
+auto_begin 1 1
+retry::server [format {{"method":"error","params":{"threadId":"t1","turnId":"%s","willRetry":false,"error":{"codexErrorInfo":"cyberPolicy","message":"This content cannot be shown"}}}} $autoTurn]
+retry::server [format {{"method":"model/safetyBuffering/updated","params":{"threadId":"t1","turnId":"%s","showBufferingUi":true}}} $autoTurn]
+retry::server [format {{"method":"turn/moderationMetadata","params":{"threadId":"t1","turnId":"%s","metadata":{"stop":"cyberPolicy"}}}} $autoTurn]
+check {[dict size $timers] == 0} "a nonterminal restriction event scheduled continuation"
+completed $autoTurn completed cyberPolicy
+check {[dict size $timers] == 0} "normal successful completion triggered continuation"
+
+# Partial tool effects permit a new neutral turn, never original-request replay.
+auto_begin 1 1
+user_event item/completed {} $autoTurn
+completed $autoTurn failed cyberPolicy {[{"type":"commandExecution","id":"already-applied"}]}
+completed $autoTurn failed cyberPolicy
+check {[dict size $timers] == 1 && [llength $sent] == 0} "duplicate stop acted early or scheduled multiple turns"
+fire
+set followId [auto_followup]
+check {[reply $followId continued-turn] == 0} "internal continuation reply leaked to native client"
+started continued-turn
+completed continued-turn failed serverOverloaded
+check {[dict size $timers] == 1 && [lindex $delays end] == 5000} "continuation lost the default overload retry"
+fire
+set replayId [auto_followup]
+reply $replayId replayed-continuation
+started replayed-continuation
+completed replayed-continuation failed usageLimitExceeded
+check {[dict size $timers] == 1 && [llength $notices] == 0 && [llength $sent] == 2} "overload replay blocked a later eligible reset"
+fire
+auto_reply $exhausted
+fire
+auto_reply {{"outcome":"reset"}}
+auto_reply $restored
+fire
+set id [auto_followup]
+check {[llength $sent] == 6 && [dict size $timers] == 0} "reset after overload did not submit one continuation"
+reply $id recovered-after-overload
+completed recovered-after-overload completed
+# A manual new turn, without resetting the engine, remains eligible.
+huddle set autoRequest id [huddle string renewed-manual]
+retry::client [json_dump $autoRequest]
+reply {"renewed-manual"} renewed-turn
+completed renewed-turn failed cyberPolicy
+fire
+auto_followup
+check {[llength $sent] == 7} "new manual input lost recovery eligibility"
+
+# Reset outcomes require an authoritative, account-matched post-redemption read.
+foreach outcome {reset alreadyRedeemed} {
+    auto_until read
+    set readId [dict get $automatic::current opId]
+    check {[auto_reply $exhausted] == 0} "internal limits reply leaked"
+    set logical [json_dump [dict get $automatic::current redemption]]
+    auto_reply $exhausted $readId
+    completed $autoTurn failed usageLimitExceeded
+    check {[json_dump [dict get $automatic::current redemption]] eq $logical && [dict size $timers] == 1} "duplicates changed the logical redemption"
+    fire
+    set consume [::huddle::json2huddle [lindex $sent end]]
+    check {[huddle get_stripped $consume method] eq "account/rateLimitResetCredit/consume" && \
+        [huddle get_stripped $consume params idempotencyKey] ne "" && \
+        ![huddle exists $consume params creditId]} "count-only credit was not redeemable"
+    set consumeId [json_dump [huddle get $consume id]]
+    auto_reply [format {{"outcome":"%s"}} $outcome]
+    auto_reply [format {{"outcome":"%s"}} $outcome] $consumeId
+    check {[llength $sent] == 3 && [field [json::json2dict [lindex $sent end]] method] eq "account/rateLimits/read"} "consume outcome skipped or duplicated verification"
+    auto_reply $restored
+    check {[llength $sent] == 3} "verification submitted continuation before native forwarding"
+    fire
+    auto_followup
+    check {[llength $sent] == 4 && [dict size $timers] == 0} "verified reset did not submit exactly one continuation"
+}
+
+# Distinct failures recover independently; stale events cannot steer a later
+# incident, authorize its account operations, or spend its verification read.
+proc auto_stale {replies turns} {
+    set before [list $::automatic::current $::retry::current $::automatic::live \
+        $::timers $::sent $::notices]
+    foreach {id result} $replies {
+        check {[auto_reply $result $id] == 0} "an earlier account reply leaked to the client"
+        check {[retry::server [format {{"id":%s,"error":{"code":-1,"message":"late account error"}}} $id]] == 0} "an earlier account error leaked to the client"
+    }
+    foreach {turn code} $turns {
+        started $turn
+        completed $turn failed $code
+        user_event item/completed {{"type":"commandExecution","id":"earlier-tool"}} $turn
+    }
+    check {[list $::automatic::current $::retry::current $::automatic::live \
+        $::timers $::sent $::notices] eq $before} "earlier-incident events changed a later recovery"
+}
+foreach {reset follow codes} {
+    0 1 {cyberPolicy cyberPolicy cyberPolicy}
+    1 0 {usageLimitExceeded usageLimitExceeded}
+    1 1 {usageLimitExceeded cyberPolicy usageLimitExceeded}
+    1 1 {cyberPolicy usageLimitExceeded cyberPolicy}
+} {
+    auto_begin $reset $follow
+    set turn $autoTurn
+    set oldReplies {}
+    set oldTurns {}
+    set redemptionKeys {}
+    set followIds {}
+    set userIds {}
+    set incident 0
+    foreach code $codes {
+        incr incident
+        set dispatched [llength $sent]
+        completed $turn failed $code
+        set pending $timers
+        completed $turn failed $code
+        auto_stale $oldReplies $oldTurns
+        check {$timers eq $pending && [dict size $timers] == 1 && \
+            [llength $sent] == $dispatched} "duplicate failure changed its queued action"
+        if {$code eq "usageLimitExceeded"} {
+            fire
+            set readId [dict get $automatic::current opId]
+            check {[lsearch -exact $oldReplies $readId] < 0 && \
+                [field [json::json2dict [lindex $sent end]] method] eq "account/rateLimits/read"} "a reset incident reused an account operation or skipped fresh eligibility"
+            auto_stale $oldReplies $oldTurns
+            auto_reply $exhausted
+            set logical [json_dump [dict get $automatic::current redemption]]
+            set key [huddle get_stripped [dict get $automatic::current redemption] idempotencyKey]
+            check {[lsearch -exact $redemptionKeys $key] < 0} "distinct reset incidents reused a logical redemption key"
+            lappend redemptionKeys $key
+            set pending $timers
+            auto_reply $exhausted $readId
+            completed $turn failed $code
+            check {$timers eq $pending && [json_dump [dict get $automatic::current redemption]] eq $logical} "duplicates changed a reset's logical redemption"
+            fire
+            set consumeId [dict get $automatic::current opId]
+            set consume [::huddle::json2huddle [lindex $sent end]]
+            check {[huddle get_stripped $consume method] eq "account/rateLimitResetCredit/consume" && \
+                [json_dump [huddle get $consume params]] eq $logical} "redemption changed at dispatch"
+            auto_stale $oldReplies $oldTurns
+            set pending $timers
+            auto_reply $exhausted $readId
+            completed $turn failed $code
+            check {$timers eq $pending && [llength $sent] == $dispatched + 2} "duplicate failure or eligibility reply consumed another reset"
+            auto_reply {{"outcome":"reset"}}
+            set verifyId [dict get $automatic::current opId]
+            auto_stale $oldReplies $oldTurns
+            # Spend the bounded extra verification on each incident. A later
+            # incident must get its own budget and authoritative account read.
+            retry::server {{"method":"account/rateLimits/updated","params":{}}}
+            auto_reply $restored
+            set finalVerifyId [dict get $automatic::current opId]
+            check {$finalVerifyId ne $verifyId && [field $automatic::current phase] eq "verify"} "a later reset lost its independent verification read"
+            auto_stale $oldReplies $oldTurns
+            auto_reply $restored
+            lappend oldReplies $readId $exhausted $consumeId {{"outcome":"reset"}} \
+                $verifyId $restored $finalVerifyId $restored
+        }
+        lappend oldTurns $turn $code
+        auto_stale $oldReplies [lrange $oldTurns 0 end-2]
+        fire
+        set id [auto_followup]
+        set followRequest [::huddle::json2huddle [lindex $sent end]]
+        set userId [huddle get_stripped $followRequest params clientUserMessageId]
+        check {[lsearch -exact $followIds $id] < 0 && [lsearch -exact $userIds $userId] < 0} "distinct continuations reused request or user identity"
+        lappend followIds $id
+        lappend userIds $userId
+        set dispatched $sent
+        # Duplicates after dispatch must neither queue another turn nor cancel
+        # ownership while the new acknowledgement is still pending.
+        auto_stale $oldReplies $oldTurns
+        set turn repeated-$autoSequence-$incident
+        reply $id $turn
+        started $turn
+        set params [huddle get $followRequest params]
+        set echo [huddle create type [huddle string userMessage] id [huddle string user-$turn] \
+            clientId [huddle get $params clientUserMessageId] content [huddle get $params input]]
+        user_event item/completed [json_dump $echo] $turn
+        auto_stale $oldReplies $oldTurns
+        check {$sent eq $dispatched && [dict size $timers] == 0 && $notices eq ""} "duplicate events dispatched another continuation or stopped a valid one"
+    }
+    completed $turn completed
+    check {[dict size $timers] == 0 && $notices eq ""} "success after repeated recovery continued or warned"
+}
+auto_until read
+set detailed [string map [list {"credits":null} {"credits":[{"id":"earned-current","status":"available","resetType":"codexRateLimits"}]}] $exhausted]
+auto_reply $detailed
+fire
+check {[field [json::json2dict [lindex $sent end]] params creditId] eq "earned-current"} "credit ID was not selected from the current read"
+foreach outcome {noCredit nothingToReset unknown} {
+    auto_until consume
+    auto_reply [format {{"outcome":"%s"}} $outcome]
+    check {[dict size $timers] == 0 && [llength $notices] == 1 && [llength $sent] == 2} "failed redemption continued or looped"
+}
+foreach {path value} {
+    {rateLimitResetCredits availableCount} 0
+    {rateLimitResetCredits availableCount} null
+    {rateLimitResetCredits availableCount} {"1"}
+    rateLimitResetCredits null
+    rateLimitResetCredits {{}}
+    ordinaryUsageAllowed true
+    ordinaryUsageAllowed null
+    {rateLimits spendControlReached} true
+    {rateLimits spendControlReached} null
+    {rateLimits rateLimitReachedType} {"workspace_owner_usage_limit_reached"}
+    {rateLimits limitId} {"unrelated-quota"}
+    accountId null
+} {
+    auto_until read
+    auto_reply [limits_fixture $exhausted $path $value]
+    check {[dict size $timers] == 0 && [llength $notices] == 1 && [llength $sent] == 1} "unverified exhaustion or credits consumed a reset"
+}
+foreach {path value} {
+    ordinaryUsageAllowed null
+    ordinaryUsageAllowed false
+    accountId {"account-B"}
+    {rateLimits limitId} {"other-quota"}
+    {rateLimits rateLimitReachedType} {"rate_limit_reached"}
+    {rateLimits spendControlReached} null
+} {
+    auto_until verify
+    auto_reply [limits_fixture $restored $path $value]
+    check {[dict size $timers] == 0 && [llength $notices] == 1 && [llength $sent] == 3} "sparse or unchanged refreshed limits authorized continuation"
+}
+foreach stage {read consume verify} {
+    auto_until $stage
+    set pending [dict get $automatic::current opId]
+    retry::server [format {{"id":%s,"error":{"code":-32601,"message":"fixture API unsupported"}}} $pending]
+    check {[dict size $timers] == 0 && [llength $notices] == 1} "unsupported API was not bounded"
+    auto_until $stage
+    set before [llength $sent]
+    fire
+    check {[dict size $timers] == 0 && [llength $notices] == 1 && [llength $sent] == $before} "timeout retried an ambiguous redemption"
+}
+
+# Cancel at every asynchronous boundary; late internal replies stay hidden.
+foreach stage {queued_read read queued_consume consume verify queued_continue} {
+    foreach change {
+        {{"method":"thread/goal/set","params":{"threadId":"t1","text":"new goal"}}}
+        {{"method":"turn/interrupt","params":{"threadId":"t1","turnId":"ignored"}}}
+        {{"method":"thread/resume","params":{"threadId":"other"}}}
+    } {
+        auto_until $stage
+        set pending [field $automatic::current opId]
+        set before [llength $sent]
+        retry::client $change
+        check {$automatic::current eq "" && [dict size $timers] == 0} "manual activity did not cancel pending recovery"
+        if {$pending ne ""} { check {[auto_reply $restored $pending] == 0} "late internal reply was exposed" }
+        check {[llength $sent] == $before} "late reply resumed canceled work"
+    }
+    foreach method {thread/settings/updated thread/goal/updated account/updated} {
+        auto_until $stage
+        retry::server [format {{"method":"%s","params":{"threadId":"t1"}}} $method]
+        check {$automatic::current eq "" && [dict size $timers] == 0} "foreign settings or account activity did not cancel recovery"
+    }
+    auto_until $stage
+    started foreign-live-turn
+    check {$automatic::current eq "" && [dict size $timers] == 0} "foreign turn did not cancel recovery"
+    auto_until $stage
+    cleanup
+    check {[dict size $timers] == 0} "disconnect cancellation left recovery running"
+}
+auto_until consume
+retry::server {{"method":"account/rateLimits/updated","params":{"ordinaryUsageAllowed":true}}}
+check {[field $automatic::current phase] eq "consume"} "a redemption's sparse update bypassed its response"
+auto_reply {{"outcome":"reset"}}
+auto_reply $restored
+fire
+auto_followup
+auto_until queued_consume
+retry::server {{"method":"account/rateLimits/updated","params":{}}}
+check {$automatic::current eq "" && [dict size $timers] == 0} "a stale exhaustion snapshot consumed a credit"
+
+# Redemption notifications may arrive on either side of its response. They
+# never authorize recovery and can cause only one additional verification read.
+foreach outcome {reset alreadyRedeemed} {
+    foreach ordering {before_reply during_verify after_verify} {
+        auto_until consume
+        set consume [lindex $sent end]
+        if {$ordering eq "before_reply"} {
+            retry::server {{"method":"account/rateLimits/updated","params":{}}}
+        }
+        auto_reply [format {{"outcome":"%s"}} $outcome]
+        set firstRead [dict get $automatic::current opId]
+        if {$ordering eq "during_verify"} {
+            retry::server {{"method":"account/rateLimits/updated","params":{}}}
+            retry::server {{"method":"account/rateLimits/updated","params":{"ordinaryUsageAllowed":true}}}
+        }
+        auto_reply $restored
+        if {$ordering eq "after_verify"} {
+            retry::server {{"method":"account/rateLimits/updated","params":{}}}
+        }
+        if {$ordering ne "before_reply"} {
+            check {[field $automatic::current phase] eq "verify" && [llength $sent] == 4} "reset update lost or duplicated verification"
+            check {[auto_reply $restored $firstRead] == 0 && [llength $sent] == 4} "stale verification response advanced recovery"
+            auto_reply $restored
+        }
+        fire
+        auto_followup
+        set redemptions {}
+        foreach json $sent {
+            if {[field [json::json2dict $json] method] eq "account/rateLimitResetCredit/consume"} { lappend redemptions $json }
+        }
+        check {$redemptions eq [list $consume] && $notices eq ""} "notification ordering redeemed again or prevented continuation"
+    }
+}
+auto_until verify
+retry::server {{"method":"account/rateLimits/updated","params":{}}}
+auto_reply $restored
+retry::server {{"method":"account/rateLimits/updated","params":{}}}
+auto_reply $restored
+check {$automatic::current eq "" && [dict size $timers] == 0 && [llength $sent] == 4 && \
+    [llength $notices] == 1} "repeated limit changes caused unbounded verification or continuation"
+
+foreach provider {unknown custom-provider} {
+    auto_until read
+    automatic::selected [huddle create model [huddle string fixture-model] modelProvider [huddle string $provider]] t1
+    auto_reply $exhausted
+    check {[dict size $timers] == 0 && [llength $notices] == 1} "unknown provider provenance consumed an account reset"
+}
+auto_until read
+set conflicting [limits_fixture $exhausted rateLimitsByLimitId \
+    {{"codex":{"limitId":"codex","spendControlReached":false,"rateLimitReachedType":null}}}]
+auto_reply $conflicting
+check {[dict size $timers] == 0 && [llength $sent] == 1} "conflicting quota views consumed a reset"
+auto_until read
+set alias [limits_fixture $exhausted {rateLimits limitId} {"fixture-alias"}]
+set alias [limits_fixture $alias {rateLimits normalModelSlug} {"fixture-model"}]
+auto_reply $alias
+check {[field $automatic::current phase] eq "consume_ready"} "a confirmed matching model quota was rejected"
+auto_begin 1 0
+completed $autoTurn failed usageLimitExceeded {[{"type":"fileChange","id":"already-applied"}]}
+fire
+auto_reply $exhausted
+fire
+auto_reply {{"outcome":"reset"}}
+auto_reply $restored
+fire
+auto_followup
+check {[llength $sent] == 4} "partial progress blocked the neutral reset follow-up"
+
+# Ownership, order and types are required even when progress is otherwise allowed.
+foreach ack {0 1} {
+    auto_begin 1 1 $ack
+    if {!$ack} { started $autoTurn }
+    completed $autoTurn failed cyberPolicy
+    if {!$ack} { check {[dict size $timers] == 0} "a terminal event acknowledged work" }
+    if {!$ack} { reply $autoId $autoTurn }
+    check {[dict size $timers] == 1} "a confirmed reordered terminal event lost recovery"
+    check {![dict exists $automatic::live t1]} "a terminal acknowledgement restored a live-turn guard"
+}
+auto_begin 1 1 0
+completed $autoTurn failed cyberPolicy
+reply $autoId $autoTurn
+check {[dict size $timers] == 0} "a completion without a confirmed start candidate triggered recovery"
+auto_begin 1 1 0
+started $autoTurn
+reply $autoId $autoTurn
+completed $autoTurn failed cyberPolicy
+check {[dict size $timers] == 1} "a correlated early start lost valid ownership"
+foreach code {{["cyberPolicy"]} {null} {{"cyberPolicy":{}}}} {
+    auto_begin 1 1
+    retry::server [format {{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"%s","status":"failed","items":[],"error":{"message":"neutral","codexErrorInfo":%s}}}}} $autoTurn $code]
+    check {[dict size $timers] == 0} "a malformed error code triggered recovery"
+}
+auto_begin 1 1 0
+retry::server [format {{"id":"unrelated","result":{"turn":{"id":"%s","status":"inProgress","items":[]}},"id":%s}} $autoTurn $autoId]
+completed $autoTurn failed cyberPolicy
+check {[dict size $timers] == 0} "an ambiguous duplicate envelope acknowledged work"
+auto_until read
+auto_reply [string map [list {"availableCount":1} {"availableCount":0,"availableCount":1}] $exhausted]
+check {[dict size $timers] == 0 && [llength $sent] == 1} "duplicate credit fields consumed a reset"
+foreach item {
+    {{"type":"userMessage","id":"foreign","content":[{"type":"text","text":"different input"}]}}
+    {{"type":"userMessage","id":"foreign","content":"not an array"}}
+} {
+    auto_begin 1 1
+    user_event item/completed $item $autoTurn
+    completed $autoTurn failed cyberPolicy
+    check {[dict size $timers] == 0} "same-turn foreign input allowed recovery"
+}
+auto_begin 1 1 0
+reply 99999 foreign-response
+completed $autoTurn failed usageLimitExceeded
+reply $autoId $autoTurn
+check {[dict size $timers] == 0} "a foreign response established ownership"
+auto_begin 1 1
+started preexisting-foreign
+huddle set autoRequest id [huddle string manual-steering-foreign]
+retry::client [json_dump $autoRequest]
+reply {"manual-steering-foreign"} preexisting-foreign
+completed preexisting-foreign failed cyberPolicy
+check {[dict size $timers] == 0 && $automatic::current eq ""} "steering an existing foreign turn established ownership"
+
+# Resume snapshots can expose running turns without turn/started delivery,
+# including paginated history or only an active thread status.
+proc auto_resume {source} {
+    auto_begin 1 1
+    set ::foreignTurn resumed-foreign-$::autoSequence
+    set turns [format {[{"id":"%s","status":"inProgress","items":[]}]} $::foreignTurn]
+    set page null
+    if {$source eq "page"} { set page [format {{"data":%s}} $turns]; set turns {[]} }
+    if {$source eq "status"} { set turns {[]} }
+    set id [json::write string activation-$::autoSequence]
+    set request [format {{"id":%s,"method":"thread/resume","params":{"threadId":"t1"}}} $id]
+    recovery::client $request
+    retry::client $request
+    retry::server [format {{"id":%s,"result":{"thread":{"id":"t1","status":{"type":"active","activeFlags":[]},"turns":%s,"ephemeral":%s},"model":"fixture-model","modelProvider":"openai","initialTurnsPage":%s}}} $id $turns [expr {$source eq "ephemeral" ? "true" : "false"}] $page]
+}
+proc thread_status {status {thread t1}} {
+    set state [huddle create type [huddle string $status]]
+    if {$status eq "active"} { huddle set state activeFlags [huddle list] }
+    retry::server [json_dump [huddle create method [huddle string thread/status/changed] \
+        params [huddle create threadId [huddle string $thread] status $state]]]
+}
+foreach source {history page status ephemeral} {
+    foreach code {cyberPolicy usageLimitExceeded} {
+        auto_resume $source
+        set id [json::write string steer-resumed-$autoSequence]
+        huddle set autoRequest id [::huddle::json2huddle $id]
+        retry::client [json_dump $autoRequest]
+        reply $id $foreignTurn
+        completed $foreignTurn failed $code
+        check {$automatic::current eq "" && [dict size $timers] == 0 && $sent eq ""} "resumed foreign work was claimed as a new manual chain"
+        if {$source eq "status"} { thread_status idle }
+        set id [json::write string new-after-resume-$autoSequence]
+        huddle set autoRequest id [::huddle::json2huddle $id]
+        retry::client [json_dump $autoRequest]
+        reply $id fresh-after-resume-$autoSequence
+        completed fresh-after-resume-$autoSequence failed cyberPolicy
+        fire
+        auto_followup
+    }
+}
+foreach stage {queued_read read queued_consume consume verify queued_continue} {
+    auto_until $stage
+    thread_status active
+    check {$automatic::current eq "" && [dict size $timers] == 0} "active foreign status left queued recovery eligible"
+}
+auto_begin 1 1 0
+thread_status active
+started $autoTurn
+reply $autoId $autoTurn
+thread_status active
+completed $autoTurn failed cyberPolicy
+thread_status active other-thread
+check {[dict size $timers] == 1} "our running status or an unrelated thread canceled confirmed work"
+fire
+auto_followup
+
+# Context invalidation must also remove an overload timer for a continuation.
+proc auto_backoff {{echo 0}} {
+    auto_begin 1 1
+    completed $::autoTurn failed cyberPolicy
+    fire
+    set id [auto_followup]
+    set ::continuationTurn continuation-$::autoSequence
+    reply $id $::continuationTurn
+    started $::continuationTurn
+    set params [huddle get [dict get $::automatic::current request] params]
+    set ::continuationUser [huddle create type [huddle string userMessage] \
+        id [huddle string continuation-user-$::autoSequence] \
+        clientId [huddle get $params clientUserMessageId] content [huddle get $params input]]
+    if {$echo} { user_event item/started [json_dump $::continuationUser] $::continuationTurn }
+    completed $::continuationTurn failed serverOverloaded
+    check {[dict size $::timers] == 1} "continuation overload did not enter backoff"
+}
+
+# A verified identical echo is neither new input nor progress during backoff.
+foreach method {item/started item/completed} {
+    auto_backoff 1
+    set pending $timers
+    user_event $method [json_dump $continuationUser] $continuationTurn
+    check {$timers eq $pending && [field $automatic::current phase] eq "overload"} "duplicate user echo canceled continuation backoff"
+    fire
+    set id [auto_followup]
+    reply $id replayed-echo-$autoSequence
+    completed replayed-echo-$autoSequence failed cyberPolicy
+    check {[dict size $timers] == 1 && [llength $notices] == 0} "overload replay blocked a later content stop"
+    fire
+    auto_followup
+}
+foreach change {input identity client unverified progress} {
+    auto_backoff [expr {$change ne "unverified"}]
+    set item $continuationUser
+    switch -- $change {
+        input { huddle set item content 0 text [huddle string {changed fixture input}] }
+        identity { huddle set item id [huddle string different-user] }
+        client { huddle set item clientId [huddle string different-client] }
+        progress { set item [huddle create type [huddle string commandExecution] id [huddle string tool-progress]] }
+    }
+    user_event item/completed [json_dump $item] $continuationTurn
+    check {$automatic::current eq "" && [dict size $timers] == 0 && [llength $sent] == 1} "new input or progress survived continuation backoff"
+}
+auto_begin 1 1
+user_event item/started {} $autoTurn
+completed $autoTurn failed cyberPolicy
+user_event item/completed {} $autoTurn
+fire
+auto_followup
+
+# Repeated terminal snapshots still have to prove input ownership.
+foreach phase {stop limit overload} {
+    foreach change {same input identity additional unverified client} {
+        if {$change eq "client" && $phase ne "overload"} { continue }
+        if {$phase eq "overload"} {
+            auto_backoff [expr {$change ne "unverified"}]
+            set turn $continuationTurn
+            set original $continuationUser
+            set code serverOverloaded
+        } else {
+            auto_begin 1 1
+            if {$change ne "unverified"} { user_event item/started {} $autoTurn }
+            set turn $autoTurn
+            set original [::huddle::json2huddle $userItem]
+            set code [expr {$phase eq "stop" ? "cyberPolicy" : "usageLimitExceeded"}]
+            completed $turn failed $code
+        }
+        set pending $timers
+        set dispatched $sent
+        set item $original
+        switch -- $change {
+            input { huddle set item content 0 text [huddle string {changed fixture input}] }
+            identity - additional { huddle set item id [huddle string additional-user] }
+            client { huddle set item clientId [huddle string different-client] }
+        }
+        set items [json::write array [json_dump $item]]
+        if {$change eq "additional"} { set items [json::write array [json_dump $original] [json_dump $item]] }
+        completed $turn failed $code $items
+        if {$change eq "same"} {
+            check {$timers eq $pending && $sent eq $dispatched} "identical terminal snapshot replaced the pending action"
+            fire
+            if {$phase eq "limit"} {
+                check {[field [json::json2dict [lindex $sent end]] method] eq "account/rateLimits/read"} "identical terminal snapshot lost reset recovery"
+            } else {
+                set id [auto_followup]
+                reply $id snapshot-followup-$autoSequence
+                completed snapshot-followup-$autoSequence failed cyberPolicy
+                check {[dict size $timers] == 1 && [llength $notices] == 0} "a distinct follow-up stop lost recovery eligibility"
+                fire
+                auto_followup
+            }
+        } else {
+            check {$automatic::current eq "" && [dict size $timers] == 0 && $sent eq $dispatched} "conflicting terminal snapshot left recovery armed"
+        }
+    }
+}
+
+foreach event {
+    {{"method":"account/updated","params":{}}}
+    {{"method":"account/gatewayOAuth/changed","params":{}}}
+    {{"method":"thread/settings/updated","params":{"threadId":"t1","threadSettings":{"modelProvider":"other-provider"}}}}
+    {{"method":"model/rerouted","params":{"threadId":"t1","turnId":"ignored","toModel":"other-model"}}}
+} {
+    auto_backoff
+    retry::server $event
+    completed $continuationTurn failed serverOverloaded
+    check {$automatic::current eq "" && $retry::current eq "" && [dict size $timers] == 0 && \
+        [llength $sent] == 1} "context invalidation left a continuation replay armed"
+}
+foreach invalidatingRequest {
+    {{"method":"account/logout","params":{}}}
+    {{"method":"thread/settings/update","params":{"threadId":"t1","model":"other-model"}}}
+} {
+    auto_backoff
+    retry::client $invalidatingRequest
+    check {$retry::current eq "" && [dict size $timers] == 0} "manual context change left continuation backoff active"
+}
+auto_begin 1 1
+completed $autoTurn failed serverOverloaded
+retry::server {{"method":"account/updated","params":{}}}
+check {[dict size $timers] == 1} "optional invalidation changed unrelated default overload behavior"
+fire
+check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+    [huddle get $autoRequest params]]} "default overload replay changed original input/settings"
+
+# Manual turn/start can steer a live continuation. Sparse later snapshots
+# cannot erase progress already observed before canceling its automatic chain.
+proc auto_progress {{startEvent 1}} {
+    auto_begin 1 1
+    completed $::autoTurn failed cyberPolicy
+    fire
+    set id [auto_followup]
+    set ::continuationTurn running-continuation-$::autoSequence
+    reply $id $::continuationTurn
+    if {$startEvent} { started $::continuationTurn }
+    user_event item/started {{"type":"commandExecution","id":"applied-tool"}} $::continuationTurn
+    check {[field $::retry::current progress] eq "1"} "tool progress was not observed before steering"
+}
+foreach startEvent {0 1} {
+    foreach invalidation {
+        {}
+        {{"method":"account/updated","params":{}}}
+        {{"method":"thread/settings/updated","params":{"threadId":"t1","threadSettings":{"modelProvider":"other-provider"}}}}
+    } {
+        foreach acknowledgement {same_turn different_turn} {
+            auto_progress $startEvent
+            if {$invalidation ne ""} {
+                retry::server $invalidation
+                check {$retry::current eq "" && [field $automatic::live t1] eq $continuationTurn} "context invalidation lost the live-turn guard"
+            }
+            set id [huddle string manual-steering-$autoSequence]
+            set steering [huddle create id $id method [huddle string turn/start] params [huddle create \
+                threadId [huddle string t1] input [huddle list [huddle create type [huddle string text] \
+                    text [huddle string {additional fixture input}]]]]]
+            retry::client [json_dump $steering]
+            check {$automatic::current eq "" && [field $retry::current progress] eq "1" && \
+                [field $retry::current previous] eq $continuationTurn} "steering erased the live continuation replay guard"
+            set acknowledged $continuationTurn
+            if {$acknowledgement eq "different_turn"} { set acknowledged replacement-$autoSequence }
+            reply [json_dump $id] $acknowledged
+            completed $acknowledged failed serverOverloaded
+            check {[dict size $timers] == 0 && [llength $sent] == 1} "sparse steering snapshots allowed replay after tool progress"
+        }
+        # A real new turn on another thread or after completion keeps normal replay.
+        foreach boundary {other_thread completed_turn} {
+            auto_progress $startEvent
+            if {$invalidation ne ""} { retry::server $invalidation }
+            set thread t2
+            if {$boundary eq "completed_turn"} {
+                completed $continuationTurn failed serverOverloaded
+                set thread t1
+            }
+            set id [huddle string fresh-manual-$autoSequence]
+            set fresh [huddle create id $id method [huddle string turn/start] params [huddle create \
+                threadId [huddle string $thread] input [huddle list [huddle create type [huddle string text] \
+                    text [huddle string {fresh fixture input}]]]]]
+            retry::client [json_dump $fresh]
+            reply [json_dump $id] fresh-turn-$autoSequence
+            completed fresh-turn-$autoSequence failed serverOverloaded {[]} $thread
+            fire
+            check {[llength $sent] == 2 && [huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                [huddle get $fresh params]]} "steering protection changed replay for a fresh manual turn"
+        }
+    }
+}
+
+# Strictly rejected activation/settings data cannot establish reset provenance
+# or seed activity snapshots. A later valid authoritative update can restore it.
+proc auto_activation {providers {active 0}} {
+    set id [json::write string provenance-activation-[incr ::autoSequence]]
+    set activation [format {{"id":%s,"method":"thread/resume","params":{"threadId":"t1"}}} $id]
+    recovery::client $activation
+    retry::client $activation
+    set status {{"type":"idle"}}
+    set turns {[]}
+    if {$active} {
+        set status {{"type":"active","activeFlags":[]}}
+        set turns {[{"id":"rejected-foreign-turn","status":"inProgress","items":[]}]}
+    }
+    retry::server [format {{"id":%s,"result":{"thread":{"id":"t1","status":%s,"turns":%s},"model":"fixture-model",%s}}} \
+        $id $status $turns $providers]
+}
+foreach source {activation settings} {
+    foreach repaired {0 1} {
+        auto_begin 1 0
+        completed $autoTurn completed
+        if {$source eq "activation"} {
+            auto_activation {"modelProvider":"other-provider","modelProvider":"openai"} 1
+        } else {
+            auto_activation {"modelProvider":"openai"}
+            retry::server {{"method":"thread/settings/updated","params":{"threadId":"t1","threadSettings":{"modelProvider":"other-provider","modelProvider":"openai"}}}}
+        }
+        check {$automatic::selection eq ""} "rejected protocol data established automatic provenance"
+        check {![dict exists $automatic::live t1]} "rejected activation data seeded a live-turn snapshot"
+        if {$repaired} {
+            if {$source eq "activation"} {
+                auto_activation {"modelProvider":"openai"}
+            } else {
+                retry::server {{"method":"thread/settings/updated","params":{"threadId":"t1","threadSettings":{"model":"fixture-model","modelProvider":"openai"}}}}
+            }
+        }
+        set id [huddle string provenance-manual-[incr autoSequence]]
+        huddle set autoRequest id $id
+        retry::client [json_dump $autoRequest]
+        set turn provenance-turn-$autoSequence
+        reply [json_dump $id] $turn
+        started $turn
+        completed $turn failed usageLimitExceeded
+        fire
+        auto_reply $exhausted
+        if {$repaired} {
+            fire
+            check {[field [json::json2dict [lindex $sent end]] method] eq "account/rateLimitResetCredit/consume"} "valid authoritative data did not restore reset eligibility"
+        } else {
+            check {$automatic::current eq "" && [dict size $timers] == 0 && \
+                [llength $sent] == 1 && [llength $notices] == 1} "rejected provenance authorized reset redemption"
+        }
+    }
+}
+
+# Installed metadata reads neither steer work nor change the selected thread.
+proc metadata_read {method thread} {
+    set params [huddle create threadId [huddle string $thread]]
+    switch -- $method {
+        thread/list - thread/loaded/list - thread/realtime/listVoices - account/read -
+        account/rateLimits/read - account/workspaceMessages/read - account/gatewayOAuth/read {
+            set params [huddle create]
+        }
+        thread/search { set params [huddle create searchTerm [huddle string fixture]] }
+        thread/searchOccurrences { huddle set params searchTerm [huddle string fixture] }
+        thread/attachmentOwner/list {
+            set params [huddle create attachmentType [huddle string file] identityKey [huddle string fixture]]
+        }
+        thread/items/read {
+            huddle set params turnId [huddle string fixture-turn]
+            huddle set params itemIds [huddle list [huddle string fixture-item]]
+        }
+    }
+    return [json_dump [huddle create id [huddle string metadata-$::autoSequence-$method-$thread] \
+        method [huddle string $method] params $params]]
+}
+foreach method {thread/queue/list thread/backgroundTerminals/list thread/items/read thread/timeline/list
+    thread/read thread/list thread/loaded/list thread/search thread/searchOccurrences thread/turns/list
+    thread/items/list thread/goal/get thread/attachment/list thread/attachmentOwner/list thread/realtime/listVoices
+    account/read account/rateLimits/read account/usage/read account/workspaceMessages/read account/gatewayOAuth/read} {
+    foreach stage {running queued_stop verify} {
+        if {$stage eq "verify"} {
+            auto_until verify
+        } else {
+            auto_begin 1 1
+            if {$stage eq "queued_stop"} { completed $autoTurn failed cyberPolicy }
+        }
+        set previous $automatic::current
+        foreach thread {t1 metadata-other-thread} {
+            retry::client [metadata_read $method $thread]
+        }
+        check {$automatic::current eq $previous} "metadata read canceled or changed recovery ownership"
+        if {$stage eq "running"} { completed $autoTurn failed cyberPolicy }
+        if {$stage eq "verify"} { auto_reply $restored }
+        fire
+        auto_followup
+    }
+}
+foreach method {thread/queue/list thread/backgroundTerminals/list thread/items/read thread/timeline/list} {
+    auto_backoff
+    foreach thread {t1 metadata-other-thread} { retry::client [metadata_read $method $thread] }
+    fire
+    auto_followup
+}
+auto_begin 1 1
+completed $autoTurn failed cyberPolicy
+retry::client {{"method":"thread/fixture/list","params":{"threadId":"t1"}}}
+check {$automatic::current eq "" && [dict size $timers] == 0} "an unknown method was treated as an installed read"
+
+auto_until read
+set pending [dict get $automatic::current opId]
+check {[retry::server [format {{"id":%s,"method":"fixture/question","params":{}}} $pending]] == 1} "a server request sharing an internal ID was hidden"
+auto_reply $exhausted
+check {[field $automatic::current phase] eq "consume_ready"} "a server request consumed an internal reply marker"
+auto_begin 0 1
+set collision [huddle string "$retry::prefix-[expr {$retry::sequence + 1}]"]
+retry::client [json_dump [huddle create id $collision method [huddle string fixture/read] params [huddle create]]]
+completed $autoTurn failed cyberPolicy
+fire
+check {[auto_followup] ne [json_dump $collision]} "automatic request collided with a native ID"
+automatic::cancel
+retry::reset
+set automatic::flags {auto_reset_limit 0 auto_continue_after_stop 0}
+set automatic::selection {}
+set automatic::live {}
+set automatic::ids {}
+set recovery::target ""
+set recovery::pending {}
+set recovery::seen {}
+set retry::usedIds {}
+set retry::internal {}
+set retry::finished {}
+set retry::sequence 0
+set sent {}
+set delays {}
+rename automatic::notify {}
+rename automatic::native_notify automatic::notify
 
 # Large startup catalogs must not stall keyboard forwarding in the event loop.
 set catalogItem {{"name":"fixture","id":"fixture","nested":{"description":"sample \"text\" {} []","method":"fixture/request","enabled":true,"values":[1,2,3]}}}
@@ -260,6 +1180,151 @@ completed notification-turn
 reply 7 acknowledged-turn
 check {$retry::current eq "" && [dict size $timers] == 0} "mismatched acknowledgement adopted another turn's failure"
 
+# Shared notifications may describe another client's work in our selected thread.
+foreach event {
+    {"method":"thread/settings/updated","params":{"threadId":"t1"}}
+    {"method":"thread/queue/changed","params":{"threadId":"t1"}}
+    {"method":"thread/goal/updated","params":{"threadId":"t1"}}
+    {"method":"thread/goal/cleared","params":{"threadId":"t1"}}
+    {"method":"item/started","params":{"threadId":"t1","turnId":"foreign","item":{"type":"userMessage"}}}
+    {"method":"hook/started","params":{"threadId":"t1","turnId":"foreign"}}
+} {
+    begin
+    completed turn1
+    retry::server "\{$event\}"
+    check {$retry::current eq "" && [dict size $timers] == 0} "shared-client activity left replay armed"
+}
+begin 0
+started foreign
+completed foreign
+reply 99 foreign
+reply {"7"} foreign
+check {[dict size $timers] == 0} "foreign traffic authorized replay without our typed acknowledgement"
+retry::reset
+
+# A foreign live turn must remain visible to correlation before our reply,
+# even when our start and overload completion have already been observed.
+foreach event {
+    {"method":"item/started","params":{"threadId":"t1","turnId":"foreign","item":{"type":"userMessage"}}}
+    {"method":"item/agentMessage/delta","params":{"threadId":"t1","turnId":"foreign","delta":"sample"}}
+    {"method":"hook/started","params":{"threadId":"t1","turnId":"foreign"}}
+} {
+    foreach timing {before-start before-ack after-completion} {
+        begin 0
+        if {$timing ne "before-start"} { started turn1 }
+        if {$timing eq "after-completion"} { completed turn1 }
+        retry::server "\{$event\}"
+        if {$timing eq "before-start"} { started turn1 }
+        if {$timing ne "after-completion"} { completed turn1 }
+        reply {"7"} turn1
+        check {[dict size $timers] == 0} "foreign activity or a differently typed reply authorized replay"
+        reply 7 turn1
+        check {$retry::current eq "" && [dict size $timers] == 0} "early foreign activity was discarded at acknowledgement"
+    }
+}
+begin 0
+retry::server {{"method":"hook/started","params":{"threadId":"t1","turnId":"finished-foreign"}}}
+completed finished-foreign completed
+started turn1
+completed turn1
+reply 7 turn1
+check {[dict size $timers] == 1} "a finished foreign turn was treated as conflicting live work"
+begin 0
+user_event item/started
+started turn1
+completed turn1
+reply 7 turn1
+check {[dict size $timers] == 1} "our early user item was treated as foreign activity"
+
+# Same-turn shared input must match the original content and one item identity.
+foreach timing {before-start before-ack after-completion} {
+    begin 0
+    if {$timing ne "before-start"} { started turn1 }
+    if {$timing eq "after-completion"} { reply 7 turn1; completed turn1 }
+    foreach method {item/started item/completed} {
+        user_event $method
+        user_event $method
+    }
+    reply 7 turn1 $userItems
+    started turn1 t1 $userItems
+    completed turn1 failed serverOverloaded $userItems
+    completed turn1 failed serverOverloaded $userItems
+    check {[dict size $timers] == 1} "original input echoes or duplicate snapshots blocked retry"
+}
+set changedUser [::huddle::json2huddle $userItem]
+huddle set changedUser content 0 text [huddle string {foreign steering}]
+set additionalUser [::huddle::json2huddle $userItem]
+huddle set additionalUser id [huddle string additional-user]
+set malformedUser [::huddle::json2huddle $userItem]
+huddle set malformedUser type [huddle list [huddle string userMessage]]
+foreach foreign [list [json_dump $changedUser] [json_dump $additionalUser] \
+    [json_dump $malformedUser] {{"type":"userMessage","id":"unidentified-input"}}] {
+    foreach method {item/started item/completed} {
+        foreach timing {before-start before-ack after-completion} {
+            begin 0
+            if {$timing ne "before-start"} { started turn1 }
+            user_event item/started
+            if {$timing eq "after-completion"} { reply 7 turn1; completed turn1 }
+            user_event $method $foreign
+            user_event $method $foreign
+            if {$timing eq "after-completion"} {
+                check {[dict size $timers] == 0} "same-turn steering left an already scheduled retry active"
+            }
+            user_event item/completed
+            started turn1
+            completed turn1
+            reply 7 turn1 $userItems
+            check {[dict size $timers] == 0} "same-turn steering or ambiguous input allowed replay"
+        }
+    }
+    foreach items [list [json::write array $userItem $foreign] [json::write array $foreign $userItem]] {
+        foreach snapshot {reply started completed duplicate-completion} {
+            begin 0
+            switch $snapshot {
+                reply { reply 7 turn1 $items; started turn1; completed turn1 }
+                started { started turn1 t1 $items; completed turn1; reply 7 turn1 }
+                completed { completed turn1 failed serverOverloaded $items; reply 7 turn1 }
+                duplicate-completion {
+                    reply 7 turn1 $userItems
+                    completed turn1
+                    completed turn1 failed serverOverloaded $items
+                }
+            }
+            check {[dict size $timers] == 0} "additional or conflicting user input in a turn snapshot allowed replay"
+        }
+    }
+}
+begin
+user_event item/started
+completed turn1
+user_event item/started [json_dump $changedUser] turn1 other-thread
+check {[dict size $timers] == 1} "foreign-thread input canceled our retry"
+fire
+set replay [::huddle::json2huddle [lindex $sent end]]
+check {[huddle equal [huddle get $replay params] [huddle get [::huddle::json2huddle $request] params]]} "user input correlation changed replay parameters"
+set id [json_dump [huddle get $replay id]]
+reply $id turn2 [json::write array [json_dump $additionalUser]]
+completed turn2
+check {[dict size $timers] == 1} "a retry turn inherited the previous user item identity"
+
+# Use the native client's input ID when it supplied one; do not infer ownership
+# from matching content if the echoed client identity disagrees or is ambiguous.
+set identifiedRequest [::huddle::json2huddle $request]
+huddle set identifiedRequest params clientUserMessageId [huddle string client-original]
+foreach clientId {{"client-original"} {"client-foreign"} null {["client-original"]}} {
+    retry::reset
+    set retry::finished {}
+    retry::client [json_dump $identifiedRequest]
+    set identifiedUser [::huddle::json2huddle $userItem]
+    huddle set identifiedUser clientId [::huddle::json2huddle $clientId]
+    user_event item/started [json_dump $identifiedUser]
+    started turn1
+    completed turn1
+    reply 7 turn1
+    check {[dict size $timers] == ($clientId eq {"client-original"})} "user input correlation ignored typed client provenance"
+}
+retry::reset
+
 begin
 completed turn1
 fire
@@ -311,7 +1376,8 @@ foreach event {
         check {[dict size $timers] == 0} "early or late model/tool/hook progress allowed replay"
     }
 }
-# Standalone MCP requests remain visible and block only the relevant thread/turn.
+# Standalone MCP requests stay visible. A different unfinished turn in the
+# same thread conflicts with our request, including before acknowledgement.
 foreach {turn thread eligible} {{"turn1"} t1 0 null t1 0 {"other-turn"} t1 1 {"turn1"} t2 1 null t2 1} {
     foreach timing {before-start before-ack after-completion} {
         begin 0
@@ -320,7 +1386,9 @@ foreach {turn thread eligible} {{"turn1"} t1 0 null t1 0 {"other-turn"} t1 1 {"t
         check {[elicitation $turn $thread] == 1} "MCP elicitation was hidden from the TUI"
         if {$timing eq "before-start"} { reply 7 turn1; started turn1; completed turn1 }
         if {$timing eq "before-ack"} { reply 7 turn1 }
-        check {[dict size $timers] == $eligible} "MCP elicitation did not respect replay progress or thread/turn scope"
+        set expected $eligible
+        if {$turn eq {"other-turn"} && $thread eq "t1"} { set expected 0 }
+        check {[dict size $timers] == $expected} "MCP elicitation did not respect replay progress or shared-client scope"
     }
 }
 foreach snapshot {reply started} {
@@ -335,12 +1403,13 @@ foreach snapshot {reply started} {
     check {[dict size $timers] == 0} "progress in a start snapshot was replayed"
 }
 begin 0
+completed old-turn completed
 retry::server {{"method":"hook/completed","params":{"threadId":"t1","turnId":"old-turn","run":{}}}}
 reply 7 turn1
 started turn1
-retry::server {{"method":"item/started","params":{"threadId":"t1","turnId":"turn1","item":{"type":"userMessage"}}}}
-completed turn1 failed serverOverloaded {[{"type":"userMessage"}]}
-check {[dict size $timers] == 1} "another turn's hook or a user item blocked retry"
+user_event item/started
+completed turn1 failed serverOverloaded $userItems
+check {[dict size $timers] == 1} "a finished turn's hook or our user item blocked retry"
 retry::server {{"method":"hook/started","params":{"threadId":"t1","turnId":null,"run":{}}}}
 check {[dict size $timers] == 0} "an unscoped hook left ambiguous replay enabled"
 foreach acknowledge {0 1} {
@@ -519,6 +1588,15 @@ recovery::client {{"id":79,"method":"thread/settings/update","params":{"threadId
 check {$recovery::yolo} "a model-only change removed applicable YOLO"
 recovery::client {{"id":80,"method":"turn/start","params":{"threadId":"actual-session","approvalPolicy":"on-request","sandboxPolicy":{"type":"readOnly"}}}}
 check {![string match {*--yolo*} [recovery::advice]]} "manual permissions were escalated again"
+resume_arguments {--yolo}
+activate 1200 thread/start
+activated 1200 shared-session
+retry::server {{"method":"thread/settings/updated","params":{"threadId":"other"}}}
+check {$recovery::yolo} "foreign-thread settings removed applicable YOLO"
+retry::server {{"method":"thread/settings/updated","params":{"threadId":"shared-session","threadSettings":{"model":"fixture","approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}}}}}
+check {$recovery::yolo} "confirmed unchanged permissions removed applicable YOLO"
+retry::server {{"method":"thread/settings/updated","params":{"threadId":"shared-session"}}}
+check {$recovery::target eq "shared-session" && !$recovery::yolo} "shared-client settings retained launch escalation"
 set activationId 94
 foreach permissions {
     {"approvalPolicy":["never"],"sandbox":{"type":"dangerFullAccess"}}
@@ -767,7 +1845,7 @@ rename native_bgerror bgerror
 
 package require websocket
 
-# A send can remove both channels before buffered backend reads finish.
+# A send can remove both channels before Tcllib dispatches another frame.
 rename websocket::send websocket::native_send
 proc websocket::send {socket type message} {
     lappend ::forwarded $message
@@ -779,12 +1857,13 @@ foreach sendMode {failed close disconnect} {
     begin
     completed turn1
     set backend [file tempfile scratch]
-    puts $backend {{"id":91,"result":{}}}
-    puts $backend {{"id":92,"result":{}}}
-    seek $backend 0
+    set backendChannel $backend
     set client fixture
     set forwarded {}
-    set failed [catch {backend_read} message]
+    set failed [catch {
+        backend_event $backendChannel text {{"id":91,"result":{}}}
+        backend_event $backendChannel text {{"id":92,"result":{}}}
+    } message]
     set stopped [expr {![info exists backend] && ![info exists client]}]
     cleanup
     file delete $scratch
@@ -805,12 +1884,10 @@ foreach outcome {confirmed rejected mismatch disconnected-rejection null-method}
         null-method { set response [string map {{,"result":} {,"method":null,"result":}} $resumeReply] }
     }
     set backend [file tempfile scratch]
-    puts $backend $response
-    seek $backend 0
     set client fixture
     set forwarded {}
     set proxyFailures {}
-    backend_read
+    backend_event $backend text $response
     cleanup
     file delete $scratch
     set expectedForwarded {}
@@ -889,40 +1966,31 @@ rename websocket::native_takeover websocket::takeover
 # A fake backend echoes one frame and ignores graceful termination.
 rename after {}
 rename real_after after
-set backend [open [list | expect -c {
+set echoFixture {
     trap SIG_IGN SIGTERM
-    fconfigure stdin -encoding utf-8 -translation lf
-    fconfigure stdout -encoding utf-8 -translation lf
-    puts READY
-    flush stdout
-    if {[gets stdin line] >= 0} { puts $line; flush stdout }
+    proc echo {socket type message} {
+        if {$type eq "text"} { websocket::send $socket text $message }
+    }
+    fixture::start echo
     vwait forever
-}] r+]
-fconfigure $backend -blocking 0 -buffering line -encoding utf-8 -translation lf
+}
+set backend [open [list | expect -c "[list source $proxyFixture]\n$echoFixture"] r+]
 set ready 0
 set frameReady 0
 set frame ""
-fileevent $backend readable {
-    if {[gets $::backend line] >= 0} {
-        if {!$::ready && $line eq "READY"} {
-            set ::ready 1
-        } else {
-            set ::frame $line
-            set ::frameReady 1
-        }
-    } elseif {[eof $::backend]} {
-        fileevent $::backend readable ""
-        set ::ready -1
-        set ::frameReady -1
+rename backend_event native_backend_event
+proc backend_event {socket type message} {
+    if {$type eq "text"} {
+        set ::frame $message
+        set ::frameReady 1
     }
 }
 set child [lindex [pid $backend] 0]
 set startup ""
 set deadline ""
 set failed [catch {
-    set startup [after 3000 {set ::ready -1}]
-    if {!$ready} { vwait ready }
-    after cancel $startup
+    backend_attach 3000
+    set ready 1
     if {$ready == 1} {
         native_backend_send "\n$request\n"
         set deadline [after 3000 {set ::frameReady -1}]
@@ -933,10 +2001,12 @@ after cancel $startup
 after cancel $deadline
 set before [clock milliseconds]
 cleanup
+rename backend_event {}
+rename native_backend_event backend_event
 if {$failed} { error $message }
 check {$ready == 1} "fake backend startup timed out"
 check {$frameReady == 1} "fake backend frame timed out"
-check {[huddle equal [::huddle::json2huddle $frame] [::huddle::json2huddle $request]]} "stdio framing changed JSON data or types"
+check {[huddle equal [::huddle::json2huddle $frame] [::huddle::json2huddle $request]]} "proxy WebSocket framing changed JSON data or types"
 check {[clock milliseconds] - $before < 3000} "backend cleanup was not bounded"
 check {[catch {exec kill -0 $child}]} "backend survived cleanup"
 cleanup
@@ -959,13 +2029,20 @@ close $channel
 file delete $scratch
 file mkdir $scratch
 set channel [open [file join $scratch codex] w]
-puts $channel {#!/usr/bin/env tclsh}
+puts $channel {#!/usr/bin/env expect}
+puts $channel [list source $proxyFixture]
 puts $channel {
     fconfigure stdout -buffering full -encoding utf-8 -translation lf
+    if {[lrange $argv 0 2] eq {app-server daemon start}} { exit 0 }
     if {[lindex $argv 0] eq "app-server"} {
-        puts {{"id":91,"result":{}}
-{"id":92,"result":{}}}
-        flush stdout
+        if {[lindex $argv 1] ne "proxy"} { exit 90 }
+        proc respond {socket type message} {
+            if {$type eq "text"} {
+                websocket::send $socket text {{"id":91,"result":{}}}
+                websocket::send $socket text {{"id":92,"result":{}}}
+            }
+        }
+        fixture::start respond
         vwait forever
     }
     set terminalMode [exec stty -g <@stdin]
@@ -1001,8 +2078,8 @@ append fixture {
     set forwarded 0
     rename websocket::send websocket::native_send
     proc websocket::send {socket type message} {
+        if {$socket ne "fixture"} { return [websocket::native_send $socket $type $message] }
         incr ::forwarded
-        if {[chan pending input $::backend] == 0} { error "missing buffered backend data" }
         connection $socket disconnect ""
         puts stderr FORWARDING_DISCONNECTED
         flush stderr
@@ -1012,7 +2089,7 @@ append fixture {
     proc spawn {args} {
         set result [uplevel 1 [list native_spawn {*}$args]]
         set ::client fixture
-        fileevent $::backend readable backend_read
+        backend_send {{"id":90,"method":"fixture/ready"}}
         return $result
     }
     rename wait native_wait
@@ -1093,13 +2170,29 @@ set env(PATH) $savedPath
 file delete -force $scratch
 check {!$failed} "fake TUI forwarding teardown failed: $message"
 
+# Bound line reads from the external shared fixture, including startup and probes.
+proc fixture_line {channel} {
+    fconfigure $channel -blocking 0
+    set ::fixtureReady 0
+    fileevent $channel readable [list apply {{channel} {
+        if {[gets $channel ::fixtureLine] >= 0} { set ::fixtureReady 1 } elseif {[eof $channel]} { set ::fixtureReady -1 }
+    }} $channel]
+    set timer [after 2000 {set ::fixtureReady -1}]
+    vwait ::fixtureReady
+    after cancel $timer
+    fileevent $channel readable ""
+    if {$::fixtureReady != 1} { error "shared fixture line read failed or timed out" }
+    return $::fixtureLine
+}
+
 # Exercise launch flag consumption and permission verification over the real proxy.
 set channel [file tempfile scratch]
 close $channel
 file delete $scratch
 file mkdir $scratch
 set channel [open [file join $scratch codex] w]
-puts $channel {#!/usr/bin/env tclsh}
+puts $channel {#!/usr/bin/env expect}
+puts $channel [list source $proxyFixture]
 puts $channel {
     package require json
     package require websocket
@@ -1107,54 +2200,122 @@ puts $channel {
     fconfigure stdout -encoding utf-8 -translation lf
     set mode $env(YOLO_FIXTURE_MODE)
     set effective $env(YOLO_FIXTURE_ENABLED)
-    set confirmation {{"id":31,"result":{"thread":{"id":"t1","turns":[]},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"activePermissionProfile":{"id":"server-profile","extends":"fixture-parent"}}}}
+    set confirmation {{"id":31,"result":{"thread":{"id":"t1","turns":[{"id":"saved","items":[{"type":"agentMessage","text":"synthetic history é"}]}]},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"activePermissionProfile":{"id":"server-profile","extends":"fixture-parent"}}}}
     if {!$effective} { set confirmation [string map {never on-request dangerFullAccess readOnly} $confirmation] }
     set turn {{"id":7,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"quoted \"input\" é"}],"approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}}}}
     if {!$effective} { set turn [string map {never on-request dangerFullAccess readOnly} $turn] }
+    if {$argv eq {--shared-server}} {
+        set loaded [expr {$mode ne "cold"}]
+        set starts 0
+        set attachments 0
+        proc accept_shared {transport address port} {
+            fconfigure $transport -buffering line -encoding utf-8 -translation lf
+            set action [gets $transport]
+            if {$action eq "inspect"} {
+                puts $transport [format {{"loaded":%s,"starts":%s,"attachments":%s,"session":%s}} \
+                    $::loaded $::starts $::attachments $::confirmation]
+                close $transport
+                return
+            }
+            if {$action eq "start"} {
+                incr ::starts
+                if {$::mode eq "startup-rejection"} { puts $transport rejected } else {
+                    set ::loaded 1
+                    puts $transport ready
+                }
+                close $transport
+                return
+            }
+            incr ::attachments
+            if {$action ne "attach" || !$::loaded || $::mode eq "attachment-rejection"} {
+                puts $transport rejected
+                close $transport
+                return
+            }
+            puts $transport ready
+            if {$::mode eq "upgrade-rejection"} {
+                puts $transport "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+                close $transport
+                return
+            }
+            fixture::accept serve $transport
+        }
+        proc serve {transport type line} {
+            global mode effective confirmation turn env
+            if {$type eq "connect"} { set ::log [open $env(YOLO_FIXTURE_LOG) w] }
+            if {$type in {close disconnect}} { catch {close $::log}; return }
+            if {$type eq "text"} {
+                set log $::log
+                puts $log $line
+                flush $log
+                set message [json::json2dict $line]
+                switch [dict get $message method] {
+                    thread/resume {
+                        if {[dict get $message params threadId] eq "t1"} {
+                            set approval [expr {$effective ? "never" : "on-request"}]
+                            set sandbox [expr {$effective ? "danger-full-access" : "read-only"}]
+                            if {[dict get $message params approvalPolicy] ne $approval || \
+                                [dict get $message params sandbox] ne $sandbox || \
+                                [dict get $message params config] ne {sample true}} { exit 3 }
+                            switch $mode {
+                                rejection { websocket::send $transport text {{"id":31,"error":{"code":-32000,"message":"fixture rejection","data":{"detail":"unchanged"}}}} }
+                                mismatch { websocket::send $transport text [string map {dangerFullAccess readOnly} $confirmation] }
+                                malformed { websocket::send $transport text {{"id":31,"result":{}}} }
+                                premature { return }
+                                default { websocket::send $transport text $confirmation }
+                            }
+                        } else {
+                            if {[dict get $message params approvalPolicy] ne "on-request" || \
+                                [dict get $message params sandbox] ne "read-only"} { exit 4 }
+                            websocket::send $transport text {{"id":35,"result":{"thread":{"id":"other"},"approvalPolicy":"on-request","sandbox":{"type":"readOnly"}}}}
+                        }
+                    }
+                    turn/start {
+                        if {$line ne $turn} { exit 5 }
+                        websocket::send $transport text {{"id":7,"result":{"turn":{"id":"fixture-turn","items":[]}}}}
+                    }
+                    thread/settings/update {
+                        if {[dict get $message params approvalPolicy] ne "on-request"} { exit 6 }
+                        websocket::send $transport text {{"id":34,"result":{}}}
+                    }
+                    default { exit 8 }
+                }
+                flush $transport
+            }
+        }
+        set listener [socket -server accept_shared -myaddr 127.0.0.1 0]
+        puts [lindex [fconfigure $listener -sockname] 2]
+        flush stdout
+        vwait forever
+    }
     if {[lindex $argv 0] eq "app-server"} {
-        if {$argv ne {app-server --listen stdio:// -c {fixture="with spaces"} --enable fixture}} { exit 2 }
-        set log [open $env(YOLO_FIXTURE_LOG) w]
+        set starting [expr {[lrange $argv 0 2] eq {app-server daemon start}}]
+        set command [expr {$starting ? [lrange $argv 0 2] : [lrange $argv 0 1]}]
+        set options [lrange $argv [expr {$starting ? 3 : 2}] end]
+        if {(!$starting && $command ne {app-server proxy}) || \
+            $options ne {-c {fixture="with spaces"} --enable fixture}} { exit 2 }
+        set transport [socket 127.0.0.1 $env(YOLO_FIXTURE_PORT)]
+        fconfigure $transport -buffering line -encoding utf-8 -translation lf
+        puts $transport [expr {$starting ? "start" : "attach"}]
+        if {[gets $transport] ne "ready"} {
+            puts stderr "fixture shared [expr {$starting ? "startup" : "attachment"}] rejection"
+            exit 12
+        }
+        if {$starting} { close $transport; exit 0 }
         set identity [open $env(YOLO_FIXTURE_PID) w]
         puts $identity [pid]
         close $identity
-        while {[gets stdin line] >= 0} {
-            puts $log $line
-            flush $log
-            set message [json::json2dict $line]
-            switch [dict get $message method] {
-                thread/resume {
-                    if {[dict get $message params threadId] eq "t1"} {
-                        set approval [expr {$effective ? "never" : "on-request"}]
-                        set sandbox [expr {$effective ? "danger-full-access" : "read-only"}]
-                        if {[dict get $message params approvalPolicy] ne $approval || \
-                            [dict get $message params sandbox] ne $sandbox || \
-                            [dict get $message params config] ne {sample true}} { exit 3 }
-                        switch $mode {
-                            rejection { puts {{"id":31,"error":{"code":-32000,"message":"fixture rejection","data":{"detail":"unchanged"}}}} }
-                            mismatch { puts [string map {dangerFullAccess readOnly} $confirmation] }
-                            malformed { puts {{"id":31,"result":{}}} }
-                            premature { continue }
-                            default { puts $confirmation }
-                        }
-                    } else {
-                        if {[dict get $message params approvalPolicy] ne "on-request" || \
-                            [dict get $message params sandbox] ne "read-only"} { exit 4 }
-                        puts {{"id":35,"result":{"thread":{"id":"other"},"approvalPolicy":"on-request","sandbox":{"type":"readOnly"}}}}
-                    }
-                }
-                turn/start {
-                    if {$line ne $turn} { exit 5 }
-                    puts {{"id":7,"result":{"turn":{"id":"fixture-turn","items":[]}}}}
-                }
-                thread/settings/update {
-                    if {[dict get $message params approvalPolicy] ne "on-request"} { exit 6 }
-                    puts {{"id":34,"result":{}}}
-                }
-                default { exit 8 }
-            }
-            flush stdout
+        fconfigure stdin -blocking 0 -encoding binary -translation binary
+        fconfigure stdout -buffering none -encoding binary -translation binary
+        fconfigure $transport -blocking 0 -buffering none -encoding binary -translation binary
+        proc forward {from to} {
+            puts -nonewline $to [read $from 16384]
+            flush $to
+            if {[eof $from]} { exit 0 }
         }
-        exit
+        fileevent stdin readable [list forward stdin $transport]
+        fileevent $transport readable [list forward $transport stdout]
+        vwait forever
     }
     if {[lrange $argv 4 end] ne $env(YOLO_FIXTURE_ARGUMENTS)} { exit 9 }
     set ready 0
@@ -1185,8 +2346,24 @@ puts $channel {
     websocket::open [lindex $argv 1] receive \
         -headers [list Authorization "Bearer $env([lindex $argv 3])"] -timeout 2000
     if {!$ready} { vwait ready }
+    if {$mode eq "input-eof"} {
+        set terminalMode [exec stty -g <@stdin]
+        exec stty raw -echo <@stdin
+        fconfigure stderr -encoding utf-8 -translation lf
+        trap {
+            # More than a PTY buffer must be drained while this handler writes.
+            puts -nonewline stderr "EOF_EXIT_BEGIN[string repeat x 32768]\x00utf8:é λEOF_EXIT_DATA_END"
+            flush stderr
+            exec stty $::terminalMode <@stdin
+            puts stderr "\033\[?2004lEOF_EXIT_END"
+            flush stderr
+            exit 19
+        } SIGTERM
+        puts -nonewline stdout "\033\[?1003h\033\[?1006h\033\[?2004h"
+    }
     puts YOLO_PROXY_OK
     flush stdout
+    if {$mode eq "input-eof"} { vwait forever }
     if {[gets stdin line] < 0 || $line ne "forwarded"} { exit 11 }
     puts YOLO_INPUT_OK
     flush stdout
@@ -1198,28 +2375,58 @@ set resumeDriver {
     set wrapperSpawn $spawn_id
     set wrapper [exp_pid]
     set failed [catch {
+        if {$env(YOLO_FIXTURE_MODE) eq "input-eof"} {
+            log_user 0
+            close_on_eof -i $wrapperSpawn 0
+            fconfigure $wrapperSpawn -encoding binary -translation binary
+            remove_nulls -i $wrapperSpawn 0
+            match_max 65536
+            set terminalPath $spawn_out(slave,name)
+            # The shell opens this FIFO as wrapper stdin; stdout stays on its PTY.
+            # RDWR avoids blocking this driver if the child fails before opening it.
+            set input [open $env(YOLO_FIXTURE_FIFO) r+]
+        }
         set deadline [expr {[clock milliseconds] + 2000}]
-        while {![file exists $env(YOLO_FIXTURE_PID)] || [file size $env(YOLO_FIXTURE_PID)] == 0} {
+        while {$env(YOLO_FIXTURE_MODE) ni {startup-rejection attachment-rejection} && (![file exists $env(YOLO_FIXTURE_PID)] || [file size $env(YOLO_FIXTURE_PID)] == 0)} {
             if {[clock milliseconds] >= $deadline} { error "resume backend startup timed out" }
             after 10
         }
-        set identity [open $env(YOLO_FIXTURE_PID) r]
-        set backend [string trim [read $identity]]
-        close $identity
-        if {![string is integer -strict $backend] || $backend <= 0} { error "invalid resume backend PID" }
+        if {[file exists $env(YOLO_FIXTURE_PID)]} {
+            set identity [open $env(YOLO_FIXTURE_PID) r]
+            set backend [string trim [read $identity]]
+            close $identity
+            if {![string is integer -strict $backend] || $backend <= 0} { error "invalid resume backend PID" }
+        }
         if {$::failureText eq ""} {
             expect {
                 -exact YOLO_PROXY_OK {}
                 eof { error "resume permission exchange failed" }
                 timeout { error "resume permission exchange timed out" }
             }
-            send -- "forwarded\r"
-            expect {
-                -exact YOLO_INPUT_OK {}
-                eof { error "resume terminal forwarding failed" }
-                timeout { error "resume terminal forwarding timed out" }
-            }
             set expectedStatus 7
+            if {$env(YOLO_FIXTURE_MODE) eq "input-eof"} {
+                set output $expect_out(buffer)
+                set channel [open $env(YOLO_FIXTURE_TERMIOS) r]
+                set originalMode [string trim [read $channel]]
+                close $channel
+                close $input
+                unset input
+                set expectedStatus 19
+            } elseif {[string match signal-* $env(YOLO_FIXTURE_MODE)]} {
+                set signame [string toupper [string range $env(YOLO_FIXTURE_MODE) 7 end]]
+                set expectedStatus [dict get {TERM 143 HUP 129 INT 130} $signame]
+                exec kill -$signame $wrapper
+            } elseif {$env(YOLO_FIXTURE_MODE) eq "eof"} {
+                send -- "\004"
+                set expectedStatus 11
+            } else {
+                send -- "forwarded\r"
+                expect {
+                    -exact YOLO_INPUT_OK {}
+                    eof { error "resume terminal forwarding failed" }
+                    timeout { error "resume terminal forwarding timed out" }
+                }
+            }
         } else {
             expect {
                 -exact $::failureText {}
@@ -1228,65 +2435,173 @@ set resumeDriver {
             }
             set expectedStatus 1
         }
-        expect {
-            eof {}
-            timeout { error "resume wrapper exit timed out" }
+        if {$env(YOLO_FIXTURE_MODE) eq "input-eof"} {
+            expect {
+                -re {(?s).+} {
+                    append output $expect_out(0,string)
+                    if {[string length $output] > 65536} { error "unbounded input-EOF output" }
+                    exp_continue -continue_timer
+                }
+                eof {}
+                timeout { error "input EOF did not drain and exit" }
+            }
+            set payload [encoding convertto utf-8 "EOF_EXIT_BEGIN[string repeat x 32768]\x00utf8:é λEOF_EXIT_DATA_END"]
+            if {[string first $payload $output] < 0 || \
+                [regexp -all EOF_EXIT_BEGIN $output] != 1 || \
+                [string first EOF_EXIT_END $output] < 0} { error "input EOF lost or duplicated final TUI output" }
+            set restored [string first "\033\[?1006l" $output]
+            set advice [string first "To resume this session, run:" $output]
+            if {$restored < [string first EOF_EXIT_END $output] || $advice < $restored} {
+                error "input EOF lost mouse restoration or exit advice ordering"
+            }
+            if {[exec stty -g < $terminalPath] ne $originalMode} { error "input EOF did not restore terminal attributes" }
+        } else {
+            expect {
+                eof {}
+                timeout { error "resume wrapper exit timed out" }
+            }
         }
         set result [wait -i $wrapperSpawn]
+        if {$env(YOLO_FIXTURE_MODE) eq "input-eof"} { close -i $wrapperSpawn }
         if {[lindex $result 2] != 0 || [lindex $result 3] != $expectedStatus} {
             error "resume exit status changed: $result"
         }
-        if {![catch {exec kill -0 $backend}]} { error "resume backend survived cleanup" }
+        if {[info exists backend] && ![catch {exec kill -0 $backend}]} { error "resume backend survived cleanup" }
+        exec kill -0 $env(YOLO_FIXTURE_SHARED_PID)
     } message]
     if {$failed} {
+        if {[info exists input]} { catch {close $input} }
         catch {exec kill -TERM $wrapper}
         if {[info exists backend]} { catch {exec kill -TERM $backend} }
         catch {expect -timeout 2 eof}
         catch {exec kill -KILL $wrapper}
+        catch {close -i $wrapperSpawn}
         puts stderr $message
         exit 1
     }
     exit 0
 }
+# Each case owns its shared fixture, port, PTY, and request log. Collect both
+# drivers before starting another pair so startup/cleanup costs can overlap.
+proc resume_batch {cases} {
+    set failures {}
+    foreach case $cases {
+        dict with case {}
+        set failed [catch {
+            try {
+                set runFailed [catch {read $driver} detail]
+                if {[catch {close $driver} closeError]} { set runFailed 1; append detail "\n$closeError" }
+                set driver ""
+                set probe [socket 127.0.0.1 $port]
+                try {
+                    fconfigure $probe -buffering line -encoding utf-8 -translation lf
+                    puts $probe inspect
+                    set after [fixture_line $probe]
+                } finally { close $probe }
+                exec kill -0 $sharedPid
+                if {$runFailed} { error $detail }
+                set state [json::json2dict $after]
+                check {[field $state loaded] == 1} "shared session unloaded on disconnect"
+                check {[field $state starts] == 1 && [field $state attachments] == ($mode ne "startup-rejection")} "startup/attachment was skipped or repeated"
+                check {[field $state session] eq [field [json::json2dict $before] session]} "shared session history or settings changed on disconnect"
+                check {[field $state session result thread id] eq "t1" && \
+                    [field $state session result thread turns] ne ""} "shared session identity or history was lost"
+                set messages {}
+                if {[file exists $logPath]} {
+                    set channel [open $logPath r]
+                    try { set messages [split [string trim [read $channel]] \n] } finally { close $channel }
+                } else {
+                    check {$mode in {startup-rejection attachment-rejection upgrade-rejection}} "shared fixture lost its request log"
+                }
+                set turns 0
+                foreach json $messages {
+                    if {$json eq ""} { continue }
+                    set message [json::json2dict $json]
+                    if {[field $message method] eq "turn/start"} { incr turns }
+                }
+                check {$turns == ($failureText eq "")} "a guarded launch leaked work or an ordinary launch lost its turn"
+            } finally {
+                catch {close $driver}
+                catch {exec kill -TERM {*}[pid $sharedServer]}
+                catch {fconfigure $sharedServer -blocking 1}
+                catch {close $sharedServer}
+            }
+        } message]
+        if {$failed} { lappend failures "$mode: $message" }
+    }
+    if {[llength $failures]} { error [join $failures \n] }
+}
 set env(PATH) "$scratch:$savedPath"
+set jobs {}
 set failed [catch {
-    foreach mode {session last alias ordinary rejection mismatch malformed premature} {
+    foreach mode {session cold last alias ordinary rejection mismatch malformed premature startup-rejection attachment-rejection upgrade-rejection signal-term signal-hup signal-int eof input-eof} {
         set env(YOLO_FIXTURE_MODE) $mode
         set env(YOLO_FIXTURE_ENABLED) [expr {$mode ne "ordinary"}]
         set env(YOLO_FIXTURE_LOG) [file join $scratch $mode.jsonl]
         set env(YOLO_FIXTURE_PID) [file join $scratch $mode.pid]
-        set launch {resume fixture-session --yolo}
-        set remaining {resume fixture-session}
+        set launch {resume t1 --yolo}
+        set remaining {resume t1}
         switch $mode {
             last { set launch {--yolo resume --last}; set remaining {resume --last} }
-            alias { set launch {resume fixture-session --dangerously-bypass-approvals-and-sandbox} }
+            alias { set launch {resume t1 --dangerously-bypass-approvals-and-sandbox} }
             ordinary { set launch $remaining }
         }
         set shared [list -c {fixture="with spaces"} --enable fixture]
         set env(YOLO_FIXTURE_ARGUMENTS) [concat $remaining $shared]
         set failureText ""
         switch $mode {
+            startup-rejection { set failureText "fixture shared startup rejection" }
+            attachment-rejection { set failureText "fixture shared attachment rejection" }
+            upgrade-rejection { set failureText "shared app-server WebSocket attachment failed" }
             rejection { set failureText "fixture rejection" }
             mismatch - malformed { set failureText "did not confirm resume --yolo permissions" }
             premature { set failureText "work requested before resume --yolo permissions were confirmed" }
         }
-        set configuredDriver "set timeout 8\n[list set failureText $failureText]\n"
-        append configuredDriver "[list spawn -noecho $wrapper {*}$launch {*}$shared]\n$resumeDriver"
-        exec expect -c $configuredDriver 2>@1
-        set channel [open $env(YOLO_FIXTURE_LOG) r]
-        set messages [split [string trim [read $channel]] \n]
-        close $channel
-        set turns 0
-        foreach json $messages {
-            if {$json eq ""} { continue }
-            set message [json::json2dict $json]
-            if {[field $message method] eq "turn/start"} { incr turns }
+        set spawnLaunch [concat [list $wrapper] $launch $shared]
+        if {$mode eq "input-eof"} {
+            set env(YOLO_FIXTURE_FIFO) [file join $scratch input.fifo]
+            set env(YOLO_FIXTURE_TERMIOS) [file join $scratch input.termios]
+            exec mkfifo $env(YOLO_FIXTURE_FIFO)
+            set spawnLaunch [concat [list sh -c {
+                input=$1; mode=$2; shift 2
+                stty -g >"$mode"
+                exec "$@" <"$input"
+            } sh $env(YOLO_FIXTURE_FIFO) $env(YOLO_FIXTURE_TERMIOS)] $spawnLaunch]
         }
-        check {$turns == ($failureText eq "")} "a guarded launch leaked work or an ordinary launch lost its turn"
+        set configuredDriver "set timeout 8\n[list set failureText $failureText]\n"
+        append configuredDriver "[list spawn -noecho {*}$spawnLaunch]\n$resumeDriver"
+        set sharedServer [open [list | tclsh [file join $scratch codex] --shared-server] r+]
+        set env(YOLO_FIXTURE_SHARED_PID) [lindex [pid $sharedServer] 0]
+        set env(YOLO_FIXTURE_PORT) [fixture_line $sharedServer]
+        set probe [socket 127.0.0.1 $env(YOLO_FIXTURE_PORT)]
+        fconfigure $probe -buffering line -encoding utf-8 -translation lf
+        puts $probe inspect
+        set before [fixture_line $probe]
+        close $probe
+        check {[field [json::json2dict $before] loaded] == ($mode ne "cold")} "fixture initial loaded state changed"
+        set driver [open [list | expect -c $configuredDriver 2>@1] r]
+        lappend jobs [dict create mode $mode driver $driver sharedServer $sharedServer \
+            port $env(YOLO_FIXTURE_PORT) sharedPid $env(YOLO_FIXTURE_SHARED_PID) \
+            logPath $env(YOLO_FIXTURE_LOG) before $before failureText $failureText]
+        unset sharedServer
+        if {[llength $jobs] == 2} {
+            set batch $jobs
+            set jobs {}
+            resume_batch $batch
+        }
     }
+    set batch $jobs
+    set jobs {}
+    resume_batch $batch
 } message]
+if {[llength $jobs]} { catch {resume_batch $jobs} }
 set env(PATH) $savedPath
-unset -nocomplain env(YOLO_FIXTURE_MODE) env(YOLO_FIXTURE_ENABLED) env(YOLO_FIXTURE_LOG) env(YOLO_FIXTURE_PID) env(YOLO_FIXTURE_ARGUMENTS)
+if {[info exists sharedServer]} {
+    catch {exec kill -TERM {*}[pid $sharedServer]}
+    catch {fconfigure $sharedServer -blocking 1}
+    catch {close $sharedServer}
+}
+unset -nocomplain env(YOLO_FIXTURE_MODE) env(YOLO_FIXTURE_ENABLED) env(YOLO_FIXTURE_LOG) env(YOLO_FIXTURE_PID) env(YOLO_FIXTURE_ARGUMENTS) env(YOLO_FIXTURE_PORT) env(YOLO_FIXTURE_SHARED_PID) env(YOLO_FIXTURE_FIFO) env(YOLO_FIXTURE_TERMIOS)
 file delete -force $scratch
 check {!$failed} "fake resume launch/proxy check failed: $message"
 
@@ -1298,13 +2613,17 @@ file delete $scratch
 file mkdir $scratch
 set channel [open [file join $scratch codex] w]
 puts $channel {#!/usr/bin/env expect}
+puts $channel [list source $proxyFixture]
 puts $channel {
     package require json
+    package require json::write
     package require websocket
     set mode $env(DIAGNOSTIC_MODE)
     fconfigure stdout -buffering line -encoding utf-8 -translation lf
     fconfigure stderr -encoding utf-8 -translation lf
+    if {[lrange $argv 0 2] eq {app-server daemon start}} { exit 0 }
     if {[lindex $argv 0] eq "app-server"} {
+        if {[lindex $argv 1] ne "proxy"} { exit 90 }
         puts stderr BACKEND_START
         flush stderr
         trap SIG_IGN SIGTERM
@@ -1314,36 +2633,68 @@ puts $channel {
         set identity [open $env(DIAGNOSTIC_PID) w]
         puts $identity [pid]
         close $identity
-        fconfigure stdin -blocking 0 -encoding utf-8 -translation lf
-        proc request {} {
-            if {[gets stdin line] < 0} { return }
-            set id [dict get [json::json2dict $line] id]
+        proc request {socket type line} {
+            if {$type ne "text"} { return }
+            set request [json::json2dict $line]
+            set id [dict get $request id]
+            if {[dict get $request method] eq "account/rateLimits/read" && $::mode eq "recovery-no-credit"} {
+                websocket::send $socket text [format {{"id":%s,"result":{"accountId":"fixture-account","ordinaryUsageAllowed":false,"rateLimits":{"limitId":"codex","spendControlReached":false,"rateLimitReachedType":"rate_limit_reached"},"rateLimitResetCredits":{"availableCount":0,"credits":null}}}} [json::write string $id]]
+                return
+            }
+            if {[dict get $request method] eq "turn/start" && [string match recovery-* $::mode]} {
+                if {![info exists ::recoveryTurns]} { set ::recoveryTurns 0 }
+                incr ::recoveryTurns
+                set encoded [json::write string $id]
+                if {$::recoveryTurns == 1} {
+                    if {$id ne "7"} { exit 80 }
+                    set encoded 7
+                } else {
+                    set params [dict get $request params]
+                    if {$::mode ne "recovery-stop" || $::recoveryTurns > 4 || \
+                        [llength [dict get $params input]] != 1 || \
+                        [dict get [lindex [dict get $params input] 0] text] ne "continue" || \
+                        [dict get $params threadId] ne "confirmed-session" || \
+                        [dict get $params effort] ne "high" || \
+                        [dict get $params sandboxPolicy type] ne "dangerFullAccess" || \
+                        [dict get $params clientUserMessageId] eq ""} { exit 81 }
+                    websocket::send $socket text {{"method":"fixture/recoveryExact","params":{}}}
+                }
+                set turn recovery-$::recoveryTurns
+                set code [expr {$::mode eq "recovery-stop" ? "cyberPolicy" : "usageLimitExceeded"}]
+                websocket::send $socket text [format {{"id":%s,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}} $encoded $turn]
+                # End the synthetic episode successfully after three stops.
+                if {$::mode eq "recovery-stop" && $::recoveryTurns == 4} {
+                    websocket::send $socket text [format {{"method":"turn/completed","params":{"threadId":"confirmed-session","turn":{"id":"%s","status":"completed","items":[]}}}} $turn]
+                } else {
+                    websocket::send $socket text [format {{"method":"turn/completed","params":{"threadId":"confirmed-session","turn":{"id":"%s","status":"failed","items":[{"type":"fileChange","id":"already-applied"}],"error":{"message":"neutral fixture failure","codexErrorInfo":"%s"}}}}} $turn $code]
+                }
+                return
+            }
             if {$id == 6} {
-                puts {{"id":6,"error":{"code":-1,"message":"fixture activation rejection"}}}
-                flush stdout
+                websocket::send $socket text {{"id":6,"error":{"code":-1,"message":"fixture activation rejection"}}}
                 return
             }
             if {$id in {4 5}} {
                 set selected [expr {$id == 4 ? "confirmed-session" : "switched-session"}]
                 set approval [expr {$id == 4 ? "never" : "on-request"}]
                 set sandbox [expr {$id == 4 ? "dangerFullAccess" : "readOnly"}]
-                puts [format {{"id":%d,"result":{"thread":{"id":"%s"},"approvalPolicy":"%s","sandbox":{"type":"%s"}}}} $id $selected $approval $sandbox]
-                flush stdout
+                websocket::send $socket text [format {{"id":%d,"result":{"thread":{"id":"%s"},"model":"fixture-model","modelProvider":"openai","approvalPolicy":"%s","sandbox":{"type":"%s"}}}} $id $selected $approval $sandbox]
                 return
             }
             if {$id == 2} {
                 if {$::mode eq "burst"} {
-                    puts {{"method":"fixture/burst","params":{}}}
-                    flush stdout
+                    websocket::send $socket text {{"method":"fixture/burst","params":{}}}
                     puts -nonewline stderr "BACKEND_DROPPED\n[string repeat x 2097152]\nBACKEND_TAIL"
                 } else { puts -nonewline stderr BACKEND_PARTIAL }
                 flush stderr
             }
-            puts [format {{"id":%d,"result":{}}} $id]
-            flush stdout
-            if {$id == 2 && $::mode eq "backend-eof"} { exit 0 }
+            websocket::send $socket text [format {{"id":%d,"result":{}}} $id]
+            if {$id == 2 && $::mode eq "backend-eof"} {
+                # Fixture exit drains and reaps the independently running relay.
+                exit 0
+            }
         }
-        fileevent stdin readable request
+        fixture::start request
         vwait forever
     }
     set identity [open $env(DIAGNOSTIC_TUI_PID) w]
@@ -1352,7 +2703,7 @@ puts $channel {
     if {[string match signal-* $mode]} { trap SIG_IGN SIGTERM }
     set terminalMode [exec stty -g <@stdin]
     exec stty raw -echo <@stdin
-    puts "\033\[?2004hLIVE_BEGIN\nDisconnected from this task. Any running work continues.\nTo reconnect, run:\nLIVE_LOOKALIKE\nLIVE_END"
+    puts "\033\[?1003h\033\[?1006h\033\[?2004hLIVE_BEGIN\nDisconnected from this task. Any running work continues.\nTo reconnect, run:\nLIVE_LOOKALIKE\nLIVE_END"
     flush stdout
     fconfigure stdin -blocking 0 -encoding utf-8 -translation lf
     set editorActive 0
@@ -1372,10 +2723,27 @@ puts $channel {
         } elseif {$type eq "text"} {
             set response [json::json2dict $message]
             if {[dict exists $response method]} {
-                puts BURST_READY
+                switch -- [dict get $response method] {
+                    warning {
+                        if {$::mode ne "recovery-no-credit" || \
+                            [string first "work remains stopped" [dict get $response params message]] < 0} { exit 82 }
+                        puts "RECOVERY_WARNING:[dict get $response params message]"
+                        websocket::send $socket text {{"id":2,"method":"fixture/ping","params":{}}}
+                    }
+                    turn/completed {
+                        if {[dict get $response params turn status] eq "failed"} {
+                            puts NATIVE_FAILURE
+                        } else {
+                            puts RECOVERY_SUCCESS
+                            websocket::send $socket text {{"id":2,"method":"fixture/ping","params":{}}}
+                        }
+                    }
+                    fixture/recoveryExact { puts RECOVERY_EXACT }
+                    default { puts BURST_READY }
+                }
             } else {
                 set id [dict get $response id]
-                if {$id in {4 5 6}} { return }
+                if {$id in {4 5 6 7}} { return }
                 puts [dict get {1 INPUT_READY 2 PROTOCOL_OK 3 BURST_PROTOCOL_OK} $id]
             }
             flush stdout
@@ -1399,6 +2767,10 @@ puts $channel {
         if {$character eq "q"} {
             puts CHAR_FORWARDED
             flush stdout
+            if {[string match recovery-* $::mode]} {
+                websocket::send $::socket text {{"id":7,"method":"turn/start","params":{"threadId":"confirmed-session","input":[{"type":"text","text":"apply fixture"}],"effort":"high","sandboxPolicy":{"type":"dangerFullAccess"}}}}
+                return
+            }
             if {$::mode eq "external-editor"} {
                 set ::editorActive 1
                 exec stty $::terminalMode <@stdin
@@ -1443,6 +2815,13 @@ file attributes [file join $scratch codex] -permissions 0755
 set diagnosticFixture {
     # Expect -c runs before normal script argument initialization.
     set argv {--yolo}
+    if {[string match recovery-* $env(DIAGNOSTIC_MODE)]} {
+        set env(XDG_CONFIG_HOME) [file join [file dirname $env(DIAGNOSTIC_PID)] $env(DIAGNOSTIC_MODE).config]
+        file mkdir [file join $env(XDG_CONFIG_HOME) codex-retry]
+        set channel [open [file join $env(XDG_CONFIG_HOME) codex-retry config.json] w]
+        puts $channel {{"auto_reset_limit":true,"auto_continue_after_stop":true}}
+        close $channel
+    }
     set terminalMode [exec stty -g <@stdin]
     rename wait native_wait
     proc wait {args} {
@@ -1462,6 +2841,9 @@ set diagnosticFixture {
                 after 10
             }
             if {$::env(DIAGNOSTIC_MODE) eq "launchfail-closed"} { close stderr }
+            exec stty raw -echo <@stdin
+            puts -nonewline stdout "\033\[?1003h\033\[?1006h"
+            flush stdout
             error "fixture TUI launch failure"
         }
     }
@@ -1517,16 +2899,30 @@ set diagnosticDriver {
                     send -- "edited\r"
                     set sentEditorInput 1
                 }
-                if {!$sentBurstInput && [string first BURST_READY $output] >= 0} {
+                if {!$sentBurstInput && ([string first BURST_READY $output] >= 0 || \
+                    ($mode eq "recovery-stop" && [string first RECOVERY_EXACT $output] >= 0))} {
                     send -- r
                     set sentBurstInput 1
                 }
-                if {!$sentExit && [string first PROTOCOL_OK $output] >= 0 && \
-                    ($mode ne "burst" || ([string first BURST_INPUT_OK $output] >= 0 && \
+                if {!$sentExit && [regexp {(^|\n)PROTOCOL_OK\r*\n} $output] && \
+                    ($mode ni {burst recovery-stop} || ([string first BURST_INPUT_OK $output] >= 0 && \
                         [string first BURST_PROTOCOL_OK $output] >= 0)) && \
                     ($mode ne "backend-eof" || [string first TUI_DISCONNECTED $output] >= 0)} {
                     if {[string first CHAR_FORWARDED $output] < 0} { error "protocol response preceded input" }
-                    if {[string match signal-* $mode]} {
+                    if {$mode eq "recovery-no-credit" && \
+                        ([string first RECOVERY_WARNING $output] < 0 || [string first NATIVE_FAILURE $output] < 0)} {
+                        error "unavailable recovery hid native failure or lost its warning"
+                    }
+                    if {$mode eq "recovery-stop" && \
+                        ([regexp -all {NATIVE_FAILURE} $output] != 3 || \
+                         [regexp -all {RECOVERY_EXACT} $output] != 3 || \
+                         [regexp -all {RECOVERY_SUCCESS} $output] != 1 || \
+                         [string first RECOVERY_WARNING $output] >= 0)} {
+                        error "repeated recovery hid native failures, changed input, or failed to end successfully"
+                    }
+                    if {$mode eq "child-death"} {
+                        exec kill -KILL $tui
+                    } elseif {[string match signal-* $mode]} {
                         exec kill -[string toupper [string range $mode 7 end]] $wrapper
                     } else { send -- x }
                     set sentExit 1
@@ -1545,6 +2941,8 @@ set diagnosticDriver {
         set expected 7
         switch $mode {
             normal { set expected 0 }
+            backend-eof { set expected 1 }
+            child-death { set expected 137 }
             launchfail - launchfail-closed - missing { set expected 1 }
             signal-term { set expected 143 }
             signal-hup { set expected 129 }
@@ -1556,10 +2954,22 @@ set diagnosticDriver {
         if {$active && (!$sentExit || (!$::actualLaunch && [string first NATIVE_WAIT_COMPLETE $output] < 0))} {
             error "native input, wait, or terminal restoration was lost: $output"
         }
+        if {$mode ne "missing"} {
+            set enabled [string first "\033\[?1006h" $output]
+            set restored [string first "\033\[?1006l" $output]
+            if {$enabled < 0 || $restored < $enabled} { error "mouse reporting survived TUI exit" }
+            foreach text {{To resume this session, run:} {To choose a saved session, run:} {background app-server diagnostics} {codex-retry: fixture TUI launch failure}} {
+                set index [string first $text $output]
+                if {$index >= 0 && $index < $restored} { error "exit text preceded mouse restoration" }
+            }
+        }
+        if {$active && [string first "client disconnected; shared server and background work may continue" $output] < 0 && $mode ne "closed"} {
+            error "shared-server lifetime advice was missing"
+        }
         if {$mode eq "external-editor" && (!$sentEditorInput || [string first EDITOR_INPUT_OK $output] < 0)} {
             error "external editor did not receive input before TUI re-entry"
         }
-        if {$active && ![string match signal-* $mode]} {
+        if {$active && ![string match signal-* $mode] && $mode ne "child-death"} {
             set boundary [string last "\033\[?2004l" $output]
             if {$boundary < 0} { error "native exit boundary was lost" }
             set live [string range $output 0 $boundary-1]
@@ -1611,7 +3021,7 @@ set diagnosticDriver {
                     [string first BACKEND_DROPPED $output] >= 0 || \
                     [string first "output truncated" $output] < 0} { error "diagnostic tail or truncation was lost" }
                 set start [string first "\n" $output [string first "output truncated" $output]]
-                set end [string first "codex-retry: private app-server stopped" $output]
+                set end [string first "codex-retry: client disconnected" $output]
                 set retained [string range $output $start+1 $end-1]
                 # Strip terminal-added CRs: 64 KiB of data plus puts' final LF.
                 set retained [string map [list "\r" ""] $retained]
@@ -1669,8 +3079,19 @@ file mkdir $env(DIAGNOSTIC_EMPTY_PATH)
 set quotedWrapper [file join $scratch {launcher 'with spaces} codex-retry]
 file mkdir [file dirname $quotedWrapper]
 file copy $wrapper $quotedWrapper
+# Every driver owns a distinct PTY and PID files. Run two independent cases at
+# a time so repeated forced-shutdown coverage fits the frozen suite deadline.
+proc diagnostic_batch {channels} {
+    set failures {}
+    foreach channel $channels {
+        set failed [catch {read $channel} output]
+        if {[catch {close $channel} message] || $failed} { lappend failures "$message: $output" }
+    }
+    if {[llength $failures]} { error [join $failures \n] }
+}
+set jobs {}
 set failed [catch {
-    foreach mode {normal error burst shutdown closed backend-eof signal-term signal-hup signal-int launchfail launchfail-closed missing no-thread activation-error switched installed quoted external-editor} {
+    foreach mode {normal error burst shutdown closed backend-eof signal-term signal-hup signal-int child-death launchfail launchfail-closed missing no-thread activation-error switched installed quoted external-editor recovery-no-credit recovery-stop} {
         set env(DIAGNOSTIC_MODE) $mode
         set env(DIAGNOSTIC_PID) [file join $scratch $mode.backend.pid]
         set env(DIAGNOSTIC_TUI_PID) [file join $scratch $mode.tui.pid]
@@ -1682,12 +3103,26 @@ set failed [catch {
         set launch [list expect -c $configuredFixture]
         if {$actualLaunch} { set launch [list $expectedLauncher --yolo] }
         set configuredDriver "set timeout 6\n[list set expectedLauncher $expectedLauncher]\n[list set launcherPath $launchedWrapper]\n[list set actualLaunch $actualLaunch]\n[list cd $scratch]\n[list spawn -noecho {*}$launch]\n$diagnosticDriver"
-        exec expect -c $configuredDriver 2>@1
+        lappend jobs [open [list | expect -c $configuredDriver 2>@1] r]
+        if {[llength $jobs] == 2} {
+            set batch $jobs
+            set jobs {}
+            diagnostic_batch $batch
+        }
     }
+    set batch $jobs
+    set jobs {}
+    diagnostic_batch $batch
 } message]
+if {[llength $jobs]} { catch {diagnostic_batch $jobs} }
 set env(PATH) $savedPath
 unset -nocomplain env(DIAGNOSTIC_MODE) env(DIAGNOSTIC_PID) env(DIAGNOSTIC_TUI_PID) env(DIAGNOSTIC_EMPTY_PATH)
 file delete -force $scratch
 check {!$failed} "fake backend diagnostic isolation failed: $message"
 
-puts "PASS: structured retries, input/settings, backoff, cancellation, progress, IDs, arguments, resume permissions, proxy/PTY forwarding, authentication, and cleanup"
+} finally {
+    unset -nocomplain env(XDG_CONFIG_HOME)
+    array set env $configEnvironment
+    file delete -force $configScratch
+}
+puts "PASS: structured retries, opt-in recovery, input/settings, backoff, cancellation, progress, IDs, arguments, resume permissions, proxy/PTY forwarding, authentication, and cleanup"

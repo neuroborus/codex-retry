@@ -34,29 +34,21 @@ proc plain {bytes} {
 }
 
 # The wrapped run uses the same rejecting backend through a Tcllib bridge in
-# place of `codex app-server`. The actual native TUI still owns both PTY streams.
+# place of `codex app-server proxy`. The actual native TUI still owns both PTY streams.
 if {$argv eq {--backend}} {
-    fconfigure stdin -blocking 0 -encoding utf-8 -translation lf
-    fconfigure stdout -buffering line -encoding utf-8 -translation lf
+    source [file join [file dirname [info script]] proxy-fixture.tcl]
+    proc bridge_input {socket type message} {
+        if {$type eq "connect"} { set ::incoming $socket }
+        if {$type eq "text"} { websocket::send $::bridge text $message }
+        if {$type in {close disconnect}} { exit 0 }
+    }
     proc bridge {socket type message} {
         switch -- $type {
-            connect { set ::bridge $socket; fileevent stdin readable bridge_input }
-            text {
-                # WebSocket JSON can be formatted across lines; stdio is JSONL.
-                # Valid JSON strings escape CR/LF, so their content is unchanged.
-                puts [string map [list \r " " \n " "] $message]
-                flush stdout
-            }
+            connect { set ::bridge $socket; fixture::start bridge_input }
+            text { websocket::send $::incoming text $message }
             close - disconnect { exit 0 }
             error - timeout { exit 1 }
         }
-    }
-    proc bridge_input {} {
-        while {[gets stdin line] >= 0} {
-            if {[string length $line] > 1048576} { exit 1 }
-            websocket::send $::bridge text $line
-        }
-        if {[eof stdin]} { exit 0 }
     }
     websocket::open $env(NATIVE_EXIT_ENDPOINT) bridge \
         -headers [list Authorization "Bearer $env(NATIVE_EXIT_TOKEN)"] -timeout 2000
@@ -91,7 +83,7 @@ set thread [string map [list @ID@ [js $threadId] @ROOT@ [js $scratch] \
      "ephemeral":false,"section":null,"sectionEnteredAt":null,"projectId":null,
      "historyMode":"legacy","modelProvider":"openai","model":"fixture",
      "reasoningEffort":null,"createdAt":1,"updatedAt":1,"recencyAt":null,
-     "status":{"type":"idle"},"path":@PATH@,"cwd":@ROOT@,"cliVersion":"0.162.1",
+     "status":{"type":"idle"},"path":@PATH@,"cwd":@ROOT@,"cliVersion":"0.163.0",
      "originator":"fixture","source":"cli","canAcceptDirectInput":true,
      "threadSource":null,"agentNickname":null,"agentRole":null,"gitInfo":null,
      "name":null,"daybreakEnabled":null,"turns":[@TURN@]}
@@ -140,8 +132,8 @@ proc result_for {method message} {
             return {{"data":[{"id":"fixture","model":"fixture","displayName":"fixture","description":"Neutral fixture","hidden":false,"isDefault":true,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","inputModalities":["text"],"supportsPersonality":false,"additionalSpeedTiers":[],"serviceTiers":[]}],"nextCursor":null}}
         }
         thread/loaded/list {
-            set loaded {[]}
-            if {$::resumed} { set loaded [json::write array [js $threadId]] }
+            # The synthetic session is already loaded by this shared server.
+            set loaded [json::write array [js $threadId]]
             return [json::write object data $loaded nextCursor null]
         }
         thread/list {
@@ -188,7 +180,10 @@ proc connection {socket type text} {
                 set method [dict get $message method]
                 lappend ::methods $method
                 check {[llength $::methods] <= 128} "unbounded native metadata requests"
-                if {$method eq "initialized"} { return }
+                if {$method eq "initialized"} {
+                    control checkpoint name [js initialized]
+                    return
+                }
                 set result [result_for $method $message]
                 set object [::huddle::json2huddle $text]
                 set id [huddle get $object id]
@@ -198,6 +193,7 @@ proc connection {socket type text} {
                 if {$method eq "thread/resume"} {
                     incr ::resumed
                     token_usage
+                    control checkpoint name [js resumed]
                 }
             }
             disconnect { set ::disconnected 1; finish }
@@ -257,6 +253,7 @@ proc handshake {socket} {
 set output ""
 set quitOffset -1
 set snapshotRequested 0
+set snapshotAttempts 0
 set footerRestored 0
 set enablePaste "\033\[?2004h"
 set disablePaste "\033\[?2004l"
@@ -269,9 +266,9 @@ proc observe {event} {
         data {
             append ::output [binary decode base64 [dict get $event data]]
             check {[string length $::output] <= 262144} "unbounded native presentation"
-            # Synchronize on genuinely rendered history while still interactive,
-            # not a fixed delay or a post-exit terminal-mode observation.
-            if {!$::snapshotRequested && $::resumed && ![dict get $event canonical] && \
+            # A history write can temporarily release the terminal. Its final
+            # bytes need not arrive in the same observation as raw-mode reentry.
+            if {!$::snapshotRequested && $::resumed && \
                 [string first FIXTURE_LIVE_END [plain $::output]] >= 0} {
                 set ::snapshotRequested 1
                 control snapshot
@@ -285,6 +282,11 @@ proc observe {event} {
             }
         }
         snapshot {
+            if {[dict get $event canonical] || [dict get $event restored]} {
+                check {[incr ::snapshotAttempts] <= 50} "native never entered interactive mode after rendering history"
+                after 10 {control snapshot}
+                return
+            }
             check {![dict get $event canonical] && ![dict get $event restored]} "native never entered interactive mode"
             check {$::quitOffset < 0} "duplicate quit request"
             # Initial replay can replace usage received alongside the resume
@@ -342,6 +344,10 @@ proc finish {} {
         file stat $launcher expectedIdentity
         check {$actualIdentity(dev) == $expectedIdentity(dev) && \
             $actualIdentity(ino) == $expectedIdentity(ino)} "wrapper recovery resolved to another launcher"
+        check {[string first "client disconnected; shared server and background work may continue" $footer] >= 0} "shared-server lifetime advice was missing"
+        foreach mode {1000 1002 1003 1005 1006 1015} {
+            check {[string first "\033\[?${mode}l" $::output $::quitOffset] >= 0} "wrapper did not disable terminal mouse mode"
+        }
         foreach obsolete {{Disconnected from this task.} {To reconnect, run:} --remote CODEX_RETRY_TOKEN agents} {
             check {[string first $obsolete $footer] < 0} "obsolete remote advice survived wrapper exit"
         }

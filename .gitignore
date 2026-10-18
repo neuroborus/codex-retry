@@ -6,6 +6,7 @@ LOCAL_ARTIFACTS/
 *~
 
 # Local environment and agent settings
+/config.json
 .env
 .env.*
 !.env.example

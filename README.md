@@ -3,7 +3,8 @@
 A Tcl/Expect wrapper that keeps the native Codex TUI and retries confirmed
 model overload through the [App Server protocol](https://learn.chatgpt.com/docs/app-server).
 
-Requires `codex`, `expect`, and Tcllib. Tested with Codex CLI 0.162.1.
+Requires `codex`, `expect`, and Tcllib, with the shared-server commands available
+in Codex CLI 0.163.0.
 On Debian/Ubuntu, install the Tcl dependencies with `sudo apt install expect tcllib`.
 Run the wrapper with interactive Codex arguments:
 
@@ -16,10 +17,20 @@ Run the wrapper with interactive Codex arguments:
 ./codex-retry resume SESSION_ID --dangerously-bypass-approvals-and-sandbox
 ```
 
-The wrapper starts a private `codex app-server` process and relays its JSON-RPC
-traffic to the TUI through one authenticated loopback WebSocket connection.
-Retry decisions use structured events exclusively; it never types `continue`.
+The wrapper runs the idempotent `codex app-server daemon start`, then attaches
+with an owned `codex app-server proxy` byte tunnel. Tcllib speaks WebSocket
+through that pipe to the control socket. Codex selects the shared
+control socket, so sessions already loaded by ordinary Codex keep their ID and
+history. A cold launch starts that same shared server. Startup or attachment
+failure is reported without falling back to an independent writer. JSON-RPC
+traffic still passes through the retry engine and one authenticated loopback
+WebSocket connection to the native TUI.
+Recovery decisions use structured events exclusively. By default, only the
+overload retry below is enabled; the optional recovery modes submit a new
+`continue` turn only when explicitly configured.
 Terminal input/output, window resizing, and TUI exit status pass through.
+If wrapper input closes, it disconnects and drains the TUI's final output before
+reaping the child and restoring the terminal.
 Large unrelated startup replies use their request ID and envelope boundaries
 for routing without decoding the payload, keeping keyboard forwarding responsive.
 Other response layouts use the full JSON parser.
@@ -30,10 +41,13 @@ with a diagnostic heading. Only the latest 64 KiB are retained in memory; a
 truncation notice appears when earlier output was discarded. Startup failures
 are reported directly if no TUI launched. No diagnostic log is saved to disk.
 
-The private app-server stops when the TUI exits or disconnects. On supported
-native 0.162.1 exits, an adapter buffers at most 16 KiB of the possible exit
-epilogue after terminal restoration, replacing remote reconnect/stop instructions
-and the continued-work claim. Live terminal content and token usage remain intact.
+Closing Retry disconnects its client; the shared server, sessions and background
+work may continue, including when Retry started the server. Cleanup terminates
+only the owned TUI and stdio bridge. Terminal attributes and mouse reporting
+are restored before exit advice or diagnostics, including failed and interrupted
+exits. An adapter buffers at most 16 KiB of the possible native exit epilogue
+after terminal release, replacing reconnect/stop commands that target the expired
+wrapper endpoint. Live terminal content and token usage remain intact.
 The final output offers one
 copyable wrapper command for the last successfully selected session, for example:
 
@@ -52,7 +66,7 @@ instead of inventing a session ID. You can also open that picker yourself with
 
 `CODEX_RETRY_TOKEN` names a temporary environment variable available to the child
 TUI, not a token value to paste into the command. It is not exported back to
-your shell, and displaying its value would not restore the stopped server.
+your shell, and displaying its value would not restore the closed wrapper endpoint.
 
 ## Arguments and compatibility
 
@@ -66,9 +80,11 @@ Forwarding alone does not guarantee the same behavior as a regular local Codex
 session.
 
 - `-c`/`--config`, `--enable`, and `--disable` are also passed to app-server.
-  These are the only options copied to both processes; other options go to the
-  TUI. A `--` separator stops the wrapper's option scan, so arguments after it
-  are forwarded to the TUI without being interpreted or copied to app-server.
+  They are supplied to shared-server startup and the bridge as well as the TUI.
+  They do not reconfigure an already-running daemon; the server decides effective
+  settings. Other options go to the TUI. A `--` separator stops the wrapper's
+  option scan, so arguments after it are forwarded to the TUI without being
+  interpreted or copied to app-server.
 - `--remote` and `--remote-auth-token-env` are reserved for the wrapper's private
   connection. Supplying either option before `--`, including its `=value` form,
   is rejected.
@@ -76,7 +92,7 @@ session.
   See the [Codex CLI reference](https://learn.chatgpt.com/docs/cli/reference).
 - For interactive `resume`, the wrapper consumes explicit `--yolo` or
   `--dangerously-bypass-approvals-and-sandbox`, before or after `resume`.
-  Codex CLI 0.162.1 rejects these permission overrides on remote resume before
+  Codex CLI 0.163.0 rejects these permission overrides on remote resume before
   connecting. The wrapper instead requests `approvalPolicy: "never"` and
   `sandbox: "danger-full-access"` on the launch's `thread/resume` RPC: commands
   run without approvals or the Codex sandbox. Prompts and option values containing
@@ -102,7 +118,8 @@ session.
   `codex exec "Review the changes"`.
 
 Offline fixtures and fake Codex PTY checks cover resume permissions, config and
-input forwarding, and failure without model work. Native connection checks block
+input forwarding, shared-server attachment and ownership, cold startup, terminal
+restoration, and failure without model work. Native connection checks block
 inference and cover TUI initialization and both native and wrapped exits using
 synthetic history, live lookalikes, token totals, terminal restoration and cleanup.
 These checks do not verify real stored-session resume behavior or cover every
@@ -119,7 +136,11 @@ a new turn in the same thread; it does not rewind history or roll back effects.
 Retries wait 5, 10, 20, 40 seconds, and so on, capped at 30 minutes, without
 jitter or an attempt limit. Success resets the delay. Duplicate and stale events
 do not schedule extra retries. New submitted input, steering, interruption,
-thread switching, and disconnection cancel a pending retry.
+thread switching, and disconnection cancel a pending retry. Conflicting activity
+in the same thread from another client also cancels replay, including settings
+changes, a different live turn, and additional or changed user messages in our
+turn. Duplicate notifications of our original input remain eligible. Foreign
+responses cannot acknowledge our work.
 
 Automatic replay stops after model output, non-user item activity (including
 tool execution), MCP elicitation requests, or hook activity, including early
@@ -129,9 +150,103 @@ Other failures and ambiguous request rejections require manual recovery.
 This deliberately covers overload before observable progress; it is not a
 general transaction recovery mechanism.
 
+## Optional recovery
+
+The wrapper reads `$XDG_CONFIG_HOME/codex-retry/config.json` once at startup.
+If `XDG_CONFIG_HOME` is unset, empty or relative, it uses
+`$HOME/.config/codex-retry/config.json`. Both flags default to `false`:
+
+```json
+{
+  "auto_reset_limit": false,
+  "auto_continue_after_stop": false
+}
+```
+
+Copy [config.example.json](config.example.json) to the configuration path above.
+For the default location, run from the repository directory:
+
+```sh
+mkdir -p "$HOME/.config/codex-retry"
+cp -i config.example.json "$HOME/.config/codex-retry/config.json"
+```
+
+Set either flag to the JSON boolean `true` to enable it. Missing files or keys
+retain the defaults. Unreadable, malformed, oversized or non-object files, or
+incorrectly typed flags such as `"true"`, disable both modes with a warning.
+Unknown keys are ignored. Configuration is data, never Tcl or shell code;
+there are no additional wrapper command-line flags, profiles or saved recovery
+state. Native Codex argument forwarding remains as described above.
+
+`auto_reset_limit` handles an acknowledged, failed turn with the typed error
+`usageLimitExceeded`. It reads fresh account limits and requires confirmed
+OpenAI provider provenance, an identified account and relevant ordinary quota,
+`ordinaryUsageAllowed: false`, `rateLimitReachedType: "rate_limit_reached"`,
+and `spendControlReached: false`. The default `codex` quota is supported;
+other quota aliases require an exact effective-model match. Missing provenance,
+transient throttling (`rateLimitExceeded`), session budgets and spend controls
+do not authorize redemption.
+
+The authoritative `rateLimitResetCredits.availableCount` must be positive.
+Missing or null availability means unknown; zero means no earned resets.
+A positive count works even when credit details are null or empty. A credit ID
+is supplied only when an available Codex reset is identified in that read.
+For each distinct failure, the wrapper sends one redemption with a fresh logical
+idempotency key that remains stable for that incident. It never retries an
+ambiguous redemption or purchases credits, and never emails
+workspace owners. Account requests time out after 10 seconds with a warning;
+the server may already have processed a timed-out redemption.
+
+After `reset` or `alreadyRedeemed`, a full limits read must identify the same
+account and quota, explicitly allow ordinary usage, and confirm no reached
+rate limit or spend control. Percentages, reset timestamps and sparse
+`account/rateLimits/updated` notifications cannot establish recovery. Verified
+recovery starts a new same-thread turn with exactly `continue`, independently
+of the second flag. Unsupported APIs, unknown or unavailable resets,
+`nothingToReset`, `noCredit`, failed verification and unchanged exhausted
+limits warn and leave work stopped. A limit change before redemption cancels
+it. For each redemption, updates can cause at most one additional full
+verification read. Further changes warn and leave work stopped, without another
+redemption.
+
+`auto_continue_after_stop` handles only the confirmed native content stop
+represented by `cyberPolicy` in CLI 0.163.0. It requires this client's
+acknowledged `turn/start` and a matching `turn/completed` with `status: "failed"`
+and a string `error.codexErrorInfo` exactly equal to `cyberPolicy`. The wrapper
+forwards the native failure, then submits exactly the plain ASCII user text
+`continue` as one new turn in the same thread. Generic refusal text, `other`,
+`misalignmentPolicyViolation`, transient safety buffering, opaque moderation
+metadata, error notifications alone and successful completion do not trigger
+it. Other CLI versions or stop types require a verified protocol mapping;
+there is no terminal-text fallback.
+
+Both modes preserve native history and restrictions and retain the turn's
+settings. Earlier tool effects remain in place. Only the neutral follow-up is
+submitted, without replaying original input, attachments, tool outputs or
+additional context. This automates a manual follow-up; it does not diagnose
+false positives or override native restriction decisions.
+
+Each distinct qualifying failure can recover, including failures of automatic
+continuations. There is no per-chain or total-attempt cap, and the modes have
+no shared allowance. Each usage-limit incident requires fresh eligibility and
+verification with an available earned reset. Duplicate or stale events cannot
+repeat a continuation or redemption for the same failure. Overload retries
+retain their original input, settings and backoff. IDs, ownership and ordering
+must be unambiguous.
+Pre-existing active work reported by activation/history snapshots or
+thread-status events cannot be claimed as this client's newly started turn.
+Metadata reads preserve recovery eligibility without changing the selected thread.
+Manual turn/thread, settings or goal changes, conflicting same-thread activity,
+account changes and disconnection cancel pending recovery, including overload
+retries of its automatic continuation. Native warnings appear through the typed
+warning notification; if delivery is unavailable,
+the existing bounded diagnostics show them after the TUI releases the terminal.
+
 Run the offline checks with `tclsh tests/retry.test.tcl`. They use structured
 event fixtures, controlled timers, and a fake backend without model calls or
-waiting through backoff.
+waiting through backoff. Fixtures cover opt-in configuration, reset eligibility
+and verification, repeated and mixed-mode continuation, deduplication and
+cancellation, plus warnings and responsive input through fake PTYs.
 
 Project guidance lives in `AGENTS.md` and `.agents/skills/`; `CLAUDE.md` and
 `.claude/skills` are relative symlinks to those canonical files.

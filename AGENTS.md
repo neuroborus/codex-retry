@@ -5,12 +5,15 @@ The README owns usage and retry behavior. Keep source, comments, and repository
 documentation in English.
 
 - Preserve the native TUI and terminal forwarding. Use App Server JSON events,
-  correlate request/thread/turn IDs, and retry only a completed `serverOverloaded`
-  failure before observable model/tool/hook progress. Preserve the original
-  input and settings; keep one timer with exponential delays from 5 seconds to
-  30 minutes.
+  correlate request/thread/turn IDs, and by default retry only a completed
+  `serverOverloaded` failure before observable model/tool/hook progress. Preserve
+  the original input and settings; keep one timer with exponential delays from
+  5 seconds to 30 minutes.
 - Cancel on manual turn/thread changes or disconnection; reset delay on success.
-  Do not infer success or failure from terminal text or inject `continue`.
+  Do not infer success or failure from terminal text. Only the explicit,
+  default-false recovery flags may submit a new literal `continue` turn after
+  verified earned-reset recovery or an acknowledged terminal `cyberPolicy`
+  stop. Handle each distinct failure at most once; never replay partial work.
 - Keep Tcllib responsible for JSON and WebSocket framing. Avoid frameworks,
   persistent state, and configuration layers unless requested behavior requires them.
 - Keep project skills under `.agents/skills/`. `.claude/skills` points there;

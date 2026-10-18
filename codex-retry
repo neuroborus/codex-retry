@@ -44,6 +44,537 @@ proc json_dump {value} {
     }
 }
 
+# Opt-in follow-ups have a separate lifetime from exit advice and overload replay.
+namespace eval automatic {
+    variable flags {auto_reset_limit 0 auto_continue_after_stop 0}
+    variable configWarning ""
+    variable current {}
+    variable timer ""
+    variable ids {}
+    variable selection {}
+    variable live {}
+}
+
+proc automatic::is {object type args} {
+    expr {[huddle exists $object {*}$args] && [huddle type $object {*}$args] eq $type}
+}
+proc automatic::text {object args} {
+    if {[is $object string {*}$args]} { return [huddle get_stripped $object {*}$args] }
+    return ""
+}
+proc automatic::selected {object thread args} {
+    variable selection
+    set selection [dict create threadId $thread model [text $object {*}$args model] \
+        provider [text $object {*}$args modelProvider]]
+}
+
+# Activation can attach to work already running in another client. An empty
+# guard value means active work is confirmed but its turn ID is unavailable.
+proc automatic::snapshot {result} {
+    variable live; variable flags
+    if {![dict get $flags auto_reset_limit] && ![dict get $flags auto_continue_after_stop]} { return }
+    set thread [text $result thread id]
+    if {$thread eq ""} { return }
+    set active {}
+    foreach path {{thread turns} {initialTurnsPage data}} {
+        if {![is $result list {*}$path]} { continue }
+        set turns [huddle get $result {*}$path]
+        for {set i 0} {$i < [huddle llength $turns]} {incr i} {
+            set turn [huddle get $turns $i]
+            if {[text $turn status] eq "inProgress"} { dict set active [text $turn id] 1 }
+        }
+    }
+    set status [text $result thread status type]
+    if {[dict size $active] || $status eq "active"} {
+        set id ""
+        if {[dict size $active] == 1} { set id [lindex [dict keys $active] 0] }
+        dict set live $thread $id
+    } elseif {$status in {idle notLoaded systemError}} { dict unset live $thread }
+}
+
+proc automatic::read_only {method} {
+    expr {$method in {thread/read thread/list thread/loaded/list thread/search thread/searchOccurrences
+        thread/turns/list thread/items/list thread/items/read thread/timeline/list thread/goal/get
+        thread/queue/list thread/backgroundTerminals/list thread/attachment/list
+        thread/attachmentOwner/list thread/realtime/listVoices account/read account/rateLimits/read
+        account/usage/read account/workspaceMessages/read account/gatewayOAuth/read}}
+}
+
+# Tcllib parses JSON. Counting its retained members against the string-free
+# source rejects duplicate keys, which its dictionaries otherwise overwrite.
+proc automatic::members {object} {
+    set count 0
+    switch -- [huddle type $object] {
+        dict {
+            foreach key [huddle keys $object] { incr count [expr {1 + [members [huddle get $object $key]]}] }
+        }
+        list {
+            for {set i 0} {$i < [huddle llength $object]} {incr i} { incr count [members [huddle get $object $i]] }
+        }
+    }
+    return $count
+}
+proc automatic::decode {json} {
+    if {![json::validate $json]} { error "invalid JSON" }
+    # Tcllib's lexical validator permits raw controls and extra whitespace.
+    regsub -all {"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4}))*"} $json 0 outside
+    if {[regexp {["\\\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\uffff]} $outside]} { error "invalid JSON characters" }
+    # Wrapping forces the parser to consume the entire document, not a prefix.
+    set wrapper [::huddle::json2huddle "\[$json\]"]
+    if {[huddle llength $wrapper] != 1 || ![is $wrapper dict 0]} { error "expected one object" }
+    set object [huddle get $wrapper 0]
+    if {[regexp -all {:} $outside] != [members $object]} { error "duplicate JSON keys" }
+    return $object
+}
+
+proc automatic::configure {} {
+    variable flags; variable configWarning
+    set flags {auto_reset_limit 0 auto_continue_after_stop 0}
+    set configWarning ""
+    if {[info exists ::env(XDG_CONFIG_HOME)] && [file pathtype $::env(XDG_CONFIG_HOME)] eq "absolute"} {
+        set directory $::env(XDG_CONFIG_HOME)
+    } elseif {[info exists ::env(HOME)]} {
+        set directory [file join $::env(HOME) .config]
+    } else {
+        set configWarning "cannot locate codex-retry config.json; both automatic recovery flags are disabled"
+        return
+    }
+    set path [file join $directory codex-retry config.json]
+    if {[catch {file lstat $path stat} message options] && \
+        [lrange [dict get $options -errorcode] 0 1] eq {POSIX ENOENT}} { return }
+    if {[catch {
+        set channel [open $path r]
+        try {
+            fconfigure $channel -encoding utf-8
+            set json [read $channel 16385]
+        } finally { close $channel }
+        if {[string length $json] > 16384} { error "oversized JSON" }
+        set object [decode $json]
+        set configured $flags
+        foreach key [dict keys $flags] {
+            if {![huddle exists $object $key]} { continue }
+            if {![is $object boolean $key]} { error "expected a JSON boolean" }
+            dict set configured $key [expr {[huddle get_stripped $object $key] eq "true"}]
+        }
+        set flags $configured
+    }]} {
+        set configWarning "invalid or unreadable codex-retry config.json; both automatic recovery flags are disabled"
+    }
+}
+
+proc automatic::notify {json} {
+    if {![info exists ::client]} { return 0 }
+    expr {![catch {websocket::send $::client text $json} result] && $result >= 0}
+}
+proc automatic::warn {message {thread ""}} {
+    set target [huddle null]
+    if {$thread ne ""} { set target [huddle string $thread] }
+    set notice [huddle create method [huddle string warning] params [huddle create \
+        threadId $target message [huddle string "codex-retry: $message"]]]
+    if {![notify [json_dump $notice]]} { diagnostics::retain "codex-retry: $message\n" }
+}
+proc automatic::owns_retry {} {
+    variable current
+    expr {[field $current generated] eq "1" && [field $current rpcId] eq [field $::retry::current rpcId] && \
+        [field $current threadId] eq [field $::retry::current threadId]}
+}
+proc automatic::cancel {} {
+    variable current; variable timer
+    # Invalidating an automatic continuation must also prevent its running or
+    # backoff turn from re-arming through the overload engine.
+    if {[owns_retry]} { retry::reset }
+    after cancel $timer
+    set timer ""
+    set current {}
+}
+proc automatic::stop {message} {
+    variable current
+    warn "$message; work remains stopped" [field $current threadId]
+    cancel
+}
+
+# The shared random prefix and monotonic sequence reserve IDs across both engines.
+proc retry::next_id {} {
+    variable prefix; variable sequence; variable usedIds
+    while {1} {
+        set id [huddle string "$prefix-[incr sequence]"]
+        set key [json_dump $id]
+        if {![dict exists $usedIds $key]} { break }
+    }
+    dict set usedIds $key 1
+    return $id
+}
+
+proc automatic::client {object} {
+    variable flags; variable current; variable configWarning; variable live
+    set method [text $object method]
+    if {$method eq "initialized" && $configWarning ne ""} {
+        warn $configWarning
+        set configWarning ""
+    }
+    if {$method eq "" || (![dict get $flags auto_reset_limit] && \
+        ![dict get $flags auto_continue_after_stop])} { return }
+    if {[read_only $method]} { return }
+    set thread [text $object params threadId]
+    if {$current ne "" && $thread ne "" && $thread ne [dict get $current threadId]} { cancel }
+    if {[string match "account/*" $method]} { cancel }
+    if {![string match "turn/*" $method] && ![string match "thread/*" $method] && \
+        $method ni {review/start modelProvider/auth/set modelProvider/auth/clear}} { return }
+    # All remaining thread/turn commands can mutate the task or its selection.
+    set busy [expr {($current ne "" && [field $current phase] eq "running") || [dict exists $live $thread]}]
+    set previous [field $current turnId]
+    cancel
+    if {$method ne "turn/start" || $busy || ![is $object dict params] || \
+        $thread eq "" || ![huddle exists $object id] || \
+        [huddle type $object id] ni {string number} || \
+        ![is $object list params input] || [huddle llength [huddle get $object params input]] == 0} { return }
+    set id [json_dump [huddle get $object id]]
+    if {[dict exists $::retry::usedIds $id]} { return }
+    set current [dict create request $object rpcId $id threadId $thread turnId "" \
+        previous $previous early "" userId "" phase running accepted 0 generated 0 done 0]
+}
+
+# An overload replay belongs to the same manually initiated chain.
+proc automatic::replay {request previous} {
+    variable current
+    if {$current eq "" || [field $current rpcId] ne $previous || \
+        [field $current phase] ne "overload"} { return }
+    dict set current request $request
+    dict set current rpcId [json_dump [huddle get $request id]]
+    dict set current previous [dict get $current turnId]
+    foreach {key value} {turnId "" early "" userId "" phase running accepted 0 done 0} { dict set current $key $value }
+}
+
+proc automatic::user_item {item} {
+    variable current
+    # Stopped turns may repeat a verified echo, but cannot establish a new identity.
+    if {[field $current phase] ne "running" && [field $current userId] eq ""} { cancel; return }
+    set params [huddle get [dict get $current request] params]
+    set id [text $item id]
+    if {$id eq "" || ![is $item list content] || \
+        ![huddle equal [retry::user_input [huddle get $params input]] \
+            [retry::user_input [huddle get $item content]]]} { cancel; return }
+    if {[huddle exists $params clientUserMessageId] && [huddle type $params clientUserMessageId] ne "null" && \
+        (![is $params string clientUserMessageId] || \
+         [text $item clientId] ne [text $params clientUserMessageId])} { cancel; return }
+    if {[field $current userId] ne "" && [field $current userId] ne $id} { cancel; return }
+    dict set current userId $id
+}
+proc automatic::items {turn} {
+    variable current
+    if {![is $turn list items]} { cancel; return }
+    set items [huddle get $turn items]
+    for {set i 0} {$i < [huddle llength $items] && $current ne ""} {incr i} {
+        set item [huddle get $items $i]
+        if {![is $item dict] || [text $item type] eq ""} { cancel; return }
+        if {[text $item type] eq "userMessage"} { user_item $item }
+    }
+}
+
+# Only an acknowledged terminal failure can queue an action. Zero-delay actions
+# run after the native event has been forwarded, and are revalidated on dispatch.
+proc automatic::queue {phase} {
+    variable current; variable timer
+    after cancel $timer
+    dict set current phase $phase
+    set timer [after 0 automatic::advance]
+}
+
+proc automatic::completed {turn} {
+    variable current; variable flags; variable live
+    if {[field $current done]} { return }
+    dict set current done 1
+    set thread [dict get $current threadId]
+    if {[field $live $thread] eq [dict get $current turnId]} { dict unset live $thread }
+    if {[text $turn status] ne "failed" || ![is $turn dict error] || ![is $turn string error message]} {
+        cancel
+        return
+    }
+    set code [text $turn error codexErrorInfo]
+    if {$code eq "serverOverloaded"} { dict set current phase overload; return }
+    set phase ""
+    if {$code eq "usageLimitExceeded" && [dict get $flags auto_reset_limit]} { set phase read_ready }
+    if {$code eq "cyberPolicy" && [dict get $flags auto_continue_after_stop]} { set phase continue_stop }
+    if {$phase eq ""} { cancel; return }
+    queue $phase
+}
+
+proc automatic::server {object} {
+    variable current; variable ids; variable flags; variable live
+    set method [text $object method]
+    set thread [text $object params threadId]
+    set turn [text $object params turn id]
+    if {$thread ne "" && $turn ne ""} {
+        if {$method eq "turn/started" && [text $object params turn status] eq "inProgress" && \
+            ![dict exists $::retry::finished [list $thread $turn]]} {
+            dict set live $thread $turn
+        } elseif {$method eq "turn/completed" && [field $live $thread] eq $turn && \
+            [text $object params turn status] in {completed failed interrupted}} { dict unset live $thread }
+    }
+    if {$thread ne "" && $method in {thread/closed thread/archived thread/deleted}} { dict unset live $thread }
+    if {$thread ne "" && $method eq "thread/status/changed"} {
+        set status [text $object params status type]
+        if {$status eq "active"} {
+            if {![dict exists $live $thread]} { dict set live $thread "" }
+            if {$thread eq [field $current threadId] && [field $current phase] ne "running"} { cancel }
+        } elseif {$status in {idle notLoaded systemError}} { dict unset live $thread }
+    }
+    set id ""
+    if {[huddle exists $object id]} { set id [json_dump [huddle get $object id]] }
+    set response [expr {![huddle exists $object method] && $id ne ""}]
+    set visible [expr {$method ne "" || ![dict exists $ids $id]}]
+    if {$current eq ""} { return $visible }
+    if {$method eq "" && $id ne "" && $id eq [field $current opId]} {
+        if {!$response || [huddle exists $object error] || ![is $object dict result]} {
+            stop "account reset API unavailable or failed"
+        } else { limits_reply [huddle get $object result] }
+        return 0
+    }
+    if {$id eq [field $current rpcId] && $method eq ""} {
+        if {!$response || [huddle exists $object error] || ![is $object dict result turn] || \
+            [text $object result turn id] eq "" || \
+            [text $object result turn status] ni {inProgress failed completed interrupted}} {
+            cancel
+        } elseif {![field $current accepted]} {
+            set turn [huddle get $object result turn]
+            set turnId [text $turn id]
+            if {$turnId eq [field $current previous] || \
+                ([dict exists $::retry::finished [list [dict get $current threadId] $turnId]] && \
+                 ![dict exists $current terminal]) || \
+                ([field $current early] ne "" && [field $current early] ne $turnId)} { cancel; return $visible }
+            dict set current accepted 1
+            dict set current turnId $turnId
+            # A running reply also establishes activity when turn/started is absent.
+            # A terminal event received before this reply must remain authoritative.
+            if {[text $turn status] eq "inProgress" && ![dict exists $current terminal] && \
+                (![dict exists $live [dict get $current threadId]] || \
+                 [field $live [dict get $current threadId]] eq "")} {
+                dict set live [dict get $current threadId] $turnId
+            }
+            items $turn
+            if {$current ne "" && [dict exists $current terminal]} {
+                set terminal [dict get $current terminal]
+                dict unset current terminal
+                completed $terminal
+            } elseif {$current ne "" && [text $turn status] ne "inProgress"} { cancel }
+        }
+        return $visible
+    }
+    if {$method in {account/updated account/gatewayOAuth/changed}} { cancel; return $visible }
+    if {$method eq "account/rateLimits/updated"} {
+        # Consume may itself publish an update. Only the subsequent full read
+        # can prove recovery; sparse notifications never authorize continuation.
+        if {[field $current phase] in {read consume_ready}} {
+            stop "rate limits changed during recovery verification"
+        } elseif {[field $current phase] eq "verify"} {
+            dict set current limitsChanged 1
+        } elseif {[field $current phase] eq "continue_reset"} {
+            refresh_limits
+        }
+        return $visible
+    }
+    if {[text $object params threadId] ne [field $current threadId]} { return $visible }
+    if {$method in {thread/closed thread/archived thread/deleted thread/reverted thread/compacted
+        thread/settings/updated thread/queue/changed thread/goal/updated thread/goal/cleared
+        thread/environment/connected thread/environment/disconnected model/rerouted}} {
+        cancel
+        return $visible
+    }
+    if {$method in {turn/started turn/completed}} {
+        if {![is $object dict params turn]} { cancel; return $visible }
+        set turn [huddle get $object params turn]
+        set turnId [text $turn id]
+        if {$turnId eq ""} { cancel; return $visible }
+        if {$turnId ne [field $current turnId] && \
+            [dict exists $::retry::finished [list [field $current threadId] $turnId]]} { return $visible }
+        if {![field $current accepted]} {
+            # An early start is only a candidate until the reply binds its ID.
+            # Retain a subsequent terminal snapshot, never a completion alone.
+            if {($method eq "turn/started" && [text $turn status] ne "inProgress") || \
+                ($method eq "turn/completed" && [field $current early] eq "") || \
+                ($turnId eq [field $current previous]) || \
+                ([field $current early] ne "" && [field $current early] ne $turnId)} { cancel; return $visible }
+            dict set current early $turnId
+            items $turn
+            if {$current ne "" && $method eq "turn/completed"} { dict set current terminal $turn }
+            return $visible
+        } elseif {$turnId ne [field $current turnId]} { cancel; return $visible }
+        items $turn
+        if {$current eq "" || [field $current done] || \
+            [field $current phase] ni {running overload} || $method ne "turn/completed"} { return $visible }
+        completed $turn
+    } elseif {[string match "item/*" $method] || [string match "hook/*" $method] || \
+        $method in {turn/plan/updated turn/diff/updated rawResponseItem/completed rawResponse/completed mcpServer/elicitation/request}} {
+        set turnId [text $object params turnId]
+        if {$turnId ne "" && $turnId ne [field $current turnId] && \
+            [dict exists $::retry::finished [list [field $current threadId] $turnId]]} { return $visible }
+        set expected [field $current turnId]
+        if {![field $current accepted]} { set expected [field $current early] }
+        if {$turnId eq "" || $expected eq "" || $turnId ne $expected} { cancel; return $visible }
+        if {$method in {item/started item/completed}} {
+            if {![is $object dict params item] || [text $object params item type] eq ""} { cancel; return $visible }
+            if {[text $object params item type] eq "userMessage"} {
+                user_item [huddle get $object params item]
+                return $visible
+            }
+        }
+        if {[field $current phase] ne "running"} { cancel }
+    }
+    return $visible
+}
+
+proc automatic::rpc {method params phase} {
+    variable current; variable timer; variable ids
+    after cancel $timer
+    set id [retry::next_id]
+    set key [json_dump $id]
+    dict set ids $key 1
+    dict set current opId $key
+    dict set current phase $phase
+    if {$phase eq "verify"} { dict set current limitsChanged 0 }
+    set timer [after 10000 [list automatic::stop "account recovery request timed out; its outcome is unknown"]]
+    backend_send [json_dump [huddle create id $id method [huddle string $method] params $params]]
+}
+
+proc automatic::refresh_limits {} {
+    variable current
+    if {[dict get $current refreshes] == 0} {
+        stop "rate limits kept changing before recovery could be verified"
+    } else {
+        dict incr current refreshes -1
+        rpc account/rateLimits/read [huddle create] verify
+    }
+}
+
+# A full read must identify the active account and the same ordinary quota.
+# Only the confirmed OpenAI provider can use these account resets. A non-default
+# quota alias also needs an exact model match. Unknown provenance stays stopped.
+proc automatic::quota {result} {
+    variable current; variable selection
+    if {[field $selection threadId] ne [dict get $current threadId] || \
+        [field $selection provider] ne "openai"} { return "" }
+    if {[text $result accountId] eq "" || ![is $result dict rateLimits]} { return "" }
+    set quota [huddle get $result rateLimits]
+    set id [text $quota limitId]
+    set params [huddle get [dict get $current request] params]
+    set model [text $params collaborationMode settings model]
+    if {$model eq ""} { set model [text $params model] }
+    if {$model eq ""} { set model [field $selection model] }
+    if {$id eq "" || ($id ne "codex" && ($model eq "" || $model ne [text $quota normalModelSlug])) || \
+        ![is $quota boolean spendControlReached] || [huddle get_stripped $quota spendControlReached] ne "false"} { return "" }
+    if {[huddle exists $result rateLimitsByLimitId] && ![is $result null rateLimitsByLimitId]} {
+        if {![is $result dict rateLimitsByLimitId $id]} { return "" }
+        set bucket [huddle get $result rateLimitsByLimitId $id]
+        foreach key {limitId spendControlReached rateLimitReachedType} {
+            if {![huddle exists $quota $key] || ![huddle exists $bucket $key] || \
+                ![huddle equal [huddle get $quota $key] [huddle get $bucket $key]]} { return "" }
+        }
+    }
+    return $quota
+}
+
+proc automatic::limits_reply {result} {
+    variable current; variable timer
+    after cancel $timer
+    set timer ""
+    set phase [dict get $current phase]
+    dict unset current opId
+    if {$phase eq "consume"} {
+        set outcome [text $result outcome]
+        if {$outcome in {reset alreadyRedeemed}} {
+            dict set current refreshes 1
+            rpc account/rateLimits/read [huddle create] verify
+        } else {
+            switch -- $outcome {
+                noCredit { stop "no earned rate-limit resets are available" }
+                nothingToReset { stop "the server found nothing resettable; no reset confirmed" }
+                default { stop "reset redemption returned an unknown outcome" }
+            }
+        }
+        return
+    }
+    if {$phase eq "verify" && [dict get $current limitsChanged]} { refresh_limits; return }
+    set quota [quota $result]
+    if {$quota eq "" || ![is $result boolean ordinaryUsageAllowed]} {
+        stop "account or ordinary quota eligibility is unknown"
+        return
+    }
+    set account [text $result accountId]
+    set limit [text $quota limitId]
+    if {$phase eq "verify"} {
+        if {$account ne [dict get $current account] || $limit ne [dict get $current limit] || \
+            [huddle get_stripped $result ordinaryUsageAllowed] ne "true" || \
+            ![is $quota null rateLimitReachedType]} {
+            stop "refreshed limits did not verify restored ordinary usage"
+        } else { queue continue_reset }
+        return
+    }
+    if {[huddle get_stripped $result ordinaryUsageAllowed] ne "false" || \
+        [text $quota rateLimitReachedType] ne "rate_limit_reached"} {
+        stop "ordinary usage is no longer exhausted or this limit is not resettable; no credit consumed"
+        return
+    }
+    if {![is $result number rateLimitResetCredits availableCount] || \
+        ![regexp {^[0-9]+$} [huddle get_stripped $result rateLimitResetCredits availableCount]]} {
+        stop "available reset count is unknown"
+        return
+    }
+    if {[huddle get_stripped $result rateLimitResetCredits availableCount] == 0} {
+        stop "no earned rate-limit resets are available"
+        return
+    }
+    dict set current account $account
+    dict set current limit $limit
+    set params [huddle create idempotencyKey [retry::next_id]]
+    if {[is $result list rateLimitResetCredits credits]} {
+        set credits [huddle get $result rateLimitResetCredits credits]
+        for {set i 0} {$i < [huddle llength $credits]} {incr i} {
+            set credit [huddle get $credits $i]
+            if {[text $credit status] eq "available" && [text $credit resetType] eq "codexRateLimits" && \
+                [text $credit id] ne ""} { huddle set params creditId [huddle get $credit id]; break }
+        }
+    }
+    # Keep one stable logical redemption. There are no automatic consume retries,
+    # including after timeouts where the server may already have redeemed it.
+    dict set current redemption $params
+    queue consume_ready
+}
+
+proc automatic::advance {} {
+    variable current; variable timer
+    set timer ""
+    if {$current eq "" || ![field $current accepted]} { return }
+    switch -- [dict get $current phase] {
+        read_ready { rpc account/rateLimits/read [huddle create] read }
+        consume_ready { rpc account/rateLimitResetCredit/consume [dict get $current redemption] consume }
+        continue_stop - continue_reset {
+            set original [huddle get [dict get $current request] params]
+            set params [huddle create threadId [huddle get $original threadId] \
+                clientUserMessageId [retry::next_id] \
+                input [huddle list [huddle create type [huddle string text] text [huddle string continue] \
+                    text_elements [huddle list]]]]
+            # Copy settings only. Never replay input, tool output, attachments,
+            # additional context, source classifications or parent identities.
+            foreach key {disabledPluginIds environments cwd runtimeWorkspaceRoots approvalPolicy
+                approvalsReviewer sandboxPolicy permissions model serviceTier serviceTierForTurn
+                effort summary personality outputSchema collaborationMode multiAgentMode cyberAccessProgram} {
+                if {[huddle exists $original $key]} { huddle set params $key [huddle get $original $key] }
+            }
+            set id [retry::next_id]
+            set request [huddle create id $id method [huddle string turn/start] params $params]
+            set key [json_dump $id]
+            dict set ::automatic::ids $key 1
+            # Each turn starts fresh; account operations and verification state
+            # belong only to the failure that triggered this continuation.
+            set current [dict create request $request rpcId $key threadId [dict get $current threadId] \
+                turnId "" previous [dict get $current turnId] early "" userId "" \
+                phase running accepted 0 generated 1 done 0]
+            retry::client [json_dump $request] 0
+            backend_send [json_dump $request]
+        }
+    }
+}
+
 # Recovery outlives retry cancellation, disconnection and backend cleanup.
 namespace eval recovery {
     variable target ""
@@ -63,6 +594,7 @@ proc recovery::client {json} {
     set method [field $message method]
     set params [field $message params]
     if {$method in {thread/start thread/resume thread/fork}} {
+        set ::automatic::selection {}
         # A pending activation is not proof that either the old or new UI
         # selection is resumable. Only the latest successful reply can select it.
         set target ""
@@ -109,8 +641,19 @@ proc recovery::client {json} {
     if {[dict exists $params permissions] && [huddle type $object params permissions] ne "null"} { set yolo 0 }
 }
 
-proc recovery::server {object message} {
+# Automatic selection and activity snapshots require strict envelope validation.
+proc recovery::server {object message {automaticValid 0}} {
     variable target; variable pending; variable deleted; variable yolo
+    if {[field $message method] eq "thread/settings/updated" && \
+        [field $message params threadId] eq $target} {
+        if {$automaticValid} { automatic::selected $object $target params threadSettings }
+        if {![huddle exists $object params threadSettings approvalPolicy] || \
+            [huddle type $object params threadSettings approvalPolicy] ne "string" || \
+            [huddle get_stripped $object params threadSettings approvalPolicy] ne "never" || \
+            ![huddle exists $object params threadSettings sandboxPolicy type] || \
+            [huddle type $object params threadSettings sandboxPolicy type] ne "string" || \
+            [huddle get_stripped $object params threadSettings sandboxPolicy type] ne "dangerFullAccess"} { set yolo 0 }
+    }
     # Reuse Tcllib's dictionary; Huddle is needed only for typed field access.
     if {[field $message method] in {thread/deleted thread/archived}} {
         set id [field $message params threadId]
@@ -122,14 +665,17 @@ proc recovery::server {object message} {
     set expected [field $pending expected]
     set ephemeral [field $pending ephemeral]
     set pending {}
-    if {$ephemeral || [huddle exists $object error] || \
+    if {[huddle exists $object error] || \
         ![huddle exists $object result thread id] || \
         [huddle type $object result] ne "dict" || [huddle type $object result thread] ne "dict" || \
         [huddle type $object result thread id] ne "string"} { return }
     set id [huddle get_stripped $object result thread id]
-    if {$id eq "" || ($expected ne "" && $id ne $expected) || [dict exists $deleted $id] || \
+    if {$id eq "" || ($expected ne "" && $id ne $expected)} { return }
+    if {$automaticValid} { automatic::snapshot [huddle get $object result] }
+    if {$ephemeral || [dict exists $deleted $id] || \
         [field $message result thread ephemeral] eq "true"} { return }
     set target $id
+    if {$automaticValid} { automatic::selected $object $id result }
     if {![huddle exists $object result approvalPolicy] || \
         [huddle type $object result approvalPolicy] ne "string" || \
         [huddle get_stripped $object result approvalPolicy] ne "never" || \
@@ -172,7 +718,7 @@ proc recovery::advice {} {
     return "$heading\n  [join $quoted { }]\n"
 }
 
-# Native 0.162.1 restores bracketed paste before its combined-PTY exit
+# Native exits restore bracketed paste before the combined-PTY exit
 # epilogue. Forward live bytes immediately, retaining only a split marker.
 # After restoration, buffer only a possible native disconnect prefix and its
 # bounded epilogue. Unrelated output and TUI re-entry flush it immediately.
@@ -396,28 +942,46 @@ proc retry::reset {} {
     set delay 5000
 }
 
-proc retry::client {json} {
+proc retry::client {json {manual 1}} {
     variable current; variable usedIds
     set object [::huddle::json2huddle $json]
     set message [json::json2dict $json]
+    # Canceling an automatic chain may clear current before steering is recorded.
+    set prior $current
+    if {$manual} {
+        if {[dict get $::automatic::flags auto_reset_limit] || \
+            [dict get $::automatic::flags auto_continue_after_stop]} {
+            if {[catch {automatic::decode $json} typed]} {
+                automatic::cancel
+            } else { automatic::client $typed }
+        } else { automatic::client $object }
+    }
     set method [field $message method]
     if {$method ne "" && [dict exists $message id]} {
         dict set usedIds [json_dump [huddle get $object id]] 1
     }
     set threadId [field $message params threadId]
     if {$current ne "" && $method ne "" && $threadId ne "" && \
-        $threadId ne [field $current threadId]} { reset }
+        $threadId ne [field $current threadId] && \
+        !([automatic::owns_retry] && [automatic::read_only $method])} { reset }
     if {[string match "turn/*" $method] || $method in {
         thread/start thread/resume thread/fork thread/revert thread/archive
         thread/delete thread/unsubscribe thread/compact/start thread/inject_items
-        thread/settings/update review/start thread/shellCommand
+        thread/settings/update thread/goal/set thread/goal/clear review/start thread/shellCommand
         thread/queue/add thread/queue/update thread/queue/delete
         thread/queue/reorder thread/queue/start
         thread/realtime/start thread/realtime/stop thread/realtime/appendText
         thread/realtime/appendAudio thread/realtime/appendSpeech
     }} {
-        set busy [expr {$current ne "" && [field $current status] in {awaiting inProgress}}]
-        set previous [field $current turnId]
+        if {$threadId ne "" && $threadId ne [field $prior threadId]} { set prior {} }
+        set busy [expr {$prior ne "" && [field $prior status] in {awaiting inProgress}}]
+        set previous [field $prior turnId]
+        # Context invalidation can discard the tracker while its turn is still
+        # live. Steering that work must not become eligible for fresh replay.
+        if {[dict exists $::automatic::live $threadId]} {
+            set busy 1
+            set previous [dict get $::automatic::live $threadId]
+        }
         reset
         if {$method eq "turn/start" && [dict exists $message id] && \
             [field $message params threadId] ne "" && [field $message params input] ne ""} {
@@ -445,14 +1009,73 @@ proc retry::observe {turnId key value} {
     }
 }
 
-proc retry::items {turn} {
+# App Server supplies the default empty spans when echoing submitted text.
+proc retry::user_input {input} {
+    if {[huddle type $input] ne "list"} { error "invalid user input" }
+    for {set i 0} {$i < [huddle llength $input]} {incr i} {
+        if {[huddle exists $input $i type] && [huddle type $input $i type] eq "string" && \
+            [huddle get_stripped $input $i type] eq "text" && \
+            ![huddle exists $input $i text_elements]} {
+            huddle set input $i text_elements [huddle list]
+        }
+    }
+    return $input
+}
+
+# One matching user item is ours; another item or changed content is steering.
+# Retain its identity per turn so early events and duplicate snapshots agree.
+proc retry::user_item {turnId item} {
+    variable current
+    if {[catch {
+        set params [huddle get [dict get $current request] params]
+        set id [huddle get_stripped $item id]
+        set matches [expr {[huddle type $item type] eq "string" && \
+            [huddle get_stripped $item type] eq "userMessage" && \
+            [huddle type $item id] eq "string" && $id ne "" && \
+            [huddle equal [user_input [huddle get $params input]] \
+                [user_input [huddle get $item content]]]}]
+        if {$matches && [huddle exists $params clientUserMessageId] && \
+            [huddle type $params clientUserMessageId] ne "null"} {
+            set matches [expr {[huddle type $params clientUserMessageId] eq "string" && \
+                [huddle type $item clientId] eq "string" && \
+                [huddle get_stripped $item clientId] eq [huddle get_stripped $params clientUserMessageId]}]
+        }
+    }] || !$matches} {
+        observe $turnId progress 1
+        return
+    }
+    set previous [field $current observations $turnId userId]
+    if {$previous ne "" && $previous ne $id} {
+        observe $turnId progress 1
+    } else {
+        observe $turnId userId $id
+    }
+}
+
+proc retry::items {turn json args} {
+    set index -1
     foreach item [field $turn items] {
-        if {[field $item type] ne "userMessage"} { observe [field $turn id] progress 1 }
+        incr index
+        if {[field $item type] eq "userMessage"} {
+            if {![info exists object]} { set object [::huddle::json2huddle $json] }
+            user_item [field $turn id] [huddle get $object {*}$args items $index]
+        } else {
+            observe [field $turn id] progress 1
+        }
     }
 }
 
 proc retry::update {} {
-    variable current
+    variable current; variable finished
+    if {[field $current accepted]} {
+        dict for {turn observed} [dict get $current observations] {
+            if {$turn ne [field $current turnId] && [field $observed activity] eq "1" && \
+                ![dict exists $finished [list [field $current threadId] $turn]]} {
+                reset
+                return
+            }
+        }
+    }
     set observed [field $current observations [field $current turnId]]
     if {[field $observed progress] eq "1"} { progress }
     if {[dict exists $observed completion]} {
@@ -478,23 +1101,20 @@ proc retry::schedule {} {
 }
 
 proc retry::fire {} {
-    variable current; variable timer; variable sequence; variable internal
-    variable prefix; variable usedIds
+    variable current; variable timer; variable internal
     set timer ""
     if {[field $current accepted] ne "1" || [field $current status] ne "failed" || \
         [field $current overloaded] ne "1" || [field $current progress]} { return }
     set request [dict get $current request]
-    while {1} {
-        set id [huddle string "$prefix-[incr sequence]"]
-        set rpcId [json_dump $id]
-        if {![dict exists $usedIds $rpcId]} { break }
-    }
+    set previous [dict get $current rpcId]
+    set id [next_id]
+    set rpcId [json_dump $id]
     huddle set request id $id
-    dict set usedIds $rpcId 1
     dict set internal $rpcId 1
     foreach {key value} [list request $request rpcId $rpcId \
         previous [dict get $current turnId] turnId "" status awaiting \
         accepted 0 overloaded 0 observations {}] { dict set current $key $value }
+    automatic::replay $request $previous
     backend_send [json_dump $request]
 }
 
@@ -536,9 +1156,26 @@ proc retry::server {json} {
     set id [response_id $json]
     if {$id ne "" && $id ne [field $::resume::pending rpcId] && \
         $id ne [field $::recovery::pending rpcId] && ![dict exists $internal $id] && \
+        $id ne [field $::automatic::current rpcId] && ![dict exists $::automatic::ids $id] && \
         ($current eq "" || $id ne [field $current rpcId])} { return 1 }
     set message [json::json2dict $json]
     set method [field $message method]
+    set automaticVisible 1
+    set automaticValid 0
+    if {$::automatic::current ne "" || $::automatic::ids ne "" || \
+        [dict get $::automatic::flags auto_reset_limit] || [dict get $::automatic::flags auto_continue_after_stop]} {
+        if {[catch {automatic::decode $json} typed]} {
+            set ::automatic::selection {}
+            if {$::automatic::current ne "" && \
+                [field $::automatic::current phase] ni {running overload}} {
+                automatic::stop "ambiguous protocol data canceled automatic recovery"
+            } else { automatic::cancel }
+            set automaticVisible [expr {![dict exists $::automatic::ids $id]}]
+        } else {
+            set automaticValid 1
+            set automaticVisible [automatic::server $typed]
+        }
+    }
     set response [expr {$method eq "" && [dict exists $message id] && \
         ([dict exists $message result] || [dict exists $message error])}]
     if {[dict exists $message id] && ($method eq "" || $::resume::pending ne "")} {
@@ -555,16 +1192,16 @@ proc retry::server {json} {
                     return 0
                 }
                 set visible [resume::acknowledge $object]
-                if {$::resume::failure eq ""} { recovery::server $object $message }
+                if {$::resume::failure eq ""} { recovery::server $object $message $automaticValid }
                 return $visible
             }
         }
     }
     if {($response && $id eq [field $::recovery::pending rpcId]) || \
-        $method in {thread/deleted thread/archived}} {
-        recovery::server [::huddle::json2huddle $json] $message
+        $method in {thread/deleted thread/archived thread/settings/updated}} {
+        recovery::server [::huddle::json2huddle $json] $message $automaticValid
     }
-    set visible [expr {!$response || ![dict exists $internal $id]}]
+    set visible [expr {$automaticVisible && (!$response || ![dict exists $internal $id])}]
     if {$response} { dict unset internal $id }
     set params [field $message params]
     set turnId [field $params turn id]
@@ -587,13 +1224,14 @@ proc retry::server {json} {
             dict set current accepted 1
             dict set current turnId $turnId
             if {[field $current status] eq "awaiting"} { dict set current status inProgress }
-            items $turn
+            items $turn $json result turn
             update
         }
         return $visible
     }
     if {[field $params threadId] ne [dict get $current threadId]} { return $visible }
-    if {$method in {thread/closed thread/archived thread/deleted thread/reverted thread/compacted}} {
+    if {$method in {thread/closed thread/archived thread/deleted thread/reverted thread/compacted
+        thread/settings/updated thread/queue/changed thread/goal/updated thread/goal/cleared}} {
         reset
     } elseif {$method eq "turn/started" && $turnId ne "" && \
         $turnId ne [field $current previous] && \
@@ -606,18 +1244,31 @@ proc retry::server {json} {
         } elseif {$turnId ne [field $current turnId]} {
             reset
         }
-        if {$current ne ""} { items [field $params turn]; update }
+        if {$current ne ""} { items [field $params turn] $json params turn; update }
     } elseif {$method eq "turn/completed" && $turnId ne ""} {
         if {$freshCompletion && [field $current status] eq "failed" && \
             $turnId ne [field $current turnId]} { reset; return $visible }
         if {$freshCompletion || $turnId eq [field $current turnId] || \
             [dict exists $current observations $turnId completion]} {
-            items [field $params turn]
+            items [field $params turn] $json params turn
             if {$freshCompletion} { observe $turnId completion [field $params turn] }
             update
         }
     } else {
         set turnId [field $params turnId]
+        # Keep pre-ack activity even after turn/started, for reconciliation.
+        if {$turnId ne "" && \
+            ![dict exists $finished [list [field $params threadId] $turnId]] && \
+            ([string match "item/*" $method] || [string match "hook/*" $method] || \
+             $method in {turn/plan/updated turn/diff/updated rawResponseItem/completed
+                 rawResponse/completed mcpServer/elicitation/request})} {
+            if {![field $current accepted]} {
+                if {$turnId ne "null"} { dict set current observations $turnId activity 1 }
+            } elseif {$turnId ne [field $current turnId]} {
+                reset
+                return $visible
+            }
+        }
         if {$method in {hook/started hook/completed mcpServer/elicitation/request} && \
             $turnId in {"" null}} {
             # An unscoped hook or elicitation in this thread makes replay ambiguous.
@@ -629,40 +1280,47 @@ proc retry::server {json} {
                 hook/started hook/completed turn/plan/updated turn/diff/updated
                 rawResponseItem/completed rawResponse/completed mcpServer/elicitation/request
             })} {
-            if {$method ni {item/started item/completed} || [field $params item type] ne "userMessage"} {
+            if {$method in {item/started item/completed} && [field $params item type] eq "userMessage"} {
+                user_item $turnId [huddle get [::huddle::json2huddle $json] params item]
+            } else {
                 observe $turnId progress 1
-                update
             }
+            update
         }
     }
     return $visible
 }
 
 proc backend_send {json} {
-    puts $::backend [json_dump [::huddle::json2huddle $json]]
-    flush $::backend
+    if {[websocket::send $::backend text [json_dump [::huddle::json2huddle $json]]] < 0} {
+        error "shared app-server proxy send failed"
+    }
 }
 
-proc backend_read {} {
-    if {![info exists ::backend] || ![info exists ::client]} { return }
-    set channel $::backend
-    set client $::client
-    while {[gets $channel json] >= 0} {
-        set visible [retry::server $json]
-        set failure $::resume::failure
-        if {$visible && [websocket::send $client text $json] < 0} {
-            if {$failure ne ""} { bgerror $failure } else { cleanup }
-            return
+proc backend_event {channel type json} {
+    if {![info exists ::backend] || $::backend ne $channel} { return }
+    if {[catch {
+        switch -- $type {
+            text {
+                if {![info exists ::client]} { error "shared app-server sent data before TUI connection" }
+                set visible [retry::server $json]
+                set failure $::resume::failure
+                if {$visible && [websocket::send $::client text $json] < 0} {
+                    if {$failure ne ""} { error $failure }
+                    cleanup
+                }
+                if {$failure ne ""} { error $failure }
+            }
+            close - disconnect {
+                set ::proxyError 1
+                if {![info exists ::proxyMessage]} { set ::proxyMessage "shared app-server proxy disconnected" }
+                # Release the connection and cancel retries, but let the native
+                # TUI drain its disconnect output through the normal exit path.
+                cleanup
+            }
+            error - timeout - binary { error "shared app-server proxy transport failed" }
         }
-        if {$failure ne ""} { bgerror $failure; return }
-        # Sending can synchronously close the connection and its backend.
-        if {![info exists ::backend] || $::backend ne $channel || \
-            ![info exists ::client] || $::client ne $client} { return }
-    }
-    if {[eof $channel]} {
-        catch {websocket::close $client}
-        cleanup
-    }
+    } message]} { bgerror $message }
 }
 
 proc connection {socket type message} {
@@ -674,7 +1332,6 @@ proc connection {socket type message} {
                 close $::listener
                 unset ::listener
                 foreach pending [array names ::handshakes] { drop_handshake $pending }
-                fileevent $::backend readable backend_read
             }
             text {
                 set message [resume::client $message]
@@ -760,18 +1417,23 @@ namespace eval diagnostics {
 }
 
 # Binary reads retain at most 64 KiB, with at most 16 KiB of work per callback.
+proc diagnostics::retain {data} {
+    variable tail; variable truncated
+    append tail $data
+    if {[string length $tail] > 65536} {
+        set tail [string range $tail end-65535 end]
+        set truncated 1
+    }
+}
+
 proc diagnostics::drain {} {
-    variable channel; variable tail; variable truncated
+    variable channel; variable truncated
     if {$channel eq ""} { return }
     for {set i 0} {$i < 4} {incr i} {
         if {[catch {read $channel 4096} data]} {
             set truncated 1
         } else {
-            append tail $data
-            if {[string length $tail] > 65536} {
-                set tail [string range $tail end-65535 end]
-                set truncated 1
-            }
+            retain $data
             if {![eof $channel]} {
                 if {$data eq ""} { return }
                 continue
@@ -824,6 +1486,8 @@ proc terminate {children} {
 }
 
 proc cleanup {} {
+    automatic::cancel
+    set ::automatic::live {}
     retry::reset
     resume::reset
     catch {close $::listener}
@@ -836,11 +1500,27 @@ proc cleanup {} {
         unset ::backend
         set children [pid $channel]
         fileevent $channel readable ""
+        catch {websocket::configure $channel -keepalive 0}
         terminate $children
         fconfigure $channel -blocking 1
+        catch {websocket::close $channel}
         catch {close $channel}
     }
     diagnostics::finish
+}
+
+# Restore the outer terminal even when the child could not run its exit code.
+# Mouse modes live in the emulator, independently of the saved termios state.
+namespace eval terminal { variable saved "" }
+proc terminal::restore {} {
+    variable saved
+    if {$saved eq ""} { return }
+    if {[catch {exec stty $saved <@stdin}]} { catch {exec stty $saved < /dev/tty} }
+    catch {
+        puts -nonewline stdout "\033\[?1000l\033\[?1002l\033\[?1003l\033\[?1005l\033\[?1006l\033\[?1015l"
+        flush stdout
+    }
+    set saved ""
 }
 
 proc shutdown {status} {
@@ -849,9 +1529,85 @@ proc shutdown {status} {
     if {[info exists ::tuiPid]} {
         terminate [list $::tuiPid]
     } else {
+        terminal::restore
         diagnostics::report
         exit $status
     }
+}
+
+# Only this short-lived starter and the stdio bridge are wrapper children.
+# Codex owns socket selection and the daemon, including after a cold start.
+proc backend_attach {{timeout 10000}} {
+    # Proxy is a byte tunnel to a WebSocket control socket, not JSONL stdio.
+    # Bootstrap HTTP here; Tcllib owns all subsequent framing and UTF-8.
+    set random [open /dev/urandom rb]
+    set key [binary encode base64 -maxlen 0 [read $random 16]]
+    close $random
+    set ::backendAccept [websocket::sec-websocket-accept $key]
+    set ::backendHeaders {}
+    set ::backendHeaderBytes 0
+    set ::backendReady 0
+    fconfigure $::backend -blocking 0 -buffering none -encoding ascii -translation crlf
+    puts $::backend "GET / HTTP/1.1\nHost: localhost\nUpgrade: websocket\nConnection: Upgrade\nSec-WebSocket-Version: 13\nSec-WebSocket-Key: $key\n"
+    fileevent $::backend readable {
+        if {[catch {
+            while {[gets $::backend line] >= 0} {
+                incr ::backendHeaderBytes [expr {[string length $line] + 2}]
+                if {$::backendHeaderBytes > 16384} { error "oversized upgrade" }
+                if {$line eq ""} {
+                    if {![regexp {^HTTP/1\.1 101(?:[ \t].*)?$} [lindex $::backendHeaders 0]]} { error "upgrade rejected" }
+                    set headers {}
+                    foreach line [lrange $::backendHeaders 1 end] {
+                        if {![regexp {^([^:[:space:]]+):[ \t]*(.*)$} $line -> name value]} { error "invalid header" }
+                        set name [string tolower $name]
+                        if {[dict exists $headers $name]} { error "duplicate header" }
+                        dict set headers $name [string trim $value]
+                    }
+                    if {[string tolower [field $headers upgrade]] ne "websocket" || \
+                        ![regexp -nocase {(^|,)\s*upgrade\s*(,|$)} [field $headers connection]] || \
+                        [field $headers sec-websocket-accept] ne $::backendAccept} { error "invalid upgrade" }
+                    set ::backendReady 1
+                    break
+                }
+                lappend ::backendHeaders $line
+            }
+            if {[eof $::backend] || $::backendHeaderBytes + [chan pending input $::backend] > 16384} { error "incomplete upgrade" }
+        }]} { set ::backendReady -1 }
+        if {$::backendReady} { fileevent $::backend readable "" }
+    }
+    set deadline [after $timeout {set ::backendReady -1}]
+    vwait ::backendReady
+    after cancel $deadline
+    fileevent $::backend readable ""
+    if {$::backendReady != 1} { error "shared app-server WebSocket attachment failed or timed out" }
+    fconfigure $::backend -encoding binary -translation binary
+    websocket::takeover $::backend backend_event 0
+}
+
+proc start_backend {options} {
+    set ::backend [open [concat [list | codex app-server daemon start] $options \
+        [list 2>@$::diagnostics::writer]] r]
+    fconfigure $::backend -blocking 0 -encoding binary -translation binary
+    set ::backendReady 0
+    fileevent $::backend readable {
+        set data [read $::backend 4096]
+        diagnostics::retain $data
+        if {[eof $::backend]} {
+            fileevent $::backend readable ""
+            set ::backendReady 1
+        }
+    }
+    set deadline [after 10000 {set ::backendReady -1}]
+    vwait ::backendReady
+    after cancel $deadline
+    if {$::backendReady != 1} { error "shared app-server startup timed out" }
+    set channel $::backend
+    unset ::backend
+    fconfigure $channel -blocking 1
+    if {[catch {close $channel} message]} { error "shared app-server startup failed: $message" }
+    set ::backend [open [concat [list | codex app-server proxy] $options \
+        [list 2>@$::diagnostics::writer]] r+]
+    backend_attach
 }
 
 proc bgerror {message} {
@@ -928,8 +1684,18 @@ proc backend_options {arguments} {
 
 proc main {arguments} {
     global spawn_out tuiSpawn
+    automatic::configure
     package require websocket
+    # Tcllib's default logger writes to stdout. Retain fixed transport labels,
+    # without protocol payloads, until the TUI has released the terminal.
+    foreach level [logger::levels] {
+        ${::websocket::log}::logproc $level message \
+            [list ::diagnostics::retain "WebSocket $level diagnostic\n"]
+    }
     set options [backend_options $arguments]
+    if {[catch {set ::terminal::saved [exec stty -g <@stdin]}]} {
+        catch {set ::terminal::saved [exec stty -g < /dev/tty]}
+    }
     lassign [resume_arguments $arguments] arguments yolo
     resume::reset
     set ::resume::armed $yolo
@@ -947,20 +1713,21 @@ proc main {arguments} {
     trap {shutdown 130} SIGINT
     lassign [chan pipe] ::diagnostics::channel ::diagnostics::writer
     fconfigure $::diagnostics::channel -blocking 0 -encoding binary -translation binary
-    set ::backend [open [concat [list | codex app-server --listen stdio://] $options \
-        [list 2>@$::diagnostics::writer]] r+]
+    fileevent $::diagnostics::channel readable diagnostics::drain
+    start_backend $options
     close $::diagnostics::writer
     set ::diagnostics::writer ""
-    fileevent $::diagnostics::channel readable diagnostics::drain
-    fconfigure $::backend -blocking 0 -buffering line -encoding utf-8 -translation lf
     # Only the TUI needs the proxy credential.
     set ::env(CODEX_RETRY_TOKEN) $token
     spawn -noecho codex --remote $::presentation::endpoint \
         --remote-auth-token-env CODEX_RETRY_TOKEN {*}$arguments
     set tuiSpawn $spawn_id
     set ::tuiPid [exp_pid]
+    if {[info exists ::proxyError]} { error $::proxyMessage }
     # EOF can precede exit; keep the PTY open so close cannot hang up the TUI.
     close_on_eof -i $tuiSpawn 0
+    # User input can end while stdout must still receive the TUI's final bytes.
+    close_on_eof -i $::user_spawn_id 0
     # The adapter handles bytes, including split UTF-8 and terminal sequences.
     fconfigure $tuiSpawn -encoding binary -translation binary
     fconfigure stdin -encoding binary -translation binary
@@ -969,20 +1736,34 @@ proc main {arguments} {
     remove_nulls -i $tuiSpawn 0
     resize
     trap resize SIGWINCH
-    interact -i $tuiSpawn -o -re {[^\x00]+} {
-        presentation::feed $interact_out(0,string)
-    } null { presentation::feed "\x00" }
+    # Expect resolves indirect spawn-ID variables in the global scope.
+    set ::terminal::input $::user_spawn_id
+    set killTimer ""
+    try {
+        interact -input ::terminal::input eof {
+            set ::terminal::input {}
+            cleanup
+            catch {exec kill -TERM $::tuiPid}
+            # Keep draining the PTY during graceful exit and after forced exit.
+            set killTimer [after 500 [list catch [list exec kill -KILL $::tuiPid]]]
+        } -output $tuiSpawn -input $tuiSpawn -re {[^\x00]+} {
+            presentation::feed $interact_out(0,string)
+        } null { presentation::feed "\x00" } -output $::user_spawn_id
+    } finally {
+        after cancel $killTimer
+    }
     trap SIG_IGN SIGWINCH
     set result [wait -i $tuiSpawn]
     close -i $tuiSpawn
     unset ::tuiPid tuiSpawn
     cleanup
+    terminal::restore
     presentation::finish
     diagnostics::report
     if {[info exists ::proxyMessage]} { catch {puts stderr "codex-retry: $::proxyMessage"} }
     # Optional guidance must preserve the TUI's exit status even if stderr fails.
     catch {
-        puts stderr "codex-retry: private app-server stopped."
+        puts stderr "codex-retry: client disconnected; shared server and background work may continue."
         if {!$::presentation::replaced} { puts -nonewline stderr [recovery::advice] }
     }
     if {[info exists ::signalStatus]} { return $::signalStatus }
@@ -1001,6 +1782,7 @@ if {[file normalize [info script]] eq [file normalize $argv0]} {
         catch {close -i $::tuiSpawn}
         unset -nocomplain ::tuiPid ::tuiSpawn
         cleanup
+        terminal::restore
         catch {presentation::finish}
         diagnostics::report
         catch {puts stderr "codex-retry: $result"}
