@@ -3,13 +3,15 @@
 source [file join [file dirname [info script]] .. codex-retry]
 set proxyFixture [file normalize [file join [file dirname [info script]] proxy-fixture.tcl]]
 # Every fake child inherits an empty wrapper configuration, never the user's.
-set configEnvironment [array get env XDG_CONFIG_HOME]
+set configEnvironment [concat [array get env XDG_CONFIG_HOME] [array get env TMPDIR]]
 set configChannel [file tempfile configScratch]
 try {
     close $configChannel
     file delete $configScratch
     file mkdir $configScratch
+    file attributes $configScratch -permissions 0700
     set env(XDG_CONFIG_HOME) $configScratch
+    set env(TMPDIR) $configScratch
 
 proc check {condition message} {
     if {![uplevel 1 [list expr $condition]]} { error $message }
@@ -762,13 +764,50 @@ foreach invalidatingRequest {
     retry::client $invalidatingRequest
     check {$retry::current eq "" && [dict size $timers] == 0} "manual context change left continuation backoff active"
 }
-auto_begin 1 1
-completed $autoTurn failed serverOverloaded
-retry::server {{"method":"account/updated","params":{}}}
-check {[dict size $timers] == 1} "optional invalidation changed unrelated default overload behavior"
-fire
-check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
-    [huddle get $autoRequest params]]} "default overload replay changed original input/settings"
+
+# Account/auth changes invalidate original-input replay independently of flags.
+# Reads and quota notifications preserve its ownership, timer and backoff.
+foreach reset {0 1} {
+    foreach follow {0 1} {
+        foreach {side method cancel} {
+            client account/logout 1
+            client account/login/start 1
+            client account/login/cancel 1
+            client modelProvider/auth/set 1
+            client modelProvider/auth/clear 1
+            server account/updated 1
+            server account/gatewayOAuth/changed 1
+            client account/read 0
+            client account/rateLimits/read 0
+            client account/usage/read 0
+            client account/workspaceMessages/read 0
+            client account/gatewayOAuth/read 0
+            server account/rateLimits/updated 0
+        } {
+            foreach stage {running before_ack backoff} {
+                auto_begin $reset $follow [expr {$stage ne "before_ack"}]
+                if {$stage eq "before_ack"} { started $autoTurn }
+                if {$stage ne "running"} { completed $autoTurn failed serverOverloaded }
+                set previous [list $automatic::current $retry::current $retry::delay $timers]
+                retry::$side [json_dump [huddle create method [huddle string $method] params [huddle create]]]
+                if {$cancel} {
+                    check {$automatic::current eq "" && $retry::current eq "" && [dict size $timers] == 0} "account/auth change left original-input recovery armed ($method/$stage)"
+                    reply $autoId $autoTurn
+                    completed $autoTurn failed serverOverloaded
+                    retry::fire
+                    check {$retry::current eq "" && [dict size $timers] == 0 && $sent eq ""} "late protocol data or dispatch replayed canceled account/auth work"
+                } else {
+                    check {[list $automatic::current $retry::current $retry::delay $timers] eq $previous} "account metadata changed overload tracking or backoff"
+                    if {$stage eq "before_ack"} { reply $autoId $autoTurn }
+                    if {$stage eq "running"} { completed $autoTurn failed serverOverloaded }
+                    fire
+                    check {[llength $sent] == 1 && [huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                        [huddle get $autoRequest params]]} "account metadata changed original input/settings on replay"
+                }
+            }
+        }
+    }
+}
 
 # Manual turn/start can steer a live continuation. Sparse later snapshots
 # cannot erase progress already observed before canceling its automatic chain.
@@ -918,10 +957,12 @@ foreach method {thread/queue/list thread/backgroundTerminals/list thread/items/r
             if {$stage eq "queued_stop"} { completed $autoTurn failed cyberPolicy }
         }
         set previous $automatic::current
+        set previousRetry [list $retry::current $retry::delay $timers]
         foreach thread {t1 metadata-other-thread} {
             retry::client [metadata_read $method $thread]
         }
         check {$automatic::current eq $previous} "metadata read canceled or changed recovery ownership"
+        check {[list $retry::current $retry::delay $timers] eq $previousRetry} "metadata read changed overload tracking or backoff"
         if {$stage eq "running"} { completed $autoTurn failed cyberPolicy }
         if {$stage eq "verify"} { auto_reply $restored }
         fire
@@ -950,6 +991,169 @@ retry::client [json_dump [huddle create id $collision method [huddle string fixt
 completed $autoTurn failed cyberPolicy
 fire
 check {[auto_followup] ne [json_dump $collision]} "automatic request collided with a native ID"
+
+# Capacity failures after partial work need a new neutral turn, never a replay.
+foreach reset {0 1} {
+    foreach follow {0 1} {
+        foreach progress {event snapshot} {
+            auto_begin $reset $follow
+            set items {[]}
+            if {$progress eq "event"} {
+                retry::server [format {{"method":"item/commandExecution/outputDelta","params":{"threadId":"t1","turnId":"%s","delta":"partial tool output"}}} $autoTurn]
+            } else { set items {[{"type":"commandExecution","id":"already-applied"}]} }
+            completed $autoTurn failed serverOverloaded $items
+            completed $autoTurn failed serverOverloaded $items
+            check {[dict size $timers] == $follow && $sent eq ""} "partial overload ignored opt-in or acted before backoff"
+            if {$follow} {
+                check {[lindex $delays end] == 5000} "partial overload skipped its initial delay"
+                fire
+                auto_followup
+                check {[llength $sent] == 1} "partial overload repeated original work or consumed a reset"
+            }
+        }
+    }
+}
+
+# Original-input retries and new follow-ups share one exponential sequence.
+auto_begin 0 1
+set turn $autoTurn
+set index 0
+foreach delay {5000 10000 20000 40000 80000 160000 320000 640000 1280000 1800000 1800000} {
+    set items {[]}
+    if {$index % 2 == 0} { set items {[{"type":"agentMessage","id":"partial","text":"partial response"}]} }
+    completed $turn failed serverOverloaded $items
+    completed $turn failed serverOverloaded $items
+    check {[dict size $timers] == 1 && [lindex $delays end] == $delay} "mixed overload recovery lost backoff or duplicated its timer"
+    fire
+    set id [auto_followup]
+    completed $turn failed serverOverloaded $items
+    check {[dict size $timers] == 0} "a stale overload re-armed recovery"
+    incr index
+    set turn overload-followup-$autoSequence-$index
+    reply $id $turn
+    started $turn
+}
+completed $turn completed
+check {$retry::delay == 5000 && [dict size $timers] == 0} "success did not reset mixed overload backoff"
+
+# Manual changes, foreign work and late progress invalidate a pending follow-up.
+foreach {side event} {
+    client {{"method":"turn/interrupt","params":{"threadId":"t1","turnId":"ignored"}}}
+    client {{"method":"account/logout","params":{}}}
+    client {{"method":"thread/settings/update","params":{"threadId":"t1","model":"different"}}}
+    server {{"method":"account/updated","params":{}}}
+    server {{"method":"turn/started","params":{"threadId":"t1","turn":{"id":"foreign-capacity-turn","status":"inProgress","items":[]}}}}
+    server {{"method":"item/agentMessage/delta","params":{"threadId":"t1","turnId":"@TURN@","delta":"late progress"}}}
+} {
+    auto_begin 0 1
+    completed $autoTurn failed serverOverloaded {[{"type":"commandExecution","id":"already-applied"}]}
+    check {[dict size $timers] == 1} "partial overload did not queue before cancellation"
+    set event [string map [list @TURN@ $autoTurn] $event]
+    retry::$side $event
+    completed $autoTurn failed serverOverloaded
+    check {$automatic::current eq "" && [dict size $timers] == 0 && $sent eq ""} "invalidated capacity follow-up remained armed"
+}
+auto_begin 0 1
+completed $autoTurn failed serverOverloaded {[{"type":"commandExecution","id":"already-applied"}]}
+retry::client [metadata_read thread/read metadata-other-thread]
+fire
+auto_followup
+check {$retry::delay == 10000} "read-only metadata reset capacity follow-up backoff"
+
+# Early terminal snapshots still require the matching start acknowledgement.
+auto_begin 0 1 0
+started $autoTurn t1 {[{"type":"commandExecution","id":"already-applied"}]}
+completed $autoTurn failed serverOverloaded
+check {[dict size $timers] == 0} "unacknowledged partial overload continued"
+reply $autoId $autoTurn
+check {[dict size $timers] == 1 && [lindex $delays end] == 5000} "early partial overload lost its acknowledged recovery"
+fire
+auto_followup
+
+# Late progress in duplicate start replies or notifications has the same effect
+# as progress in a repeated completion, without replacing a valid timer.
+foreach snapshot {reply started} {
+    foreach change {same late} {
+        auto_begin 0 1
+        set items {[{"type":"commandExecution","id":"applied-tool"}]}
+        completed $autoTurn failed serverOverloaded $items
+        set pending $timers
+        if {$change eq "late"} { set items {[{"type":"agentMessage","id":"late-response","text":"late"}]} }
+        if {$snapshot eq "reply"} { reply $autoId $autoTurn $items } else { started $autoTurn t1 $items }
+        if {$change eq "same"} {
+            check {$timers eq $pending} "duplicate start snapshot replaced overload backoff"
+            fire
+            auto_followup
+        } else {
+            check {$automatic::current eq "" && [dict size $timers] == 0 && $sent eq ""} "late start snapshot progress left recovery armed"
+        }
+    }
+}
+
+# Metadata stays neutral before acknowledgement and during original-input backoff,
+# independently of the optional flags and ownership of an automatic continuation.
+foreach reset {0 1} {
+    foreach follow {0 1} {
+        foreach stage {awaiting running backoff} {
+            auto_begin $reset $follow 0
+            if {$stage ne "awaiting"} { reply $autoId $autoTurn; started $autoTurn }
+            if {$stage eq "backoff"} { completed $autoTurn failed serverOverloaded }
+            set previous [list $automatic::current $retry::current $retry::delay $timers]
+            retry::client [metadata_read thread/turns/list metadata-other-thread]
+            check {[list $automatic::current $retry::current $retry::delay $timers] eq $previous} "metadata read canceled original work or reset its backoff"
+            if {$stage eq "awaiting"} { reply $autoId $autoTurn; started $autoTurn }
+            if {$stage ne "backoff"} { completed $autoTurn failed serverOverloaded }
+            fire
+            check {[llength $sent] == 1 && [huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                [huddle get $autoRequest params]]} "metadata read changed original-input replay"
+        }
+    }
+}
+
+# Repeated terminal snapshots can repeat known progress, but new or changed
+# work cancels recovery, including when acknowledgement has not arrived yet.
+foreach mode {stop limit replay followup} {
+    foreach acknowledge {0 1} {
+        foreach change {same sparse additional updated} {
+            auto_begin 1 1 $acknowledge
+            if {!$acknowledge} { started $autoTurn }
+            set code [dict get {stop cyberPolicy limit usageLimitExceeded replay serverOverloaded followup serverOverloaded} $mode]
+            set items {[{"type":"commandExecution","id":"applied-tool","status":"completed"}]}
+            if {$mode eq "replay"} { set items {[]} }
+            completed $autoTurn failed $code $items
+            set pending $timers
+            set duplicate $items
+            if {$change eq "same" && $mode ne "replay"} {
+                set duplicate {[{"status":"completed","id":"applied-tool","type":"commandExecution"}]}
+            } elseif {$change eq "sparse"} {
+                set duplicate {[]}
+            } elseif {$change eq "additional"} {
+                set duplicate [string replace $items end end {,{"type":"agentMessage","id":"late-response","text":"late"}]}]
+                if {$mode eq "replay"} { set duplicate {[{"type":"agentMessage","id":"late-response","text":"late"}]} }
+            } elseif {$change eq "updated"} {
+                set duplicate {[{"type":"commandExecution","id":"applied-tool","status":"completed","aggregatedOutput":"late output"}]}
+            }
+            completed $autoTurn failed $code $duplicate
+            if {$change eq "sparse"} { completed $autoTurn failed $code $items }
+            if {$change in {same sparse}} { check {$timers eq $pending} "repeated progress snapshot replaced recovery's timer" }
+            if {!$acknowledge} { reply $autoId $autoTurn }
+            if {$change in {same sparse}} {
+                check {[dict size $timers] == 1} "identical progress snapshot canceled recovery"
+                fire
+                check {[llength $sent] == 1} "identical progress snapshot duplicated dispatch"
+            } else {
+                check {$automatic::current eq "" && [dict size $timers] == 0 && $sent eq ""} "late snapshot progress left recovery armed ($mode/$acknowledge/$change)"
+            }
+        }
+    }
+}
+auto_begin 0 1 0
+started $autoTurn
+completed $autoTurn failed serverOverloaded {[{"type":"commandExecution","id":"applied-tool"}]}
+retry::server [format {{"method":"item/agentMessage/delta","params":{"threadId":"t1","turnId":"%s","delta":"late output"}}} $autoTurn]
+reply $autoId $autoTurn
+check {$automatic::current eq "" && [dict size $timers] == 0 && $sent eq ""} "late progress before acknowledgement re-armed recovery"
+
 automatic::cancel
 retry::reset
 set automatic::flags {auto_reset_limit 0 auto_continue_after_stop 0}
@@ -1140,7 +1344,7 @@ foreach mutation {
     {"method":"turn/interrupt","params":{"threadId":"t1","turnId":"turn1"}}
     {"method":"turn/steer","params":{"threadId":"t1","expectedTurnId":"turn1","input":[{"type":"text","text":"manual"}]}}
     {"method":"thread/resume","params":{"threadId":"t2"}}
-    {"method":"thread/read","params":{"threadId":"t2"}}
+    {"method":"thread/settings/update","params":{"threadId":"t2","model":"changed-model"}}
     {"method":"review/start","params":{"threadId":"t1"}}
     {"method":"thread/queue/start","params":{"threadId":"t1"}}
 } {
@@ -1149,6 +1353,14 @@ foreach mutation {
     retry::client "\{$mutation\}"
     check {[dict size $timers] == 0 && $retry::delay == 5000} "manual action left a stale retry"
 }
+begin
+completed turn1
+set pending [list $retry::current $retry::timer $retry::delay $timers]
+retry::client {{"id":"metadata-default","method":"thread/read","params":{"threadId":"t2"}}}
+check {[list $retry::current $retry::timer $retry::delay $timers] eq $pending} "read-only metadata canceled default replay or changed its backoff"
+fire
+check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+    [huddle get [::huddle::json2huddle $request] params]]} "read-only metadata changed default replay input or settings"
 begin
 completed turn1
 retry::client $request
@@ -2070,6 +2282,41 @@ puts $channel {
 close $channel
 file attributes [file join $scratch codex] -permissions 0755
 set wrapper [file normalize [file join [file dirname [info script]] .. codex-retry]]
+set pipeFixture "set argv0 pipe-fixture\n[list source $wrapper]\n"
+append pipeFixture {
+    if {[catch {
+        trap {exit 99} SIGINT
+        set handler [trap SIGINT]
+        set arguments [list PIPE_SURVIVED --config {model="fixture capacity";$literal} --disable fixture_feature]
+        set channel [terminal::pipe [list | sh -c {kill -INT $$; printf '%s\n' "$@"} fixture {*}$arguments] r]
+        set output [read $channel]
+        close $channel
+        if {$output ne "[join $arguments \n]\n" || [trap SIGINT] ne $handler} {
+            error "pipe SIGINT inheritance, argv boundaries or wrapper handler restoration failed"
+        }
+        set channel [terminal::pipe [list | sh -c {exit 23}] r]
+        if {![catch {close $channel} message options] || \
+            [lindex [dict get $options -errorcode] 0] ne "CHILDSTATUS" || \
+            [lindex [dict get $options -errorcode] 2] != 23 || [trap SIGINT] ne $handler} {
+            error "failed pipe child lost the wrapper SIGINT handler"
+        }
+        rename send native_send
+        proc send {args} { lappend ::interrupts $args; error "TUI already exited" }
+        rename shutdown native_shutdown
+        proc shutdown {status} { set ::interruptedStartup $status }
+        set interrupts {}
+        set ::tuiSpawn closed-tui
+        terminal::interrupt
+        if {$interrupts ne [list [list -i closed-tui -- "\003"]] || [info exists ::interruptedStartup]} {
+            error "SIGINT overrode an exiting native TUI's status"
+        }
+        unset ::tuiSpawn
+        terminal::interrupt
+        if {$::interruptedStartup != 130} { error "SIGINT did not cancel startup" }
+    } message]} { puts stderr $message; exit 1 }
+}
+set failed [catch {exec expect -c $pipeFixture 2>@1} message]
+check {!$failed} "owned pipe interrupt handling failed: $message"
 set fixture "set argv0 disconnect-fixture\n[list source $wrapper]\n"
 append fixture {
     package require websocket
@@ -2361,9 +2608,18 @@ puts $channel {
         } SIGTERM
         puts -nonewline stdout "\033\[?1003h\033\[?1006h\033\[?2004h"
     }
+    if {$mode eq "signal-int"} { exec stty raw -echo <@stdin }
     puts YOLO_PROXY_OK
     flush stdout
     if {$mode eq "input-eof"} { vwait forever }
+    if {$mode eq "signal-int"} {
+        fconfigure stdin -blocking 0 -encoding binary -translation binary
+        fileevent stdin readable {
+            if {[read stdin 1] eq "\003"} { exit 19 }
+            exit 20
+        }
+        vwait forever
+    }
     if {[gets stdin line] < 0 || $line ne "forwarded"} { exit 11 }
     puts YOLO_INPUT_OK
     flush stdout
@@ -2415,6 +2671,7 @@ set resumeDriver {
             } elseif {[string match signal-* $env(YOLO_FIXTURE_MODE)]} {
                 set signame [string toupper [string range $env(YOLO_FIXTURE_MODE) 7 end]]
                 set expectedStatus [dict get {TERM 143 HUP 129 INT 130} $signame]
+                if {$signame eq "INT"} { set expectedStatus 19 }
                 exec kill -$signame $wrapper
             } elseif {$env(YOLO_FIXTURE_MODE) eq "eof"} {
                 send -- "\004"
@@ -2627,6 +2884,8 @@ puts $channel {
         puts stderr BACKEND_START
         flush stderr
         trap SIG_IGN SIGTERM
+        # Expect installs its own SIGINT trap, overriding the inherited ignore.
+        if {$mode eq "ctrl-c-isig"} { trap SIG_IGN SIGINT }
         if {$mode eq "shutdown"} {
             trap {puts -nonewline stderr BACKEND_SHUTDOWN; flush stderr; exit 23} SIGTERM
         }
@@ -2637,6 +2896,8 @@ puts $channel {
             if {$type ne "text"} { return }
             set request [json::json2dict $line]
             set id [dict get $request id]
+            if {$id == 9 && ([dict get $request method] ne "turn/interrupt" || \
+                [dict get $request params] ne {threadId confirmed-session turnId fixture-turn})} { exit 83 }
             if {[dict get $request method] eq "account/rateLimits/read" && $::mode eq "recovery-no-credit"} {
                 websocket::send $socket text [format {{"id":%s,"result":{"accountId":"fixture-account","ordinaryUsageAllowed":false,"rateLimits":{"limitId":"codex","spendControlReached":false,"rateLimitReachedType":"rate_limit_reached"},"rateLimitResetCredits":{"availableCount":0,"credits":null}}}} [json::write string $id]]
                 return
@@ -2744,6 +3005,11 @@ puts $channel {
             } else {
                 set id [dict get $response id]
                 if {$id in {4 5 6 7}} { return }
+                if {$id == 9} {
+                    puts TURN_INTERRUPTED
+                    flush stdout
+                    return
+                }
                 puts [dict get {1 INPUT_READY 2 PROTOCOL_OK 3 BURST_PROTOCOL_OK} $id]
             }
             flush stdout
@@ -2764,6 +3030,14 @@ puts $channel {
             return
         }
         set character [read stdin 1]
+        if {$character eq "\003" && $::mode in {ctrl-c ctrl-c-isig signal-int}} {
+            if {![info exists ::interrupted]} {
+                set ::interrupted 1
+                websocket::send $::socket text {{"id":9,"method":"turn/interrupt","params":{"threadId":"confirmed-session","turnId":"fixture-turn"}}}
+                return
+            }
+            set character x
+        }
         if {$character eq "q"} {
             puts CHAR_FORWARDED
             flush stdout
@@ -2852,12 +3126,14 @@ set diagnosticFixture {
 set diagnosticDriver {
     set wrapperSpawn $spawn_id
     set wrapper [exp_pid]
+    set terminalPath $spawn_out(slave,name)
     log_user 0
     match_max 131072
     set output ""
     set sentInput 0
     set sentEditorInput 0
     set sentBurstInput 0
+    set sentInterrupt 0
     set sentExit 0
     set mode $env(DIAGNOSTIC_MODE)
     set active [expr {$mode ni {launchfail launchfail-closed missing}}]
@@ -2900,14 +3176,17 @@ set diagnosticDriver {
                     set sentEditorInput 1
                 }
                 if {!$sentBurstInput && ([string first BURST_READY $output] >= 0 || \
-                    ($mode eq "recovery-stop" && [string first RECOVERY_EXACT $output] >= 0))} {
+                    ($mode eq "recovery-stop" && [string first RECOVERY_EXACT $output] >= 0) || \
+                    ($mode in {ctrl-c ctrl-c-isig signal-int} && [string first TURN_INTERRUPTED $output] >= 0))} {
                     send -- r
                     set sentBurstInput 1
                 }
                 if {!$sentExit && [regexp {(^|\n)PROTOCOL_OK\r*\n} $output] && \
                     ($mode ni {burst recovery-stop} || ([string first BURST_INPUT_OK $output] >= 0 && \
                         [string first BURST_PROTOCOL_OK $output] >= 0)) && \
-                    ($mode ne "backend-eof" || [string first TUI_DISCONNECTED $output] >= 0)} {
+                    ($mode ne "backend-eof" || [string first TUI_DISCONNECTED $output] >= 0) && \
+                    ($mode ni {ctrl-c ctrl-c-isig signal-int} || !$sentInterrupt || \
+                        [string first BURST_PROTOCOL_OK $output] >= 0)} {
                     if {[string first CHAR_FORWARDED $output] < 0} { error "protocol response preceded input" }
                     if {$mode eq "recovery-no-credit" && \
                         ([string first RECOVERY_WARNING $output] < 0 || [string first NATIVE_FAILURE $output] < 0)} {
@@ -2920,7 +3199,17 @@ set diagnosticDriver {
                          [string first RECOVERY_WARNING $output] >= 0)} {
                         error "repeated recovery hid native failures, changed input, or failed to end successfully"
                     }
-                    if {$mode eq "child-death"} {
+                    if {$mode in {ctrl-c ctrl-c-isig signal-int}} {
+                        foreach child [list $wrapper $backend $tui] { exec kill -0 $child }
+                        if {$mode eq "ctrl-c-isig"} { exec stty isig < $terminalPath }
+                        if {$mode eq "signal-int"} {
+                            exec kill -INT $wrapper
+                        } else { send -- "\003" }
+                        if {!$sentInterrupt} {
+                            set sentInterrupt 1
+                            exp_continue -continue_timer
+                        }
+                    } elseif {$mode eq "child-death"} {
                         exec kill -KILL $tui
                     } elseif {[string match signal-* $mode]} {
                         exec kill -[string toupper [string range $mode 7 end]] $wrapper
@@ -2946,13 +3235,17 @@ set diagnosticDriver {
             launchfail - launchfail-closed - missing { set expected 1 }
             signal-term { set expected 143 }
             signal-hup { set expected 129 }
-            signal-int { set expected 130 }
         }
         if {[lindex $result 2] != 0 || [lindex $result 3] != $expected} {
             error "diagnostic reporting changed exit status: $result; output: $output"
         }
         if {$active && (!$sentExit || (!$::actualLaunch && [string first NATIVE_WAIT_COMPLETE $output] < 0))} {
             error "native input, wait, or terminal restoration was lost: $output"
+        }
+        if {$mode in {ctrl-c ctrl-c-isig signal-int} && \
+            (!$sentInterrupt || [regexp -all {TURN_INTERRUPTED} $output] != 1 || \
+             [string first BURST_INPUT_OK $output] < 0 || [string first BURST_PROTOCOL_OK $output] < 0)} {
+            error "first interrupt closed the TUI or broke input/protocol forwarding: $output"
         }
         if {$mode ne "missing"} {
             set enabled [string first "\033\[?1006h" $output]
@@ -3091,7 +3384,7 @@ proc diagnostic_batch {channels} {
 }
 set jobs {}
 set failed [catch {
-    foreach mode {normal error burst shutdown closed backend-eof signal-term signal-hup signal-int child-death launchfail launchfail-closed missing no-thread activation-error switched installed quoted external-editor recovery-no-credit recovery-stop} {
+    foreach mode {normal error burst shutdown closed backend-eof signal-term signal-hup signal-int ctrl-c ctrl-c-isig child-death launchfail launchfail-closed missing no-thread activation-error switched installed quoted external-editor recovery-no-credit recovery-stop} {
         set env(DIAGNOSTIC_MODE) $mode
         set env(DIAGNOSTIC_PID) [file join $scratch $mode.backend.pid]
         set env(DIAGNOSTIC_TUI_PID) [file join $scratch $mode.tui.pid]
@@ -3121,7 +3414,7 @@ file delete -force $scratch
 check {!$failed} "fake backend diagnostic isolation failed: $message"
 
 } finally {
-    unset -nocomplain env(XDG_CONFIG_HOME)
+    unset -nocomplain env(XDG_CONFIG_HOME) env(TMPDIR)
     array set env $configEnvironment
     file delete -force $configScratch
 }

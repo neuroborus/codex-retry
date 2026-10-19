@@ -97,7 +97,9 @@ proc fixture::start {handler} {
     # Fake backends run under Expect so its exit/signal hooks are already loaded.
     package present Expect
     exit -onexit [list fixture::onexit [exit -onexit]]
+    set ignoreInterrupt [expr {[trap SIGINT] eq "SIG_IGN"}]
     foreach {signal status} {SIGTERM 143 SIGHUP 129 SIGINT 130} {
+        if {$signal eq "SIGINT" && $ignoreInterrupt} { continue }
         trap [list fixture::signal [trap $signal] $status] $signal
     }
     set listener [socket -server [list fixture::accept $handler] -myaddr 127.0.0.1 0]
@@ -105,7 +107,11 @@ proc fixture::start {handler} {
     # `2>@stdout` merges into the pipeline's lifecycle pipe, not our stdout.
     set output [open /dev/stdout w]
     try {
-        set relay [open [list | tclsh $script --relay $port <@stdin 2>@$output] r]
+        set command [list | tclsh $script --relay $port <@stdin 2>@$output]
+        if {$ignoreInterrupt} {
+            set command [linsert $command 1 sh -c {trap '' INT; exec "$@"} fixture-relay]
+        }
+        set relay [open $command r]
     } finally { close $output }
     fconfigure $relay -blocking 0
     fileevent $relay readable fixture::relay_done

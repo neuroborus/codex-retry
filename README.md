@@ -29,6 +29,10 @@ Recovery decisions use structured events exclusively. By default, only the
 overload retry below is enabled; the optional recovery modes submit a new
 `continue` turn only when explicitly configured.
 Terminal input/output, window resizing, and TUI exit status pass through.
+`Ctrl+C` stays under native TUI control, including stopping an active turn and
+its normal repeat-to-exit behavior. If it arrives as `SIGINT`, the wrapper
+forwards a Ctrl+C keystroke to the TUI. Before the TUI starts, `SIGINT` cancels
+startup; `SIGTERM` and `SIGHUP` still close the wrapper.
 If wrapper input closes, it disconnects and drains the TUI's final output before
 reaping the child and restoring the terminal.
 Large unrelated startup replies use their request ID and envelope boundaries
@@ -136,19 +140,22 @@ a new turn in the same thread; it does not rewind history or roll back effects.
 Retries wait 5, 10, 20, 40 seconds, and so on, capped at 30 minutes, without
 jitter or an attempt limit. Success resets the delay. Duplicate and stale events
 do not schedule extra retries. New submitted input, steering, interruption,
-thread switching, and disconnection cancel a pending retry. Conflicting activity
-in the same thread from another client also cancels replay, including settings
-changes, a different live turn, and additional or changed user messages in our
-turn. Duplicate notifications of our original input remain eligible. Foreign
-responses cannot acknowledge our work.
+thread switching, account/auth changes, and disconnection cancel a pending retry.
+Conflicting activity in the same thread from another client also cancels replay,
+including settings changes, a different live turn, and additional or changed
+user messages in our turn. Duplicate notifications of our original input remain
+eligible. Foreign responses cannot acknowledge our work.
 
 Automatic replay stops after model output, non-user item activity (including
 tool execution), MCP elicitation requests, or hook activity, including early
 events and start snapshots. Hooks and MCP elicitation without a turn ID
 conservatively block replay in the active thread.
 Other failures and ambiguous request rejections require manual recovery.
-This deliberately covers overload before observable progress; it is not a
+The default behavior covers overload before observable progress; it is not a
 general transaction recovery mechanism.
+To continue after overload following model/tool/hook progress, enable
+`auto_continue_after_stop` below. This submits a new `continue` turn using the
+same exponential delay, rather than replaying the original request.
 
 ## Optional recovery
 
@@ -209,16 +216,21 @@ it. For each redemption, updates can cause at most one additional full
 verification read. Further changes warn and leave work stopped, without another
 redemption.
 
-`auto_continue_after_stop` handles only the confirmed native content stop
-represented by `cyberPolicy` in CLI 0.163.0. It requires this client's
-acknowledged `turn/start` and a matching `turn/completed` with `status: "failed"`
-and a string `error.codexErrorInfo` exactly equal to `cyberPolicy`. The wrapper
-forwards the native failure, then submits exactly the plain ASCII user text
-`continue` as one new turn in the same thread. Generic refusal text, `other`,
-`misalignmentPolicyViolation`, transient safety buffering, opaque moderation
-metadata, error notifications alone and successful completion do not trigger
-it. Other CLI versions or stop types require a verified protocol mapping;
-there is no terminal-text fallback.
+`auto_continue_after_stop` handles the confirmed native content stop represented
+by `cyberPolicy` in CLI 0.163.0 and `serverOverloaded` after observable progress.
+It requires this client's acknowledged `turn/start` and a matching
+`turn/completed` with `status: "failed"` and a string `error.codexErrorInfo`
+exactly equal to the applicable code. The wrapper forwards the native failure,
+then submits exactly the plain ASCII user text
+`continue` as one new turn in the same thread. Content stops continue immediately;
+overload follow-ups wait 5, 10, 20 seconds, and so on up to 30 minutes, without an
+attempt limit. Consecutive overloads retain the delay even when a new `continue`
+is needed; success or manual new work resets it. Before progress, overloads keep
+the original-input replay behavior regardless of this flag.
+Generic refusal text, `other`, `misalignmentPolicyViolation`, transient safety
+buffering, opaque moderation metadata, error notifications alone and successful
+completion do not trigger it. Other CLI versions or stop types require a verified
+protocol mapping; there is no terminal-text fallback.
 
 Both modes preserve native history and restrictions and retain the turn's
 settings. Earlier tool effects remain in place. Only the neutral follow-up is
@@ -231,16 +243,18 @@ continuations. There is no per-chain or total-attempt cap, and the modes have
 no shared allowance. Each usage-limit incident requires fresh eligibility and
 verification with an available earned reset. Duplicate or stale events cannot
 repeat a continuation or redemption for the same failure. Overload retries
-retain their original input, settings and backoff. IDs, ownership and ordering
-must be unambiguous.
+before progress retain their original input, settings and backoff. IDs,
+ownership and ordering must be unambiguous.
 Pre-existing active work reported by activation/history snapshots or
 thread-status events cannot be claimed as this client's newly started turn.
 Metadata reads preserve recovery eligibility without changing the selected thread.
 Manual turn/thread, settings or goal changes, conflicting same-thread activity,
 account changes and disconnection cancel pending recovery, including overload
-retries of its automatic continuation. Native warnings appear through the typed
-warning notification; if delivery is unavailable,
-the existing bounded diagnostics show them after the TUI releases the terminal.
+retries of its automatic continuation. Late progress, including new or changed
+work in repeated terminal snapshots, also cancels queued recovery.
+Native warnings appear through the typed warning notification; if delivery is
+unavailable, the existing bounded diagnostics show them after the TUI releases
+the terminal.
 
 Run the offline checks with `tclsh tests/retry.test.tcl`. They use structured
 event fixtures, controlled timers, and a fake backend without model calls or

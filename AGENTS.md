@@ -12,8 +12,10 @@ documentation in English.
 - Cancel on manual turn/thread changes or disconnection; reset delay on success.
   Do not infer success or failure from terminal text. Only the explicit,
   default-false recovery flags may submit a new literal `continue` turn after
-  verified earned-reset recovery or an acknowledged terminal `cyberPolicy`
-  stop. Handle each distinct failure at most once; never replay partial work.
+  verified earned-reset recovery, an acknowledged terminal `cyberPolicy` stop,
+  or a completed `serverOverloaded` failure after progress. Keep the same
+  exponential backoff for overload follow-ups. Handle each distinct failure at
+  most once; never replay partial work.
 - Keep Tcllib responsible for JSON and WebSocket framing. Avoid frameworks,
   persistent state, and configuration layers unless requested behavior requires them.
 - Keep project skills under `.agents/skills/`. `.claude/skills` points there;

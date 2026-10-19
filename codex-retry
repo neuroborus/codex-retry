@@ -175,7 +175,8 @@ proc automatic::warn {message {thread ""}} {
 }
 proc automatic::owns_retry {} {
     variable current
-    expr {[field $current generated] eq "1" && [field $current rpcId] eq [field $::retry::current rpcId] && \
+    expr {([field $current generated] eq "1" || [field $current phase] eq "continue_overload") && \
+        [field $current rpcId] eq [field $::retry::current rpcId] && \
         [field $current threadId] eq [field $::retry::current threadId]}
 }
 proc automatic::cancel {} {
@@ -243,6 +244,7 @@ proc automatic::replay {request previous} {
     dict set current rpcId [json_dump [huddle get $request id]]
     dict set current previous [dict get $current turnId]
     foreach {key value} {turnId "" early "" userId "" phase running accepted 0 done 0} { dict set current $key $value }
+    foreach key {terminal progress} { dict unset current $key }
 }
 
 proc automatic::user_item {item} {
@@ -268,21 +270,35 @@ proc automatic::items {turn} {
         set item [huddle get $items $i]
         if {![is $item dict] || [text $item type] eq ""} { cancel; return }
         if {[text $item type] eq "userMessage"} { user_item $item }
+        if {$current ne "" && [text $item type] ne "userMessage"} {
+            # Repeated terminal snapshots may repeat known work, but must not
+            # introduce progress after recovery has become eligible.
+            if {[dict exists $current terminal]} {
+                set known 0
+                set previous [huddle get [dict get $current terminal] items]
+                for {set j 0} {$j < [huddle llength $previous]} {incr j} {
+                    if {[huddle equal $item [huddle get $previous $j]]} { set known 1; break }
+                }
+                if {!$known} { cancel; return }
+            }
+            dict set current progress 1
+        }
     }
 }
 
 # Only an acknowledged terminal failure can queue an action. Zero-delay actions
 # run after the native event has been forwarded, and are revalidated on dispatch.
-proc automatic::queue {phase} {
+proc automatic::queue {phase {delay 0}} {
     variable current; variable timer
     after cancel $timer
     dict set current phase $phase
-    set timer [after 0 automatic::advance]
+    set timer [after $delay automatic::advance]
 }
 
 proc automatic::completed {turn} {
     variable current; variable flags; variable live
     if {[field $current done]} { return }
+    dict set current terminal $turn
     dict set current done 1
     set thread [dict get $current threadId]
     if {[field $live $thread] eq [dict get $current turnId]} { dict unset live $thread }
@@ -291,7 +307,13 @@ proc automatic::completed {turn} {
         return
     }
     set code [text $turn error codexErrorInfo]
-    if {$code eq "serverOverloaded"} { dict set current phase overload; return }
+    if {$code eq "serverOverloaded"} {
+        if {[dict get $flags auto_continue_after_stop] && [field $current progress] eq "1"} {
+            queue continue_overload $::retry::delay
+            set ::retry::delay [expr {min(1800000, $::retry::delay * 2)}]
+        } else { dict set current phase overload }
+        return
+    }
     set phase ""
     if {$code eq "usageLimitExceeded" && [dict get $flags auto_reset_limit]} { set phase read_ready }
     if {$code eq "cyberPolicy" && [dict get $flags auto_continue_after_stop]} { set phase continue_stop }
@@ -357,6 +379,10 @@ proc automatic::server {object} {
                 dict unset current terminal
                 completed $terminal
             } elseif {$current ne "" && [text $turn status] ne "inProgress"} { cancel }
+        } elseif {[text $object result turn id] ne [field $current turnId]} {
+            cancel
+        } else {
+            items [huddle get $object result turn]
         }
         return $visible
     }
@@ -385,7 +411,7 @@ proc automatic::server {object} {
         set turn [huddle get $object params turn]
         set turnId [text $turn id]
         if {$turnId eq ""} { cancel; return $visible }
-        if {$turnId ne [field $current turnId] && \
+        if {$turnId ne [field $current turnId] && $turnId ne [field $current early] && \
             [dict exists $::retry::finished [list [field $current threadId] $turnId]]} { return $visible }
         if {![field $current accepted]} {
             # An early start is only a candidate until the reply binds its ID.
@@ -396,7 +422,9 @@ proc automatic::server {object} {
                 ([field $current early] ne "" && [field $current early] ne $turnId)} { cancel; return $visible }
             dict set current early $turnId
             items $turn
-            if {$current ne "" && $method eq "turn/completed"} { dict set current terminal $turn }
+            if {$current ne "" && $method eq "turn/completed" && ![dict exists $current terminal]} {
+                dict set current terminal $turn
+            }
             return $visible
         } elseif {$turnId ne [field $current turnId]} { cancel; return $visible }
         items $turn
@@ -406,7 +434,7 @@ proc automatic::server {object} {
     } elseif {[string match "item/*" $method] || [string match "hook/*" $method] || \
         $method in {turn/plan/updated turn/diff/updated rawResponseItem/completed rawResponse/completed mcpServer/elicitation/request}} {
         set turnId [text $object params turnId]
-        if {$turnId ne "" && $turnId ne [field $current turnId] && \
+        if {$turnId ne "" && $turnId ne [field $current turnId] && $turnId ne [field $current early] && \
             [dict exists $::retry::finished [list [field $current threadId] $turnId]]} { return $visible }
         set expected [field $current turnId]
         if {![field $current accepted]} { set expected [field $current early] }
@@ -418,7 +446,9 @@ proc automatic::server {object} {
                 return $visible
             }
         }
-        if {[field $current phase] ne "running"} { cancel }
+        if {[field $current phase] ne "running" || [dict exists $current terminal]} {
+            cancel
+        } else { dict set current progress 1 }
     }
     return $visible
 }
@@ -547,7 +577,9 @@ proc automatic::advance {} {
     switch -- [dict get $current phase] {
         read_ready { rpc account/rateLimits/read [huddle create] read }
         consume_ready { rpc account/rateLimitResetCredit/consume [dict get $current redemption] consume }
-        continue_stop - continue_reset {
+        continue_stop - continue_reset - continue_overload {
+            set overload [expr {[dict get $current phase] eq "continue_overload"}]
+            set delay $::retry::delay
             set original [huddle get [dict get $current request] params]
             set params [huddle create threadId [huddle get $original threadId] \
                 clientUserMessageId [retry::next_id] \
@@ -570,6 +602,7 @@ proc automatic::advance {} {
                 turnId "" previous [dict get $current turnId] early "" userId "" \
                 phase running accepted 0 generated 1 done 0]
             retry::client [json_dump $request] 0
+            if {$overload} { set ::retry::delay $delay }
             backend_send [json_dump $request]
         }
     }
@@ -957,13 +990,15 @@ proc retry::client {json {manual 1}} {
         } else { automatic::client $object }
     }
     set method [field $message method]
+    if {([string match "account/*" $method] && ![automatic::read_only $method]) || \
+        $method in {modelProvider/auth/set modelProvider/auth/clear}} { reset }
     if {$method ne "" && [dict exists $message id]} {
         dict set usedIds [json_dump [huddle get $object id]] 1
     }
     set threadId [field $message params threadId]
     if {$current ne "" && $method ne "" && $threadId ne "" && \
         $threadId ne [field $current threadId] && \
-        !([automatic::owns_retry] && [automatic::read_only $method])} { reset }
+        ![automatic::read_only $method]} { reset }
     if {[string match "turn/*" $method] || $method in {
         thread/start thread/resume thread/fork thread/revert thread/archive
         thread/delete thread/unsubscribe thread/compact/start thread/inject_items
@@ -1160,6 +1195,7 @@ proc retry::server {json} {
         ($current eq "" || $id ne [field $current rpcId])} { return 1 }
     set message [json::json2dict $json]
     set method [field $message method]
+    if {$method in {account/updated account/gatewayOAuth/changed}} { reset }
     set automaticVisible 1
     set automaticValid 0
     if {$::automatic::current ne "" || $::automatic::ids ne "" || \
@@ -1523,6 +1559,21 @@ proc terminal::restore {} {
     set saved ""
 }
 
+# Treat SIGINT like a native Ctrl+C once the TUI can receive input.
+proc terminal::interrupt {} {
+    if {[info exists ::tuiSpawn]} {
+        # An already exiting TUI may have closed its PTY; keep its exit status.
+        catch {send -i $::tuiSpawn -- "\003"}
+        return
+    }
+    shutdown 130
+}
+
+# Owned pipe children must survive a terminal's foreground-group SIGINT.
+proc terminal::pipe {command mode} {
+    open [linsert $command 1 sh -c {trap '' INT; exec "$@"} codex-retry] $mode
+}
+
 proc shutdown {status} {
     set ::signalStatus $status
     cleanup
@@ -1585,7 +1636,7 @@ proc backend_attach {{timeout 10000}} {
 }
 
 proc start_backend {options} {
-    set ::backend [open [concat [list | codex app-server daemon start] $options \
+    set ::backend [terminal::pipe [concat [list | codex app-server daemon start] $options \
         [list 2>@$::diagnostics::writer]] r]
     fconfigure $::backend -blocking 0 -encoding binary -translation binary
     set ::backendReady 0
@@ -1605,7 +1656,7 @@ proc start_backend {options} {
     unset ::backend
     fconfigure $channel -blocking 1
     if {[catch {close $channel} message]} { error "shared app-server startup failed: $message" }
-    set ::backend [open [concat [list | codex app-server proxy] $options \
+    set ::backend [terminal::pipe [concat [list | codex app-server proxy] $options \
         [list 2>@$::diagnostics::writer]] r+]
     backend_attach
 }
@@ -1710,7 +1761,7 @@ proc main {arguments} {
     exit -onexit {trap SIG_IGN {SIGHUP SIGWINCH}}
     trap {shutdown 143} SIGTERM
     trap {shutdown 129} SIGHUP
-    trap {shutdown 130} SIGINT
+    trap terminal::interrupt SIGINT
     lassign [chan pipe] ::diagnostics::channel ::diagnostics::writer
     fconfigure $::diagnostics::channel -blocking 0 -encoding binary -translation binary
     fileevent $::diagnostics::channel readable diagnostics::drain
