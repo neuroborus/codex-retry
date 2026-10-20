@@ -51,6 +51,10 @@ proc completed {turn {status failed} {code serverOverloaded} {items {[]}} {threa
 proc elicitation {turn {thread t1}} {
     retry::server [format {{"id":"elicitation","method":"mcpServer/elicitation/request","params":{"threadId":"%s","turnId":%s,"serverName":"fixture","mode":"form","_meta":null,"message":"sample input","requestedSchema":{"type":"object","properties":{}}}}} $thread $turn]
 }
+proc compacted {turn {thread t1}} {
+    retry::server [json_dump [huddle create method [huddle string thread/compacted] \
+        params [huddle create threadId [huddle string $thread] turnId [huddle string $turn]]]]
+}
 set request {{"id":7,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"original\nrequest \"quoted\" é\u0001"},{"type":"localImage","path":"sample.png"}],"effort":"high","sandboxPolicy":{"type":"readOnly"},"special":{"odd\"key":"escaped"},"optional":null,"flag":true,"count":3,"emptyObject":{},"emptyArray":[]}}}
 set userItem {{"type":"userMessage","id":"original-user","clientId":null,"content":[{"text_elements":[],"text":"original\nrequest \"quoted\" é\u0001","type":"text"},{"path":"sample.png","type":"localImage"}]}}
 set userItems [json::write array $userItem]
@@ -1012,6 +1016,166 @@ foreach reset {0 1} {
             }
         }
     }
+}
+
+# Automatic compaction is owned progress in both protocol forms, even by itself.
+foreach reset {0 1} {
+    foreach follow {0 1} {
+        foreach form {legacy item} {
+            auto_begin $reset $follow
+            if {$form eq "legacy"} {
+                compacted $autoTurn
+                compacted $autoTurn
+            } else {
+                user_event item/started {{"type":"contextCompaction","id":"compaction"}} $autoTurn
+                user_event item/completed {{"type":"contextCompaction","id":"compaction"}} $autoTurn
+            }
+            check {[field $retry::current progress] == 1} "compaction did not prevent original-input replay"
+            if {$reset || $follow} {
+                check {[field $automatic::current turnId] eq $autoTurn && \
+                    [field $automatic::current progress] == 1} "automatic compaction lost owned recovery tracking"
+            }
+            completed $autoTurn
+            set pending $timers
+            completed $autoTurn
+            check {$timers eq $pending && [dict size $timers] == $follow && $sent eq ""} "compaction ignored opt-in or duplicated recovery"
+            if {$follow} {
+                check {[lindex $delays end] == 5000} "compaction skipped overload backoff"
+                fire
+                auto_followup
+                check {[llength $sent] == 1} "compaction replayed original work or requested an account reset"
+            }
+        }
+    }
+}
+
+# Legacy compaction follows the same early-start and acknowledgement guards.
+foreach ordering {before-ack completed-before-ack reply-without-start} {
+    auto_begin 1 1 0
+    if {$ordering eq "reply-without-start"} { reply $autoId $autoTurn } else { started $autoTurn }
+    compacted $autoTurn
+    compacted $autoTurn
+    if {$ordering ne "before-ack"} { completed $autoTurn }
+    if {$ordering ne "reply-without-start"} {
+        reply {"unrelated-compaction-reply"} $autoTurn
+        check {[dict size $timers] == 0} "compaction or a foreign reply acknowledged recovery"
+        reply $autoId $autoTurn
+    }
+    if {$ordering eq "before-ack"} { completed $autoTurn }
+    check {[dict size $timers] == 1} "correlated early compaction lost acknowledged recovery"
+    fire
+    auto_followup
+}
+foreach follow {0 1} {
+    auto_begin 0 $follow 0
+    compacted $autoTurn
+    started $autoTurn
+    completed $autoTurn
+    reply $autoId $autoTurn
+    check {[dict size $timers] == 0 && $sent eq ""} "compaction before a start candidate established recovery or allowed replay"
+}
+auto_begin 0 1 0
+started $autoTurn
+compacted $autoTurn
+completed $autoTurn
+reply $autoId different-compaction-turn
+check {$automatic::current eq "" && $retry::current eq "" && [dict size $timers] == 0} "a mismatched acknowledgement adopted compacted work"
+
+# Foreign threads and already finished turns are neutral; live foreign turns
+# and ambiguous IDs cannot preserve recovery or resurrect it at acknowledgement.
+completed finished-before-compaction completed
+foreach follow {0 1} {
+    auto_begin 0 $follow
+    set previous [list $automatic::current $retry::current $timers]
+    compacted $autoTurn other-thread
+    compacted finished-before-compaction
+    check {[list $automatic::current $retry::current $timers] eq $previous} "unrelated compaction changed current ownership"
+    completed $autoTurn
+    fire
+    check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+        [huddle get $autoRequest params]]} "unrelated compaction prevented an otherwise safe original-input retry"
+    foreach ordering {before-start before-ack running} {
+        auto_begin 0 $follow 0
+        if {$ordering ne "before-start"} { started $autoTurn }
+        if {$ordering eq "running"} { reply $autoId $autoTurn }
+        compacted live-foreign-compaction
+        if {$ordering eq "before-start"} { started $autoTurn }
+        if {$ordering ne "running"} { reply $autoId $autoTurn }
+        completed $autoTurn
+        check {$automatic::current eq "" && $retry::current eq "" && \
+            [dict size $timers] == 0 && $sent eq ""} "foreign compaction allowed recovery"
+    }
+    foreach params {
+        {"turnId":"@TURN@"}
+        {"threadId":null,"turnId":"@TURN@"}
+        {"threadId":"","turnId":"@TURN@"}
+        {"threadId":["t1"],"turnId":"@TURN@"}
+        {"threadId":"t1"}
+        {"threadId":"t1","turnId":null}
+        {"threadId":"t1","turnId":""}
+        {"threadId":"t1","turnId":1}
+        {"threadId":"t1","turnId":["@TURN@"]}
+        {"threadId":"other","threadId":"t1","turnId":"@TURN@"}
+        {"threadId":"t1","turnId":"foreign","turnId":"@TURN@"}
+    } {
+        auto_begin 0 $follow
+        retry::server [format {{"method":"thread/compacted","params":{%s}}} \
+            [string map [list @TURN@ $autoTurn] $params]]
+        completed $autoTurn
+        check {$automatic::current eq "" && $retry::current eq "" && \
+            [dict size $timers] == 0 && $sent eq ""} "ambiguous compaction allowed recovery"
+    }
+}
+
+# Manual compaction and progress arriving after failure still cancel recovery.
+foreach stage {running backoff} {
+    auto_begin 1 1
+    compacted $autoTurn
+    if {$stage eq "backoff"} { completed $autoTurn }
+    retry::client {{"id":"manual-compact","method":"thread/compact/start","params":{"threadId":"t1"}}}
+    completed $autoTurn
+    check {$automatic::current eq "" && $retry::current eq "" && $retry::delay == 5000 && \
+        [dict size $timers] == 0 && $sent eq ""} "manual compaction retained recovery or backoff"
+}
+foreach follow {0 1} {
+    auto_begin 0 $follow
+    if {$follow} { compacted $autoTurn }
+    completed $autoTurn
+    check {[dict size $timers] == 1} "expected queued overload recovery before late compaction"
+    compacted $autoTurn
+    completed $autoTurn
+    check {[dict size $timers] == 0 && $sent eq ""} "late compaction left queued recovery armed"
+}
+
+# Substantial work and repeated compacted follow-ups retain shared backoff;
+# success and new manual work reset it as usual.
+foreach ending {success manual} {
+    auto_begin 1 1
+    set turn $autoTurn
+    foreach delay {5000 10000} {
+        user_event item/completed {{"type":"commandExecution","id":"applied-tool"}} $turn
+        compacted $turn
+        completed $turn
+        check {[dict size $timers] == 1 && [lindex $delays end] == $delay} "compaction lost shared overload backoff"
+        fire
+        set id [auto_followup]
+        completed $turn
+        compacted $turn
+        check {[dict size $timers] == 0} "a stale compacted failure repeated recovery"
+        set turn compacted-followup-$autoSequence-$delay
+        reply $id $turn
+        started $turn
+    }
+    if {$ending eq "success"} {
+        compacted $turn
+        completed $turn completed
+    } else {
+        compacted $turn
+        completed $turn
+        huddle set autoRequest id [huddle string manual-after-compaction-$autoSequence]
+        retry::client [json_dump $autoRequest]
+    }
+    check {$retry::delay == 5000 && [dict size $timers] == 0} "success or manual work did not reset compaction backoff"
 }
 
 # Original-input retries and new follow-ups share one exponential sequence.
@@ -2113,6 +2277,60 @@ rename native_bgerror bgerror
 rename websocket::send {}
 rename websocket::native_send websocket::send
 
+# Metadata RPCs and failures cannot touch a queued primary recovery, even when
+# IDs, thread IDs and permissions overlap. Stale channel callbacks are harmless.
+rename websocket::send websocket::native_send
+rename close_backend native_close_backend
+proc websocket::send {socket type message} { lappend ::routed [list $socket $message]; return 1 }
+proc close_backend {channel} { lappend ::closedBridges $channel }
+auto_begin 0 1
+completed $autoTurn failed serverOverloaded {[{"type":"fileChange","id":"progress"}]}
+resume::reset
+set resume::armed 1
+set recovery::target primary-session
+set protected [list $timers $retry::current $retry::delay $automatic::current \
+    $automatic::selection $automatic::live $resume::armed $resume::pending $recovery::target $recovery::yolo]
+set routed {}
+set closedBridges {}
+foreach socket {picker1 picker2} channel {bridge1 bridge2} {
+    set auxiliary::clients($socket) $channel
+    set auxiliary::backends($channel) $socket
+    foreach message [list $resumeRequest $request \
+        { {"id":7,"method":"thread/list","params":{"searchTerm":"synthetic"}} }] {
+        auxiliary::event $socket text $message
+    }
+    foreach message [list $resumeReply \
+        { {"id":7,"error":{"code":-1,"message":"metadata failure"}} } \
+        { {"method":"thread/closed","params":{"threadId":"t1"}} }] {
+        auxiliary::backend $channel text $message
+    }
+    check {[lindex [lindex $routed end] 0] eq $socket} "auxiliary backend reply used another client"
+    if {$socket eq "picker1"} {
+        auxiliary::backend $channel timeout ""
+    } else {
+        auxiliary::event $socket text "invalid JSON"
+    }
+    set before $routed
+    auxiliary::backend $channel text $resumeReply
+    auxiliary::event $socket text $request
+    check {$routed eq $before} "retired auxiliary callback forwarded data"
+}
+check {[llength $routed] == 12 && $closedBridges eq {bridge1 bridge2}} "auxiliary routing or local failure cleanup changed"
+check {[list $timers $retry::current $retry::delay $automatic::current \
+    $automatic::selection $automatic::live $resume::armed $resume::pending $recovery::target $recovery::yolo] eq $protected} \
+    "picker metadata, failure or closure changed primary ownership"
+fire
+check {[huddle get_stripped [::huddle::json2huddle [lindex $sent end]] params input 0 text] eq "continue"} \
+    "picker traffic prevented the queued primary continuation"
+automatic::cancel
+retry::reset
+resume::reset
+set automatic::flags {auto_reset_limit 0 auto_continue_after_stop 0}
+rename close_backend {}
+rename native_close_backend close_backend
+rename websocket::send {}
+rename websocket::native_send websocket::send
+
 # File-backed requests exercise handshake parsing without opening a listener.
 rename websocket::takeover websocket::native_takeover
 proc websocket::takeover {socket handler server} { set ::upgraded 1 }
@@ -2234,6 +2452,294 @@ cleanup
 check {[lsort [chan names]] eq $channels} "repeated cleanup leaked a diagnostic pipe end"
 check {$::diagnostics::tail eq "STARTUP_PARTIAL"} "cleanup lost partial startup diagnostics"
 set ::diagnostics::tail ""
+
+# Independent native picker transports, exercised through the real wrapper/PTY.
+set channel [file tempfile scratch]
+close $channel
+file delete $scratch
+file mkdir $scratch
+set channel [open [file join $scratch codex] w]
+puts $channel {#!/usr/bin/env expect}
+puts $channel [list source $proxyFixture]
+puts $channel {
+    package require json
+    package require json::write
+    package require huddle::json
+    json::write indented 0
+    proc check {condition message} {
+        if {![uplevel 1 [list expr $condition]]} { error $message }
+    }
+    proc bgerror {message} { puts stderr $message; exit 91 }
+    after 12000 {error "picker fixture timed out"}
+    if {[lrange $argv 0 2] eq {app-server daemon start}} { exit 0 }
+    if {[lrange $argv 0 1] eq {app-server proxy}} {
+        check {![info exists env(CODEX_RETRY_TOKEN)]} "tunnel inherited the TUI credential"
+        set identity [open [file join $env(PICKER_SCRATCH) children] a]
+        puts $identity [pid]
+        close $identity
+        proc respond {socket type text} {
+            if {$type ne "text"} { return }
+            set request [json::json2dict $text]
+            set method [dict get $request method]
+            set encoded [huddle jsondump [huddle get [::huddle::json2huddle $text] id] "" ""]
+            switch $method {
+                initialize {
+                    check {![info exists ::role]} "transport initialized twice"
+                    set ::role [dict get $request params role]
+                    websocket::send $socket text [format { {"id":%s,"result":{"pid":%s}} } $encoded [pid]]
+                }
+                thread/resume {
+                    check {[info exists ::role]} "transport did not initialize"
+                    set approval [expr {$::role eq "main" ? "never" : "on-request"}]
+                    set sandbox [expr {$::role eq "main" ? "danger-full-access" : "read-only"}]
+                    check {[dict get $request params approvalPolicy] eq $approval && \
+                        [dict get $request params sandbox] eq $sandbox} "picker consumed or inherited launch YOLO"
+                    set thread [dict get $request params threadId]
+                    set sandbox [expr {$::role eq "main" ? "dangerFullAccess" : "readOnly"}]
+                    websocket::send $socket text [format { {"id":%s,"result":{"thread":{"id":"%s"},"model":"fixture","modelProvider":"openai","approvalPolicy":"%s","sandbox":{"type":"%s"}}} } $encoded $thread $approval $sandbox]
+                }
+                thread/list {
+                    websocket::send $socket text [format { {"id":%s,"result":{"data":[{"id":"auxiliary-session"}],"pid":%s}} } $encoded [pid]]
+                    if {[dict exists $request params searchTerm]} {
+                        # These must never reach the primary recovery engine.
+                        foreach event {
+                            {"method":"thread/settings/updated","params":{"threadId":"primary-session","threadSettings":{"approvalPolicy":"on-request","sandboxPolicy":{"type":"readOnly"}}}}
+                            {"method":"thread/closed","params":{"threadId":"primary-session"}}
+                            {"id":7,"error":{"code":-1,"message":"auxiliary failure"}}
+                        } { websocket::send $socket text "\{$event\}" }
+                    }
+                }
+                turn/start {
+                    if {![info exists ::turned]} {
+                        set ::turned 1
+                        websocket::send $socket text { {"id":7,"result":{"turn":{"id":"failed","status":"inProgress","items":[]}}} }
+                        websocket::send $socket text { {"method":"turn/completed","params":{"threadId":"primary-session","turn":{"id":"failed","status":"failed","items":[{"type":"fileChange","id":"progress"}],"error":{"message":"fixture overload","codexErrorInfo":"serverOverloaded"}}}} }
+                    } else {
+                        set params [dict get $request params]
+                        check {[llength [dict get $params input]] == 1 && \
+                            [dict get [lindex [dict get $params input] 0] text] eq "continue" && \
+                            [dict get $params threadId] eq "primary-session"} "queued primary recovery changed"
+                        websocket::send $socket text [format { {"id":%s,"result":{"turn":{"id":"recovered","status":"inProgress","items":[]}}} } $encoded]
+                        websocket::send $socket text { {"method":"turn/completed","params":{"threadId":"primary-session","turn":{"id":"recovered","status":"completed","items":[]}}} }
+                    }
+                }
+                fixture/fail { exit 0 }
+                default { error "unexpected picker fixture method" }
+            }
+        }
+        fixture::start respond
+        vwait forever
+    }
+    set url [lindex $argv 1]
+    set token $env([lindex $argv 3])
+    set identity [open [file join $env(PICKER_SCRATCH) children] a]
+    puts $identity [pid]
+    close $identity
+    if {$env(PICKER_MODE) eq "input-eof"} {
+        trap {puts PICKER_EOF_DRAINED; flush stdout; exit 19} SIGTERM
+    }
+    set terminalMode [exec stty -g <@stdin]
+    exec stty raw -echo <@stdin
+    fconfigure stdin -blocking 0 -encoding utf-8 -translation lf
+    proc receive {socket type text} {
+        if {$type eq "connect"} { set ::connected $socket; unset -nocomplain ::closed($socket) }
+        if {$type eq "text"} { lappend ::messages($socket) [json::json2dict $text] }
+        if {$type in {close disconnect error timeout}} { set ::closed($socket) 1 }
+        incr ::changed
+    }
+    set changed 0
+    proc until {condition} {
+        set timer [after 7000 {error "picker protocol wait timed out"}]
+        try { while {![uplevel 1 [list expr $condition]]} { vwait ::changed } } finally { after cancel $timer }
+    }
+    proc open_client {role} {
+        set ::connected ""
+        set socket [websocket::open $::url receive -headers [list Authorization "Bearer $::token"] -timeout 2000]
+        until {$::connected eq $socket}
+        set reply [rpc $socket [format { {"id":1,"method":"initialize","params":{"role":"%s"}} } $role]]
+        return [list $socket [dict get $reply result pid]]
+    }
+    proc rpc {socket text} {
+        set ::messages($socket) {}
+        websocket::send $socket text $text
+        until {[llength $::messages($socket)] > 0}
+        return [lindex $::messages($socket) 0]
+    }
+    lassign [open_client main] main mainPid
+    lassign [open_client picker] picker pickerPid
+    check {$pickerPid != $mainPid} "picker reused the main backend"
+    rpc $picker { {"id":31,"method":"thread/resume","params":{"threadId":"auxiliary-session","approvalPolicy":"on-request","sandbox":"read-only"}} }
+    rpc $main { {"id":31,"method":"thread/resume","params":{"threadId":"primary-session","approvalPolicy":"on-request","sandbox":"read-only"}} }
+    rpc $main { {"id":7,"method":"turn/start","params":{"threadId":"primary-session","input":[{"type":"text","text":"original"}],"approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}}} }
+    until {[string first serverOverloaded $::messages($main)] >= 0}
+    # Equal IDs and conflicting replies must stay visible only on their channel.
+    rpc $picker { {"id":7,"method":"thread/list","params":{"searchTerm":"synthetic"}} }
+    until {[llength $::messages($picker)] == 4}
+    check {[string first {auxiliary failure} $::messages($main)] < 0} "auxiliary reply leaked onto primary"
+    websocket::close $picker
+    lassign [open_client picker] picker reopenedPid
+    check {$reopenedPid != $mainPid} "reopened picker reused the main backend"
+    rpc $picker { {"id":7,"method":"thread/list","params":{}} }
+    websocket::send $picker text { {"id":8,"method":"fixture/fail","params":{}} }
+    until {[info exists ::closed($picker)]}
+    # Fail-closed attempts while an authenticated main client is already live.
+    proc denied {socket type text} {
+        if {$type eq "connect"} { error "invalid auxiliary handshake was accepted" }
+        if {$type in {close disconnect error timeout}} { set ::rejected 1; incr ::changed }
+    }
+    foreach headers [list {Authorization {Bearer invalid}} \
+        [list Authorization "Bearer $token" Origin https://example.invalid] \
+        [list Authorization "Bearer $token" authorization "Bearer $token"]] {
+        set rejected 0
+        websocket::open $url denied -headers $headers -timeout 1000
+        until {$::rejected}
+    }
+    set port [lindex [split [string trimright $url /] :] end]
+    set malformed [socket 127.0.0.1 $port]
+    fconfigure $malformed -blocking 0 -buffering none -translation crlf
+    fileevent $malformed readable [list apply {{socket} {
+        read $socket
+        if {[eof $socket]} { set ::rawClosed 1; incr ::changed }
+    }} $malformed]
+    puts $malformed "GET / HTTP/1.1\nBad header\n\n"
+    until {[info exists ::rawClosed]}
+    close $malformed
+    # Leave both an authenticated client and an incomplete handshake for teardown.
+    lassign [open_client picker] picker finalPid
+    set pending [socket 127.0.0.1 $port]
+    puts -nonewline $pending "GET / HTTP/1.1\r\n"
+    flush $pending
+    puts PICKER_INPUT_READY
+    flush stdout
+    fileevent stdin readable {
+        if {[read stdin 1] eq "q"} { puts PICKER_INPUT_OK; flush stdout; set ::typed 1; incr ::changed }
+    }
+    until {[info exists ::typed]}
+    if {$env(PICKER_MODE) eq "normal"} {
+        until {[string first recovered $::messages($main)] >= 0}
+        puts PICKER_RECOVERY_OK
+        flush stdout
+        exec stty $terminalMode <@stdin
+        exit 7
+    }
+    if {$env(PICKER_MODE) eq "primary-close"} { websocket::close $main; after 100 {exit 7} }
+    vwait forever
+}
+close $channel
+file attributes [file join $scratch codex] -permissions 0755
+set wrapper [file normalize [file join [file dirname [info script]] .. codex-retry]]
+file mkdir [file join $scratch codex-retry]
+set channel [open [file join $scratch codex-retry config.json] w]
+puts $channel { {"auto_continue_after_stop":true} }
+close $channel
+set pickerEnvironment [concat [array get env PATH] [array get env XDG_CONFIG_HOME]]
+set env(PATH) "$scratch:$env(PATH)"
+set env(XDG_CONFIG_HOME) $scratch
+set env(PICKER_SCRATCH) $scratch
+set pickerDriver {
+    set wrapperPid [exp_pid]
+    set wrapperSpawn $spawn_id
+    if {$env(PICKER_MODE) eq "input-eof"} {
+        close_on_eof -i $wrapperSpawn 0
+        set input [open [file join $env(PICKER_SCRATCH) input.fifo] r+]
+    }
+    set failed [catch {
+        expect {
+            -exact PICKER_INPUT_READY {}
+            eof {error "picker transport failed before keyboard forwarding"}
+            timeout {error "picker transport timed out"}
+        }
+        if {[info exists input]} { puts -nonewline $input q; flush $input } else { send -- q }
+        expect {
+            -exact PICKER_INPUT_OK {}
+            eof {error "picker closure disconnected primary input"}
+            timeout {error "primary keyboard forwarding stopped"}
+        }
+        switch $env(PICKER_MODE) {
+            normal {
+                expect {
+                    -exact PICKER_RECOVERY_OK {}
+                    eof {error "picker cancelled primary recovery"}
+                    timeout {error "queued primary recovery timed out"}
+                }
+            }
+            input-eof { close $input; unset input }
+            term { exec kill -TERM $wrapperPid }
+            hup { exec kill -HUP $wrapperPid }
+        }
+        if {$env(PICKER_MODE) eq "input-eof"} {
+            expect {
+                -exact PICKER_EOF_DRAINED {}
+                eof {error "wrapper EOF lost final TUI output"}
+                timeout {error "wrapper EOF did not drain TUI"}
+            }
+        }
+        expect {
+            -re {To resume this session, run:\r*\n[^\r\n]*primary-session --yolo} {}
+            eof {error "picker changed primary exit advice"}
+            timeout {error "primary exit advice timed out"}
+        }
+        expect {
+            eof {}
+            timeout {error "picker shutdown did not finish"}
+        }
+        set result [wait -i $wrapperSpawn]
+        set expected [dict get {normal 7 primary-close 7 term 143 hup 129 input-eof 19} $env(PICKER_MODE)]
+        if {[lindex $result 2] != 0 || [lindex $result 3] != $expected} { error "picker shutdown changed native status: $result" }
+    } message]
+    if {[info exists input]} { close $input }
+    if {$failed} {
+        catch {exec kill -TERM $wrapperPid}
+        catch {expect -timeout 2 eof}
+        catch {exec kill -KILL $wrapperPid}
+        puts stderr $message
+        exit 1
+    }
+    exit 0
+}
+set pickerRuns {}
+foreach mode {normal primary-close term hup input-eof} {
+    set modeScratch [file join $scratch $mode]
+    file mkdir $modeScratch
+    set channel [open [file join $modeScratch children] w]
+    close $channel
+    set launch [list $wrapper resume --last --yolo]
+    if {$mode eq "normal"} { set launch [list $wrapper resume --yolo] }
+    if {$mode eq "input-eof"} {
+        exec mkfifo [file join $modeScratch input.fifo]
+        set launch [concat [list sh -c {input=$1; shift; exec "$@" <"$input"} sh \
+            [file join $modeScratch input.fifo]] $launch]
+    }
+    set configuredDriver "set timeout 10\n[list spawn -noecho {*}$launch]\n$pickerDriver"
+    set driver [open [list | env PICKER_MODE=$mode PICKER_SCRATCH=$modeScratch \
+        expect -c $configuredDriver 2>@1] r]
+    lappend pickerRuns [list $driver $modeScratch]
+}
+# Each driver owns its PTY and children; overlap independent shutdown waits.
+set failed 0
+set message ""
+foreach run $pickerRuns {
+    lassign $run driver modeScratch
+    set output [read $driver]
+    if {[catch {close $driver} result]} {
+        set failed 1
+        append message "\n[file tail $modeScratch]: $output$result"
+    }
+    set channel [open [file join $modeScratch children] r]
+    set children [read $channel]
+    close $channel
+    foreach child $children {
+        if {![catch {exec kill -0 $child}]} {
+            catch {exec kill -TERM $child}
+            set failed 1
+            append message "\nowned picker bridge survived cleanup"
+        }
+    }
+}
+array set env $pickerEnvironment
+unset env(PICKER_SCRATCH)
+file delete -force $scratch
+check {!$failed} "native picker fake-process regression failed: $message"
 
 # Exercise the real main/PTY lifecycle with synchronous forwarding teardown.
 set channel [file tempfile scratch]

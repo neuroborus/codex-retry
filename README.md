@@ -23,8 +23,13 @@ through that pipe to the control socket. Codex selects the shared
 control socket, so sessions already loaded by ordinary Codex keep their ID and
 history. A cold launch starts that same shared server. Startup or attachment
 failure is reported without falling back to an independent writer. JSON-RPC
-traffic still passes through the retry engine and one authenticated loopback
-WebSocket connection to the native TUI.
+traffic from the main TUI passes through the retry engine and an authenticated
+loopback WebSocket endpoint. The native in-session `/resume` picker can list,
+search and select saved sessions. Each temporary picker connection initializes
+through its own owned proxy bridge to the same shared server; closing the picker
+or losing its bridge keeps the main TUI connected. Picker metadata does not
+affect the main TUI's retries, launch permissions or selected-session exit advice.
+Selecting a session still uses the native TUI's normal session handoff.
 Recovery decisions use structured events exclusively. By default, only the
 overload retry below is enabled; the optional recovery modes submit a new
 `continue` turn only when explicitly configured.
@@ -47,11 +52,12 @@ are reported directly if no TUI launched. No diagnostic log is saved to disk.
 
 Closing Retry disconnects its client; the shared server, sessions and background
 work may continue, including when Retry started the server. Cleanup terminates
-only the owned TUI and stdio bridge. Terminal attributes and mouse reporting
-are restored before exit advice or diagnostics, including failed and interrupted
-exits. An adapter buffers at most 16 KiB of the possible native exit epilogue
-after terminal release, replacing reconnect/stop commands that target the expired
-wrapper endpoint. Live terminal content and token usage remain intact.
+only the owned TUI and stdio bridges, including temporary picker connections.
+Terminal attributes and mouse reporting are restored before exit advice or
+diagnostics, including failed and interrupted exits. An adapter buffers at most
+16 KiB of the possible native exit epilogue after terminal release, replacing
+reconnect/stop commands that target the expired wrapper endpoint. Live terminal
+content and token usage remain intact.
 The final output offers one
 copyable wrapper command for the last successfully selected session, for example:
 
@@ -147,9 +153,12 @@ user messages in our turn. Duplicate notifications of our original input remain
 eligible. Foreign responses cannot acknowledge our work.
 
 Automatic replay stops after model output, non-user item activity (including
-tool execution), MCP elicitation requests, or hook activity, including early
-events and start snapshots. Hooks and MCP elicitation without a turn ID
-conservatively block replay in the active thread.
+tool execution and automatic context compaction), MCP elicitation requests, or
+hook activity, including early events and start snapshots. Correlated legacy
+`thread/compacted` notifications also count as progress and preserve ownership
+for opt-in recovery after a later overload. Manual compaction cancels recovery.
+Hooks and MCP elicitation without a turn ID conservatively block replay in the
+active thread.
 Other failures and ambiguous request rejections require manual recovery.
 The default behavior covers overload before observable progress; it is not a
 general transaction recovery mechanism.

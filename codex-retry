@@ -400,7 +400,7 @@ proc automatic::server {object} {
         return $visible
     }
     if {[text $object params threadId] ne [field $current threadId]} { return $visible }
-    if {$method in {thread/closed thread/archived thread/deleted thread/reverted thread/compacted
+    if {$method in {thread/closed thread/archived thread/deleted thread/reverted
         thread/settings/updated thread/queue/changed thread/goal/updated thread/goal/cleared
         thread/environment/connected thread/environment/disconnected model/rerouted}} {
         cancel
@@ -432,7 +432,8 @@ proc automatic::server {object} {
             [field $current phase] ni {running overload} || $method ne "turn/completed"} { return $visible }
         completed $turn
     } elseif {[string match "item/*" $method] || [string match "hook/*" $method] || \
-        $method in {turn/plan/updated turn/diff/updated rawResponseItem/completed rawResponse/completed mcpServer/elicitation/request}} {
+        $method in {thread/compacted turn/plan/updated turn/diff/updated
+            rawResponseItem/completed rawResponse/completed mcpServer/elicitation/request}} {
         set turnId [text $object params turnId]
         if {$turnId ne "" && $turnId ne [field $current turnId] && $turnId ne [field $current early] && \
             [dict exists $::retry::finished [list [field $current threadId] $turnId]]} { return $visible }
@@ -1195,6 +1196,15 @@ proc retry::server {json} {
         ($current eq "" || $id ne [field $current rpcId])} { return 1 }
     set message [json::json2dict $json]
     set method [field $message method]
+    # Legacy compaction is turn progress, just like a contextCompaction item.
+    # Require unambiguous IDs even when optional recovery is disabled.
+    if {$method eq "thread/compacted" && ([catch {automatic::decode $json} compacted] || \
+        [automatic::text $compacted params threadId] eq "" || \
+        [automatic::text $compacted params turnId] eq "")} {
+        automatic::cancel
+        reset
+        return 1
+    }
     if {$method in {account/updated account/gatewayOAuth/changed}} { reset }
     set automaticVisible 1
     set automaticValid 0
@@ -1266,7 +1276,7 @@ proc retry::server {json} {
         return $visible
     }
     if {[field $params threadId] ne [dict get $current threadId]} { return $visible }
-    if {$method in {thread/closed thread/archived thread/deleted thread/reverted thread/compacted
+    if {$method in {thread/closed thread/archived thread/deleted thread/reverted
         thread/settings/updated thread/queue/changed thread/goal/updated thread/goal/cleared}} {
         reset
     } elseif {$method eq "turn/started" && $turnId ne "" && \
@@ -1296,7 +1306,7 @@ proc retry::server {json} {
         if {$turnId ne "" && \
             ![dict exists $finished [list [field $params threadId] $turnId]] && \
             ([string match "item/*" $method] || [string match "hook/*" $method] || \
-             $method in {turn/plan/updated turn/diff/updated rawResponseItem/completed
+             $method in {thread/compacted turn/plan/updated turn/diff/updated rawResponseItem/completed
                  rawResponse/completed mcpServer/elicitation/request})} {
             if {![field $current accepted]} {
                 if {$turnId ne "null"} { dict set current observations $turnId activity 1 }
@@ -1313,7 +1323,7 @@ proc retry::server {json} {
             [dict exists $current observations $turnId completion] || \
             ![dict exists $finished [list [field $params threadId] $turnId]]) && \
             ([string match "item/*" $method] || $method in {
-                hook/started hook/completed turn/plan/updated turn/diff/updated
+                thread/compacted hook/started hook/completed turn/plan/updated turn/diff/updated
                 rawResponseItem/completed rawResponse/completed mcpServer/elicitation/request
             })} {
             if {$method in {item/started item/completed} && [field $params item type] eq "userMessage"} {
@@ -1365,9 +1375,6 @@ proc connection {socket type message} {
         switch -- $type {
             connect {
                 set ::client $socket
-                close $::listener
-                unset ::listener
-                foreach pending [array names ::handshakes] { drop_handshake $pending }
             }
             text {
                 set message [resume::client $message]
@@ -1379,6 +1386,91 @@ proc connection {socket type message} {
             error - timeout { error $message }
         }
     } result]} { bgerror $result }
+}
+
+# The native picker opens a temporary client. A separate owned byte tunnel keeps
+# its initialize, RPC IDs and lifetime out of the main TUI's recovery state.
+namespace eval auxiliary {
+    variable clients
+    variable backends
+    variable keys
+}
+
+proc auxiliary::close {socket} {
+    variable clients; variable backends; variable keys
+    if {![info exists clients($socket)]} { return }
+    set channel $clients($socket)
+    unset clients($socket) backends($channel)
+    unset -nocomplain keys($socket)
+    catch {websocket::configure $socket -keepalive 0}
+    catch {websocket::close $socket}
+    catch {::close $socket}
+    close_backend $channel
+}
+
+proc auxiliary::event {socket type message} {
+    variable clients
+    if {![info exists clients($socket)]} { return }
+    if {[catch {
+        switch -- $type {
+            text {
+                set message [json_dump [::huddle::json2huddle $message]]
+                if {[websocket::send $clients($socket) text $message] < 0} { close $socket }
+            }
+            close - disconnect - error - timeout - binary { close $socket }
+        }
+    }]} { close $socket }
+}
+
+proc auxiliary::backend {channel type message} {
+    variable backends
+    if {![info exists backends($channel)]} { return }
+    set socket $backends($channel)
+    if {[catch {
+        switch -- $type {
+            text {
+                ::huddle::json2huddle $message
+                if {[websocket::send $socket text $message] < 0} { close $socket }
+            }
+            close - disconnect - error - timeout - binary { close $socket }
+        }
+    }]} { close $socket }
+}
+
+proc auxiliary::ready {channel ready} {
+    variable backends; variable keys
+    if {![info exists backends($channel)]} { return }
+    set socket $backends($channel)
+    if {!$ready || [catch {
+        websocket::takeover $channel auxiliary::backend 0
+        upgrade_client $socket $keys($socket) auxiliary::event
+        unset keys($socket)
+    }]} { close $socket }
+}
+
+proc auxiliary::open {socket key} {
+    variable clients; variable backends; variable keys
+    if {[catch {
+        # The endpoint credential belongs to the native TUI, not the tunnel.
+        set credential $::env(CODEX_RETRY_TOKEN)
+        unset ::env(CODEX_RETRY_TOKEN)
+        try {
+            set channel [terminal::pipe [concat [list | codex app-server proxy] $::backendOptions \
+                [list 2>@$::diagnostics::writer]] r+]
+        } finally { set ::env(CODEX_RETRY_TOKEN) $credential }
+        set clients($socket) $channel
+        set backends($channel) $socket
+        set keys($socket) $key
+        backend_upgrade $channel auxiliary::ready
+    }]} {
+        if {[info exists clients($socket)]} { close $socket } else { catch {::close $socket} }
+    }
+}
+
+proc upgrade_client {socket key handler} {
+    puts $socket "HTTP/1.1 101 Switching Protocols\nUpgrade: websocket\nConnection: Upgrade\nSec-WebSocket-Accept: $key\n"
+    flush $socket
+    websocket::takeover $socket $handler 1
 }
 
 proc accept {socket address port} {
@@ -1424,19 +1516,19 @@ proc handshake {socket} {
                     dict append headers $key ", $value"
                 } else { dict set headers $key $value }
             }
-            if {$request eq "GET / HTTP/1.1" && ![info exists ::client] && \
+            if {$request eq "GET / HTTP/1.1" && \
                 ![dict exists $headers origin] && \
                 [field $headers authorization] eq "Bearer $::env(CODEX_RETRY_TOKEN)" && \
                 [string tolower [field $headers upgrade]] eq "websocket" && \
                 ![catch {websocket::validate $headers} upgrade]} {
                 set key [websocket::sec-websocket-accept [dict get $upgrade key]]
-                if {[catch {
-                    puts $socket "HTTP/1.1 101 Switching Protocols\nUpgrade: websocket\nConnection: Upgrade\nSec-WebSocket-Accept: $key\n"
-                    flush $socket
-                }]} { drop_handshake $socket; return }
                 after cancel [dict get $::handshakes($socket) timer]
                 unset ::handshakes($socket)
-                websocket::takeover $socket connection 1
+                if {[info exists ::client]} {
+                    auxiliary::open $socket $key
+                } elseif {[catch {upgrade_client $socket $key connection}]} {
+                    catch {close $socket}
+                }
             } else { drop_handshake $socket }
             return
         }
@@ -1529,20 +1621,29 @@ proc cleanup {} {
     catch {close $::listener}
     unset -nocomplain ::listener
     foreach socket [array names ::handshakes] { drop_handshake $socket }
+    foreach socket [array names ::auxiliary::clients] { auxiliary::close $socket }
     catch {close $::client}
     unset -nocomplain ::client
     if {[info exists ::backend]} {
         set channel $::backend
         unset ::backend
-        set children [pid $channel]
-        fileevent $channel readable ""
-        catch {websocket::configure $channel -keepalive 0}
-        terminate $children
-        fconfigure $channel -blocking 1
-        catch {websocket::close $channel}
-        catch {close $channel}
+        close_backend $channel
     }
     diagnostics::finish
+}
+
+proc close_backend {channel} {
+    if {[info exists ::upgrades($channel)]} {
+        after cancel [dict get $::upgrades($channel) timer]
+        unset ::upgrades($channel)
+    }
+    set children [pid $channel]
+    fileevent $channel readable ""
+    catch {websocket::configure $channel -keepalive 0}
+    terminate $children
+    fconfigure $channel -blocking 1
+    catch {websocket::close $channel}
+    catch {close $channel}
 }
 
 # Restore the outer terminal even when the child could not run its exit code.
@@ -1586,52 +1687,69 @@ proc shutdown {status} {
     }
 }
 
-# Only this short-lived starter and the stdio bridge are wrapper children.
+# Only the short-lived starter and the stdio bridges are wrapper children.
 # Codex owns socket selection and the daemon, including after a cold start.
-proc backend_attach {{timeout 10000}} {
+proc backend_upgrade {channel callback {timeout 10000}} {
     # Proxy is a byte tunnel to a WebSocket control socket, not JSONL stdio.
     # Bootstrap HTTP here; Tcllib owns all subsequent framing and UTF-8.
     set random [open /dev/urandom rb]
     set key [binary encode base64 -maxlen 0 [read $random 16]]
     close $random
-    set ::backendAccept [websocket::sec-websocket-accept $key]
-    set ::backendHeaders {}
-    set ::backendHeaderBytes 0
-    set ::backendReady 0
-    fconfigure $::backend -blocking 0 -buffering none -encoding ascii -translation crlf
-    puts $::backend "GET / HTTP/1.1\nHost: localhost\nUpgrade: websocket\nConnection: Upgrade\nSec-WebSocket-Version: 13\nSec-WebSocket-Key: $key\n"
-    fileevent $::backend readable {
-        if {[catch {
-            while {[gets $::backend line] >= 0} {
-                incr ::backendHeaderBytes [expr {[string length $line] + 2}]
-                if {$::backendHeaderBytes > 16384} { error "oversized upgrade" }
-                if {$line eq ""} {
-                    if {![regexp {^HTTP/1\.1 101(?:[ \t].*)?$} [lindex $::backendHeaders 0]]} { error "upgrade rejected" }
-                    set headers {}
-                    foreach line [lrange $::backendHeaders 1 end] {
-                        if {![regexp {^([^:[:space:]]+):[ \t]*(.*)$} $line -> name value]} { error "invalid header" }
-                        set name [string tolower $name]
-                        if {[dict exists $headers $name]} { error "duplicate header" }
-                        dict set headers $name [string trim $value]
-                    }
-                    if {[string tolower [field $headers upgrade]] ne "websocket" || \
-                        ![regexp -nocase {(^|,)\s*upgrade\s*(,|$)} [field $headers connection]] || \
-                        [field $headers sec-websocket-accept] ne $::backendAccept} { error "invalid upgrade" }
-                    set ::backendReady 1
-                    break
+    set ::upgrades($channel) [dict create accept [websocket::sec-websocket-accept $key] \
+        headers {} size 0 callback $callback \
+        timer [after $timeout [list backend_upgraded $channel 0]]]
+    fconfigure $channel -blocking 0 -buffering none -encoding ascii -translation crlf
+    puts $channel "GET / HTTP/1.1\nHost: localhost\nUpgrade: websocket\nConnection: Upgrade\nSec-WebSocket-Version: 13\nSec-WebSocket-Key: $key\n"
+    fileevent $channel readable [list backend_upgrade_read $channel]
+}
+
+proc backend_upgrade_read {channel} {
+    if {![info exists ::upgrades($channel)]} { return }
+    set ready 0
+    if {[catch {
+        while {[gets $channel line] >= 0} {
+            dict incr ::upgrades($channel) size [expr {[string length $line] + 2}]
+            if {[dict get $::upgrades($channel) size] > 16384} { error "oversized upgrade" }
+            if {$line eq ""} {
+                set lines [dict get $::upgrades($channel) headers]
+                if {![regexp {^HTTP/1\.1 101(?:[ \t].*)?$} [lindex $lines 0]]} { error "upgrade rejected" }
+                set headers {}
+                foreach line [lrange $lines 1 end] {
+                    if {![regexp {^([^:[:space:]]+):[ \t]*(.*)$} $line -> name value]} { error "invalid header" }
+                    set name [string tolower $name]
+                    if {[dict exists $headers $name]} { error "duplicate header" }
+                    dict set headers $name [string trim $value]
                 }
-                lappend ::backendHeaders $line
+                if {[string tolower [field $headers upgrade]] ne "websocket" || \
+                    ![regexp -nocase {(^|,)\s*upgrade\s*(,|$)} [field $headers connection]] || \
+                    [field $headers sec-websocket-accept] ne [dict get $::upgrades($channel) accept]} { error "invalid upgrade" }
+                set ready 1
+                break
             }
-            if {[eof $::backend] || $::backendHeaderBytes + [chan pending input $::backend] > 16384} { error "incomplete upgrade" }
-        }]} { set ::backendReady -1 }
-        if {$::backendReady} { fileevent $::backend readable "" }
-    }
-    set deadline [after $timeout {set ::backendReady -1}]
+            dict lappend ::upgrades($channel) headers $line
+            if {[llength [dict get $::upgrades($channel) headers]] > 64} { error "oversized upgrade" }
+        }
+        if {[eof $channel] || [dict get $::upgrades($channel) size] + \
+            [chan pending input $channel] > 16384} { error "incomplete upgrade" }
+    }]} { backend_upgraded $channel 0; return }
+    if {$ready} { backend_upgraded $channel 1 }
+}
+
+proc backend_upgraded {channel ready} {
+    if {![info exists ::upgrades($channel)]} { return }
+    set state $::upgrades($channel)
+    unset ::upgrades($channel)
+    after cancel [dict get $state timer]
+    fileevent $channel readable ""
+    if {$ready} { fconfigure $channel -encoding binary -translation binary }
+    {*}[dict get $state callback] $channel $ready
+}
+
+proc backend_attach {{timeout 10000}} {
+    set ::backendReady 0
+    backend_upgrade $::backend {apply {{channel ready} {set ::backendReady [expr {$ready ? 1 : -1}]}}} $timeout
     vwait ::backendReady
-    after cancel $deadline
-    fileevent $::backend readable ""
     if {$::backendReady != 1} { error "shared app-server WebSocket attachment failed or timed out" }
-    fconfigure $::backend -encoding binary -translation binary
     websocket::takeover $::backend backend_event 0
 }
 
@@ -1744,6 +1862,7 @@ proc main {arguments} {
             [list ::diagnostics::retain "WebSocket $level diagnostic\n"]
     }
     set options [backend_options $arguments]
+    set ::backendOptions $options
     if {[catch {set ::terminal::saved [exec stty -g <@stdin]}]} {
         catch {set ::terminal::saved [exec stty -g < /dev/tty]}
     }
@@ -1766,8 +1885,6 @@ proc main {arguments} {
     fconfigure $::diagnostics::channel -blocking 0 -encoding binary -translation binary
     fileevent $::diagnostics::channel readable diagnostics::drain
     start_backend $options
-    close $::diagnostics::writer
-    set ::diagnostics::writer ""
     # Only the TUI needs the proxy credential.
     set ::env(CODEX_RETRY_TOKEN) $token
     spawn -noecho codex --remote $::presentation::endpoint \
