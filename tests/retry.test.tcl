@@ -5,6 +5,13 @@ set proxyFixture [file normalize [file join [file dirname [info script]] proxy-f
 # Every fake child inherits an empty wrapper configuration, never the user's.
 set configEnvironment [concat [array get env XDG_CONFIG_HOME] [array get env TMPDIR]]
 set configChannel [file tempfile configScratch]
+set unitFailure 0
+set unitPhase 10
+set transportJob ""
+proc transport_output {channel} {
+    puts -nonewline [read $channel]
+    if {[eof $channel]} { fileevent $channel readable "" }
+}
 try {
     close $configChannel
     file delete $configScratch
@@ -928,7 +935,8 @@ foreach source {activation settings} {
     }
 }
 
-# Installed metadata reads neither steer work nor change the selected thread.
+# Installed metadata requests neither steer work nor change the selected thread.
+set metadataSequence 0
 proc metadata_read {method thread} {
     set params [huddle create threadId [huddle string $thread]]
     switch -- $method {
@@ -945,12 +953,16 @@ proc metadata_read {method thread} {
             huddle set params turnId [huddle string fixture-turn]
             huddle set params itemIds [huddle list [huddle string fixture-item]]
         }
+        thread/readState/update {
+            huddle set params expectedRevision [huddle string fixture-revision]
+            huddle set params operation [huddle create type [huddle string read]]
+        }
     }
-    return [json_dump [huddle create id [huddle string metadata-$::autoSequence-$method-$thread] \
+    return [json_dump [huddle create id [huddle string metadata-[incr ::metadataSequence]] \
         method [huddle string $method] params $params]]
 }
 foreach method {thread/queue/list thread/backgroundTerminals/list thread/items/read thread/timeline/list
-    thread/read thread/list thread/loaded/list thread/search thread/searchOccurrences thread/turns/list
+    thread/read thread/readState/update thread/list thread/loaded/list thread/search thread/searchOccurrences thread/turns/list
     thread/items/list thread/goal/get thread/attachment/list thread/attachmentOwner/list thread/realtime/listVoices
     account/read account/rateLimits/read account/usage/read account/workspaceMessages/read account/gatewayOAuth/read} {
     foreach stage {running queued_stop verify} {
@@ -973,6 +985,59 @@ foreach method {thread/queue/list thread/backgroundTerminals/list thread/items/r
         auto_followup
     }
 }
+
+# Native inbox acknowledgements must preserve overload recovery after tool work,
+# including acknowledgement ordering, backoff, and rejected metadata revisions.
+foreach reset {0 1} {
+    foreach follow {0 1} {
+        foreach stage {before_ack completed_before_ack running backoff} {
+            auto_begin $reset $follow [expr {$stage in {running backoff}}]
+            if {$stage in {before_ack completed_before_ack}} { started $autoTurn }
+            user_event item/started {{"type":"commandExecution","id":"read-state-progress"}} $autoTurn
+            if {$stage in {completed_before_ack backoff}} { completed $autoTurn }
+            set previous [list $automatic::current $automatic::selection $automatic::timer \
+                $retry::current $retry::timer $retry::delay $timers]
+            foreach operation {read unread} {
+                foreach thread {t1 metadata-other-thread} {
+                    foreach outcome {success conflict} {
+                        set update [::huddle::json2huddle [metadata_read thread/readState/update $thread]]
+                        huddle set update params operation type [huddle string $operation]
+                        retry::client [json_dump $update]
+                        set response [huddle create id [huddle get $update id]]
+                        if {$outcome eq "conflict"} {
+                            huddle set response error [huddle create code [huddle number -32000] \
+                                message [huddle string "fixture revision conflict"]]
+                        } else {
+                            set firstUnread [huddle null]
+                            if {$operation eq "unread"} { set firstUnread [huddle create type [huddle string threadStart]] }
+                            set readState [huddle create revision [huddle string updated-revision] firstUnread $firstUnread]
+                            huddle set response result [huddle create readState $readState]
+                            retry::server [json_dump [huddle create method [huddle string thread/readState/changed] \
+                                params [huddle create threadId [huddle string $thread] readState $readState]]]
+                        }
+                        check {[retry::server [json_dump $response]] == 1} "inbox metadata reply was hidden"
+                    }
+                }
+            }
+            check {[list $automatic::current $automatic::selection $automatic::timer \
+                $retry::current $retry::timer $retry::delay $timers] eq $previous} \
+                "read/unread metadata or its reply changed partial-work recovery"
+            if {$stage in {before_ack completed_before_ack}} {
+                check {[dict size $timers] == 0} "inbox metadata acknowledged model work"
+                reply $autoId $autoTurn
+            }
+            if {$stage in {before_ack running}} { completed $autoTurn }
+            completed $autoTurn
+            check {[dict size $timers] == $follow && $sent eq ""} "inbox metadata bypassed opt-in or overload backoff"
+            if {$follow} {
+                check {[lindex $delays end] == 5000} "inbox metadata reset overload backoff"
+                fire
+                auto_followup
+                check {[llength $sent] == 1} "inbox metadata duplicated recovery or replayed partial work"
+            }
+        }
+    }
+}
 foreach method {thread/queue/list thread/backgroundTerminals/list thread/items/read thread/timeline/list} {
     auto_backoff
     foreach thread {t1 metadata-other-thread} { retry::client [metadata_read $method $thread] }
@@ -989,12 +1054,22 @@ set pending [dict get $automatic::current opId]
 check {[retry::server [format {{"id":%s,"method":"fixture/question","params":{}}} $pending]] == 1} "a server request sharing an internal ID was hidden"
 auto_reply $exhausted
 check {[field $automatic::current phase] eq "consume_ready"} "a server request consumed an internal reply marker"
-auto_begin 0 1
-set collision [huddle string "$retry::prefix-[expr {$retry::sequence + 1}]"]
-retry::client [json_dump [huddle create id $collision method [huddle string fixture/read] params [huddle create]]]
-completed $autoTurn failed cyberPolicy
-fire
-check {[auto_followup] ne [json_dump $collision]} "automatic request collided with a native ID"
+foreach method {fixture/read thread/readState/update} {
+    auto_begin 0 1 0
+    # Without reservation this ID would be used by the continuation's RPC,
+    # after its freshly generated clientUserMessageId.
+    set collision [huddle string "$retry::prefix-[expr {$retry::sequence + 2}]"]
+    set metadata [::huddle::json2huddle [metadata_read $method t1]]
+    huddle set metadata id $collision
+    retry::client [json_dump $metadata]
+    reply [json_dump $collision] $autoTurn
+    check {![field $automatic::current accepted] && ![field $retry::current accepted] && \
+        [dict size $timers] == 0} "a metadata reply acknowledged model work"
+    reply $autoId $autoTurn
+    completed $autoTurn failed cyberPolicy
+    fire
+    check {[auto_followup] ne [json_dump $collision]} "automatic request collided with a native ID"
+}
 
 # Capacity failures after partial work need a new neutral turn, never a replay.
 foreach reset {0 1} {
@@ -1188,6 +1263,10 @@ foreach delay {5000 10000 20000 40000 80000 160000 320000 640000 1280000 1800000
     completed $turn failed serverOverloaded $items
     completed $turn failed serverOverloaded $items
     check {[dict size $timers] == 1 && [lindex $delays end] == $delay} "mixed overload recovery lost backoff or duplicated its timer"
+    set previous [list $automatic::current $retry::current $retry::delay $timers]
+    foreach thread {t1 metadata-other-thread} { retry::client [metadata_read thread/readState/update $thread] }
+    check {[list $automatic::current $retry::current $retry::delay $timers] eq $previous} \
+        "inbox metadata changed accumulated overload backoff"
     fire
     set id [auto_followup]
     completed $turn failed serverOverloaded $items
@@ -1263,7 +1342,9 @@ foreach reset {0 1} {
             if {$stage ne "awaiting"} { reply $autoId $autoTurn; started $autoTurn }
             if {$stage eq "backoff"} { completed $autoTurn failed serverOverloaded }
             set previous [list $automatic::current $retry::current $retry::delay $timers]
-            retry::client [metadata_read thread/turns/list metadata-other-thread]
+            foreach method {thread/turns/list thread/readState/update} {
+                foreach thread {t1 metadata-other-thread} { retry::client [metadata_read $method $thread] }
+            }
             check {[list $automatic::current $retry::current $retry::delay $timers] eq $previous} "metadata read canceled original work or reset its backoff"
             if {$stage eq "awaiting"} { reply $autoId $autoTurn; started $autoTurn }
             if {$stage ne "backoff"} { completed $autoTurn failed serverOverloaded }
@@ -1336,6 +1417,7 @@ set delays {}
 rename automatic::notify {}
 rename automatic::native_notify automatic::notify
 
+set unitPhase 11
 # Large startup catalogs must not stall keyboard forwarding in the event loop.
 set catalogItem {{"name":"fixture","id":"fixture","nested":{"description":"sample \"text\" {} []","method":"fixture/request","enabled":true,"values":[1,2,3]}}}
 set catalog "{\"id\":99,\"result\":{\"items\":\[[join [lrepeat 30000 $catalogItem] ,]\]}}"
@@ -1454,6 +1536,14 @@ retry::server {{"id":7,"result":{"turn":{"id":"turn1","items":[]}},"id":99}}
 check {![field $retry::current accepted] && [dict size $timers] == 0} "an ambiguous header acknowledged the wrong request"
 reply 7 turn1
 check {[dict size $timers] == 1} "an ambiguous header consumed the matching acknowledgement"
+
+# A catalog-like prefix cannot hide later connection-scoped control activity.
+foreach payload {{{}} {[]} {{"nested":[{"text":"[]{}"}]}} {[{"nested":{"text":"{}[]"}}]}} {
+    begin
+    completed turn1
+    retry::server [format {{"id":99,"result":%s,"method":"account/updated"}} $payload]
+    check {$retry::current eq "" && [dict size $timers] == 0} "a response prefix hid an account change"
+}
 
 # Server requests can share an internal ID; only an actual reply consumes it.
 foreach methodKey {{"method"} {"\u006dethod"}} {
@@ -1826,6 +1916,7 @@ set id [huddle jsondump [huddle get $retried id] "" ""]
 retry::server [format {{"id":%s,"error":{"code":-32000,"message":"rejected"}}} $id]
 check {$retry::current eq "" && [dict size $timers] == 0} "an ambiguous RPC failure was retried"
 
+set unitPhase 12
 set options [list -c {model="fixture with spaces"} --enable feature --disable=other {-ceffort="high"}]
 check {[backend_options [concat {resume --last} $options {-- --remote=prompt -c prompt}]] eq $options} "config extraction crossed the argument boundary or changed values"
 foreach arguments {{--remote ws://invalid} {--remote-auth-token-env=OTHER} {-c} {--enable} {-c |} {--enable >file}} {
@@ -1879,7 +1970,113 @@ check {[resume_arguments {resume --last -c --approve-for-me --yolo}] eq {{resume
 check {[resume_arguments {--yolo -a never}] eq {{--yolo -a never} 0}} "new-session conflicts stopped being native-owned"
 check {[backend_options {resume --last -m --remote -p --config -i -c --cd --enable -- --config=prompt}] eq {}} "backend extraction interpreted another option's value"
 
+# A launch default must respect native values, prompts, errors and saved roots.
+foreach {arguments inject} {
+    {} 1
+    {--yolo {a prompt containing resume, fork and --cd}} 1
+    {-m resume -p fork --config=--cd} 1
+    {-m-Celsewhere -ifork.png --profile=resume} 1
+    {-- resume --cd /prompt/path} 1
+    {{a prompt} resume fork} 1
+    {--model} 1
+    {--unknown-option} 1
+    {--cd} 0
+    {-C} 0
+    {--cd {explicit directory with spaces}} 0
+    {-C {explicit directory with spaces}} 0
+    {{--cd=explicit directory}} 0
+    {{-Cexplicit directory}} 0
+    {{-C=explicit directory}} 0
+    {--cd=} 0
+    {--cd one -C two} 0
+    {{a prompt} --cd elsewhere} 0
+    {resume} 0
+    {resume --last} 0
+    {resume --all} 0
+    {--yolo resume session} 0
+    {-m fixture resume --last --all} 0
+    {fork} 0
+    {fork session} 0
+    {fork --last --all} 0
+} {
+    set expected $arguments
+    set expectedCwd ""
+    if {$inject} {
+        set expected [linsert $arguments 0 --cd [pwd]]
+        set expectedCwd [pwd]
+    }
+    check {[cwd_arguments $arguments] eq $expected} "launch cwd changed native argument boundaries: $arguments"
+    check {$implicitCwd eq $expectedCwd} "launch cwd marker claimed an explicit or saved-session override: $arguments"
+}
+foreach option {-c --config --enable --disable -m --model --local-provider -p --profile
+    -s --sandbox -a --ask-for-approval --add-dir -i --image} {
+    foreach value {resume fork --cd -C --cd=elsewhere -Celsewhere --} {
+        set arguments [list $option $value]
+        check {[cwd_arguments $arguments] eq [linsert $arguments 0 --cd [pwd]]} "launch cwd interpreted an option value: $option $value"
+    }
+}
+set launchDirectory [pwd]
+set launchScript [file normalize [file join [file dirname [info script]] .. codex-retry]]
+set physicalLaunch [file join $configScratch {physical launch}]
+file mkdir $physicalLaunch
+file link -symbolic [file join $configScratch launch-link] $physicalLaunch
+try {
+    cd [file join $configScratch launch-link]
+    # A new wrapper process observes getcwd, rather than Tcl's cached cd path.
+    set probe "set argv0 cwd-launch\n[list source $launchScript]\nputs \[cwd_arguments {}\]"
+    check {[exec [info nameofexecutable] << $probe] eq [list --cd $physicalLaunch]} "launch cwd retained a logical symlink path"
+} finally { cd $launchDirectory }
+
+# Only the wrapper's default may be removed from later session activations.
+foreach arguments [list {} [list --cd [pwd]] [list -C [pwd]] \
+    [list --cd=[pwd]] [list -C[pwd]] {resume --last} {fork --last}] {
+    cwd_arguments $arguments
+    foreach method {thread/resume thread/fork} id {{"cwd-request"} 31} {
+        set json [string map [list @METHOD@ [json::write string $method] @ID@ $id \
+            @CWD@ [json::write string [pwd]]] {
+            { "id":@ID@,"method":@METHOD@,"params":{"threadId":"saved-session",
+              "cwd":@CWD@,"model":"fixture","permissions":null,
+              "settings":{"flag":true,"disabled":false,"count":3,"text":"quoted \" é\n",
+                          "emptyObject":{},"emptyArray":[],"items":[null,1,"one"]}},
+              "metadata":{"cwd":@CWD@} }
+        }]
+        set adapted [cwd_client $json]
+        if {$arguments eq {}} {
+            set object [::huddle::json2huddle $adapted]
+            check {[huddle type $object params cwd] eq "null"} "synthetic cwd leaked into $method"
+            huddle set object params cwd [huddle string [pwd]]
+            check {[huddle equal $object [::huddle::json2huddle $json]]} "cwd filtering changed other fields or JSON types"
+        } else {
+            check {$adapted eq $json} "cwd filtering changed an explicit override or startup resume/fork"
+        }
+    }
+}
+cwd_arguments {}
+foreach params [list {{"threadId":"saved-session"}} {{"cwd":null}} {{"cwd":""}} \
+    {{"cwd":false}} {{"cwd":3}} {{"cwd":{}}} \
+    [json::write object cwd [json::write string "$implicitCwd/elsewhere"]] \
+    [json::write object cwd [json::write string "$implicitCwd/"]] \
+    [json::write object cwd [json::write array [json::write string $implicitCwd]]]] {
+    foreach method {thread/resume thread/fork} {
+        set json [json::write object id 32 method [json::write string $method] params $params]
+        check {[cwd_client $json] eq $json} "cwd filtering changed missing, null, different or non-string cwd"
+    }
+}
+foreach method {thread/start thread/read thread/settings/update turn/start} {
+    set json [json::write object id 33 method [json::write string $method] \
+        params [json::write object cwd [json::write string $implicitCwd]]]
+    check {[cwd_client $json] eq $json} "cwd filtering changed an unrelated request"
+}
+foreach envelope {{{"id":34,"result":{"cwd":@CWD@}}} \
+    {{"id":35,"method":["thread/resume"],"params":{"cwd":@CWD@}}}} {
+    set json [string map [list @CWD@ [json::write string $implicitCwd]] $envelope]
+    check {[cwd_client $json] eq $json} "cwd filtering interpreted a response or untyped method"
+}
+cwd_arguments {resume}
+
 # Recovery requires the newest typed activation reply, independently of retries.
+set transport::reattaching 0
+set transport::unavailable 0
 proc activate {id method {thread t1}} {
     recovery::client [format {{"id":%s,"method":"%s","params":{"threadId":"%s"}}} $id $method $thread]
 }
@@ -2062,6 +2259,8 @@ rename presentation::native_write presentation::write
 set resumeRequest {{"id":31,"method":"thread/resume","params":{"threadId":"t1","approvalPolicy":"on-request","sandbox":"read-only","permissions":null,"config":{"sample":true},"initialTurnsPage":{"limit":3},"optional":null,"empty":[]}}}
 set resumeReply {{"id":31,"result":{"thread":{"id":"t1","turns":[]},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"activePermissionProfile":{"id":"fixture","extends":null}}}}
 proc arm_resume {} {
+    set ::transport::reattaching 0
+    set ::transport::unavailable 0
     retry::reset
     set ::retry::finished {}
     resume::reset
@@ -2188,7 +2387,9 @@ foreach mutation {
 }
 arm_resume
 connection fixture disconnect ""
-check {!$resume::armed && $resume::pending eq ""} "disconnect retained launch YOLO"
+check {!$resume::armed && [string match {*before resume --yolo permissions were confirmed} $resume::failure]} \
+    "disconnect silently discarded unresolved launch YOLO verification"
+resume::reset
 
 arm_resume
 connection fixture text $resumeRequest
@@ -2221,6 +2422,7 @@ rename native_bgerror bgerror
 
 package require websocket
 
+set unitPhase 13
 # A send can remove both channels before Tcllib dispatches another frame.
 rename websocket::send websocket::native_send
 proc websocket::send {socket type message} {
@@ -2248,7 +2450,7 @@ foreach sendMode {failed close disconnect} {
 }
 rename bgerror native_bgerror
 proc bgerror {message} { lappend ::proxyFailures $message; cleanup }
-foreach outcome {confirmed rejected mismatch disconnected-rejection null-method} {
+foreach outcome {confirmed rejected mismatch disconnected-rejection closed-rejection null-method} {
     arm_resume
     recovery::client [resume::client $resumeRequest]
     set sendMode record
@@ -2257,6 +2459,7 @@ foreach outcome {confirmed rejected mismatch disconnected-rejection null-method}
         rejected { set response $rejection }
         mismatch { set response [string map {dangerFullAccess readOnly} $resumeReply] }
         disconnected-rejection { set response $rejection; set sendMode disconnect }
+        closed-rejection { set response $rejection; set sendMode close }
         null-method { set response [string map {{,"result":} {,"method":null,"result":}} $resumeReply] }
     }
     set backend [file tempfile scratch]
@@ -2270,6 +2473,10 @@ foreach outcome {confirmed rejected mismatch disconnected-rejection null-method}
     if {$outcome ni {mismatch null-method}} { set expectedForwarded [list $response] }
     check {$forwarded eq $expectedForwarded} "resume routing altered an authoritative response or exposed unconfirmed success"
     check {[llength $proxyFailures] == ($outcome ne "confirmed")} "resume verification failure did not halt visibly"
+    if {$outcome in {rejected disconnected-rejection closed-rejection}} {
+        check {$proxyFailures eq [list "server rejected resume --yolo: fixture rejection"]} \
+            "frontend closure replaced the authoritative resume rejection"
+    }
     check {$recovery::target eq ($outcome eq "confirmed" ? "t1" : "")} "resume recovery bypassed permission verification or cleanup lost confirmation"
 }
 rename bgerror {}
@@ -2292,27 +2499,31 @@ set protected [list $timers $retry::current $retry::delay $automatic::current \
     $automatic::selection $automatic::live $resume::armed $resume::pending $recovery::target $recovery::yolo]
 set routed {}
 set closedBridges {}
+set client primary-fixture
+set backend primary-bridge
 foreach socket {picker1 picker2} channel {bridge1 bridge2} {
     set auxiliary::clients($socket) $channel
     set auxiliary::backends($channel) $socket
+    set ticket [incr transport::sequence]
+    set auxiliary::tickets($socket) $ticket
     foreach message [list $resumeRequest $request \
         { {"id":7,"method":"thread/list","params":{"searchTerm":"synthetic"}} }] {
-        auxiliary::event $socket text $message
+        auxiliary::event $ticket $socket text $message
     }
     foreach message [list $resumeReply \
         { {"id":7,"error":{"code":-1,"message":"metadata failure"}} } \
         { {"method":"thread/closed","params":{"threadId":"t1"}} }] {
-        auxiliary::backend $channel text $message
+        auxiliary::backend $ticket $channel text $message
     }
     check {[lindex [lindex $routed end] 0] eq $socket} "auxiliary backend reply used another client"
     if {$socket eq "picker1"} {
-        auxiliary::backend $channel timeout ""
+        auxiliary::backend $ticket $channel timeout ""
     } else {
-        auxiliary::event $socket text "invalid JSON"
+        auxiliary::event $ticket $socket text "invalid JSON"
     }
     set before $routed
-    auxiliary::backend $channel text $resumeReply
-    auxiliary::event $socket text $request
+    auxiliary::backend $ticket $channel text $resumeReply
+    auxiliary::event $ticket $socket text $request
     check {$routed eq $before} "retired auxiliary callback forwarded data"
 }
 check {[llength $routed] == 12 && $closedBridges eq {bridge1 bridge2}} "auxiliary routing or local failure cleanup changed"
@@ -2322,6 +2533,7 @@ check {[list $timers $retry::current $retry::delay $automatic::current \
 fire
 check {[huddle get_stripped [::huddle::json2huddle [lindex $sent end]] params input 0 text] eq "continue"} \
     "picker traffic prevented the queued primary continuation"
+unset client backend
 automatic::cancel
 retry::reset
 resume::reset
@@ -2330,6 +2542,151 @@ rename close_backend {}
 rename native_close_backend close_backend
 rename websocket::send {}
 rename websocket::native_send websocket::send
+
+# Physical loss retires the protocol lifetime, preserving only verified advice.
+rename websocket::send websocket::native_send
+rename close_backend native_close_backend
+proc websocket::send {socket type message} { lappend ::routed [list $socket $message]; return 1 }
+proc close_backend {channel} { lappend ::closedBridges $channel }
+set listener [file tempfile listenerPath]
+set client old-client
+set backend old-bridge
+set recovery::target t1
+set recovery::yolo 0
+set oldGeneration $transport::generation
+auto_begin 1 1
+completed $autoTurn failed usageLimitExceeded
+fire
+set staleActions [dict values $timers]
+set staleId [field $automatic::current opId]
+set retry::finished [dict create [list t1 reused-turn] 1]
+set retry::internal [dict create $staleId 1]
+set recovery::seen [dict create 31 1]
+set before [llength $sent]
+transport::lost {shared app-server proxy disconnected}
+check {[info exists listener] && $recovery::target eq "t1" && !$recovery::yolo} \
+    "transport loss destroyed the endpoint or verified session advice"
+check {![info exists client] && ![info exists backend] && [dict size $timers] == 0 && \
+    $retry::current eq "" && $automatic::current eq "" && $retry::finished eq "" && \
+    $retry::internal eq "" && $retry::usedIds eq "" && $automatic::ids eq "" && \
+    $automatic::live eq "" && $automatic::selection eq "" && $recovery::seen eq "" && \
+    $recovery::pending eq ""} "transport retirement retained connection ownership"
+
+# A metadata-only picker can arrive before the new main client. Its replies and
+# even an old callback with a reused channel name cannot select the session.
+set routed {}
+set ticket [incr transport::sequence]
+set auxiliary::clients(picker) picker-bridge
+set auxiliary::backends(picker-bridge) picker
+set auxiliary::tickets(picker) $ticket
+auxiliary::event $ticket picker text {{"id":"initialize","method":"initialize","params":{}}}
+auxiliary::event $ticket picker text {{"id":31,"method":"thread/list","params":{}}}
+check {![info exists client] && $recovery::target eq "t1" && [llength $routed] == 2} \
+    "reconnecting picker became the primary client"
+set mainTicket [incr transport::sequence]
+set auxiliary::clients(new-client) old-bridge
+set auxiliary::backends(old-bridge) new-client
+set auxiliary::tickets(new-client) $mainTicket
+auxiliary::event $mainTicket new-client text $resumeRequest
+check {$client eq "new-client" && $backend eq "old-bridge" && $recovery::target eq "t1"} \
+    "activation did not promote the new bridge or lost verified advice before acknowledgement"
+check {[lindex $sent end] eq $resumeRequest} "reattachment reapplied launch permissions"
+set pending $recovery::pending
+set routedBefore $routed
+backend_event old-bridge text $resumeReply $oldGeneration
+connection new-client text $request $oldGeneration
+foreach action $staleActions { uplevel #0 $action }
+check {$pending eq $recovery::pending && $routed eq $routedBefore && [dict size $timers] == 0} \
+    "old bridge replies or timers crossed protocol lifetimes"
+set nativeReply [string map {never on-request dangerFullAccess readOnly} $resumeReply]
+auxiliary::backend $mainTicket old-bridge text $nativeReply
+check {$recovery::target eq "t1" && !$transport::reattaching && !$transport::unavailable && \
+    !$recovery::yolo && [lindex [lindex $routed end] 0] eq "new-client"} \
+    "reused activation ID failed or native permission changes were overridden"
+check {[llength $sent] == $before + 1} "transport restoration submitted unsolicited work"
+auxiliary::close picker
+
+# Newly submitted work may recover, even when turn and RPC IDs repeat. A stale
+# timer must not operate on that fresh chain, or consume its current timer.
+connection new-client text $request $mainTicket
+reply 7 reused-turn
+completed reused-turn
+set freshTimers $timers
+foreach action $staleActions { uplevel #0 $action }
+transport::dispatch $oldGeneration retry::fire
+check {$timers eq $freshTimers && [dict size $timers] == 1} "stale callback touched fresh recovery"
+fire
+check {[llength $sent] == $before + 3} "fresh post-reconnect overload recovery failed"
+set generated [huddle get_stripped [::huddle::json2huddle [lindex $sent end]] id]
+transport::retire
+connection fresh-client text $request
+reply 7 reused-turn
+completed reused-turn
+fire
+check {[huddle get_stripped [::huddle::json2huddle [lindex $sent end]] id] ne $generated} \
+    "generated request IDs repeated across reconnects"
+transport::retire
+set transport::reattaching 1
+set automatic::flags {auto_reset_limit 0 auto_continue_after_stop 0}
+connection fresh-client text $resumeRequest
+set activeReply [string map [list {"turns":[]} {"turns":[{"id":"foreign-live","status":"inProgress","items":[]}]}] $nativeReply]
+retry::server $activeReply
+connection fresh-client text $request
+reply 7 foreign-live
+completed foreign-live
+check {[dict size $timers] == 0} "reattachment adopted a pre-existing running turn"
+transport::retire
+
+# Promoted picker activations and later primary reconnects share the cwd filter.
+cwd_arguments {}
+set cwdResume [::huddle::json2huddle $resumeRequest]
+huddle set cwdResume params cwd [huddle string $implicitCwd]
+set cwdResume [json_dump $cwdResume]
+set ticket [incr transport::sequence]
+set auxiliary::clients(cwd-client) cwd-bridge
+set auxiliary::backends(cwd-bridge) cwd-client
+set auxiliary::tickets(cwd-client) $ticket
+auxiliary::event $ticket cwd-client text $cwdResume
+check {$client eq "cwd-client" && \
+    [huddle type [::huddle::json2huddle [lindex $sent end]] params cwd] eq "null"} \
+    "picker promotion bypassed the synthetic cwd filter"
+transport::retire
+check {$implicitCwd eq [pwd]} "transport retirement lost the launch cwd marker"
+connection fresh-client text $cwdResume
+check {[huddle type [::huddle::json2huddle [lindex $sent end]] params cwd] eq "null"} \
+    "primary reconnection bypassed the synthetic cwd filter"
+transport::retire
+cwd_arguments {resume}
+
+# Already queued upgrade/handshake callbacks must not close a reused channel.
+set channel [file tempfile callbackPath]
+set ticket [incr transport::sequence]
+set handshakes($channel) [dict create ticket $ticket timer "" lines {} size 0]
+handshake $channel [expr {$ticket - 1}]
+drop_handshake $channel [expr {$ticket - 1}]
+check {![catch {fconfigure $channel}] && [info exists handshakes($channel)]} \
+    "stale frontend handshake closed a new connection"
+drop_handshake $channel
+file delete $callbackPath
+set channel [file tempfile callbackPath]
+set upgrades($channel) [dict create ticket $ticket timer ""]
+backend_upgrade_read $channel [expr {$ticket - 1}]
+backend_upgraded $channel 0 [expr {$ticket - 1}]
+check {![catch {fconfigure $channel}] && [info exists upgrades($channel)]} \
+    "stale backend upgrade touched a new connection"
+unset upgrades($channel)
+close $channel
+file delete $callbackPath
+close $listener
+unset listener
+file delete $listenerPath
+rename close_backend {}
+rename native_close_backend close_backend
+rename websocket::send {}
+rename websocket::native_send websocket::send
+set transport::reattaching 0
+set transport::unavailable 0
+set automatic::flags {auto_reset_limit 0 auto_continue_after_stop 0}
 
 # File-backed requests exercise handshake parsing without opening a listener.
 rename websocket::takeover websocket::native_takeover
@@ -2346,10 +2703,12 @@ proc handshake_fixture {headers} {
         handshake $channel
     } message]
     drop_handshake $channel
+    catch {close $channel}
     file delete $scratch
     if {$failed} { error $message }
     return $::upgraded
 }
+set backend handshake-fixture
 set hadToken [info exists env(CODEX_RETRY_TOKEN)]
 if {$hadToken} { set savedToken $env(CODEX_RETRY_TOKEN) }
 set env(CODEX_RETRY_TOKEN) fixture-token
@@ -2392,6 +2751,14 @@ check {![handshake_fixture [lrange $headers 0 end-1]]} "missing credential was a
 if {$hadToken} { set env(CODEX_RETRY_TOKEN) $savedToken } else { unset env(CODEX_RETRY_TOKEN) }
 rename websocket::takeover {}
 rename websocket::native_takeover websocket::takeover
+unset backend
+
+set unitPhase 14
+# Keep CPU-heavy checks out of the transport cases' fixed deadlines, while
+# overlapping independent four-case batches with the remaining IO/shutdown waits.
+set transportJob [open [list | tclsh [file join [file dirname [info script]] transport.test.tcl] 2>@1] r]
+fconfigure $transportJob -blocking 0
+fileevent $transportJob readable [list transport_output $transportJob]
 
 # A fake backend echoes one frame and ignores graceful termination.
 rename after {}
@@ -2442,6 +2809,8 @@ check {[catch {exec kill -0 $child}]} "backend survived cleanup"
 cleanup
 
 # Cleanup also owns both stderr pipe ends when launching the backend fails.
+set ::diagnostics::tail ""
+set ::diagnostics::truncated 0
 set channels [lsort [chan names]]
 lassign [chan pipe] ::diagnostics::channel ::diagnostics::writer
 fconfigure $::diagnostics::channel -blocking 0 -encoding binary -translation binary
@@ -2453,6 +2822,7 @@ check {[lsort [chan names]] eq $channels} "repeated cleanup leaked a diagnostic 
 check {$::diagnostics::tail eq "STARTUP_PARTIAL"} "cleanup lost partial startup diagnostics"
 set ::diagnostics::tail ""
 
+set unitPhase 15
 # Independent native picker transports, exercised through the real wrapper/PTY.
 set channel [file tempfile scratch]
 close $channel
@@ -2741,6 +3111,7 @@ unset env(PICKER_SCRATCH)
 file delete -force $scratch
 check {!$failed} "native picker fake-process regression failed: $message"
 
+set unitPhase 16
 # Exercise the real main/PTY lifecycle with synchronous forwarding teardown.
 set channel [file tempfile scratch]
 close $channel
@@ -2938,6 +3309,7 @@ proc fixture_line {channel} {
     return $::fixtureLine
 }
 
+set unitPhase 17
 # Exercise launch flag consumption and permission verification over the real proxy.
 set channel [file tempfile scratch]
 close $channel
@@ -3244,8 +3616,8 @@ set resumeDriver {
     }
     exit 0
 }
-# Each case owns its shared fixture, port, PTY, and request log. Collect both
-# drivers before starting another pair so startup/cleanup costs can overlap.
+# Each case owns its shared fixture, port, PTY, and request log. Collect four
+# drivers per batch so independent startup/cleanup costs can overlap.
 proc resume_batch {cases} {
     set failures {}
     foreach case $cases {
@@ -3347,7 +3719,7 @@ set failed [catch {
             port $env(YOLO_FIXTURE_PORT) sharedPid $env(YOLO_FIXTURE_SHARED_PID) \
             logPath $env(YOLO_FIXTURE_LOG) before $before failureText $failureText]
         unset sharedServer
-        if {[llength $jobs] == 2} {
+        if {[llength $jobs] == 4} {
             set batch $jobs
             set jobs {}
             resume_batch $batch
@@ -3368,6 +3740,7 @@ unset -nocomplain env(YOLO_FIXTURE_MODE) env(YOLO_FIXTURE_ENABLED) env(YOLO_FIXT
 file delete -force $scratch
 check {!$failed} "fake resume launch/proxy check failed: $message"
 
+set unitPhase 18
 # Backend diagnostics must never cross the live TUI, including unterminated
 # messages and bursts larger than both a pipe and the retained diagnostic tail.
 set channel [file tempfile scratch]
@@ -3524,7 +3897,7 @@ puts $channel {
             flush stdout
         }
     }
-    proc input {} {
+    proc input {{character ""}} {
         if {$::editorActive} {
             if {[gets stdin line] < 0} { return }
             if {$line ne "edited"} { exit 12 }
@@ -3535,7 +3908,7 @@ puts $channel {
             websocket::send $::socket text {{"id":2,"method":"fixture/ping","params":{}}}
             return
         }
-        set character [read stdin 1]
+        if {$character eq ""} { set character [read stdin 1] }
         if {$character eq "\003" && $::mode in {ctrl-c ctrl-c-isig signal-int}} {
             if {![info exists ::interrupted]} {
                 set ::interrupted 1
@@ -3587,6 +3960,7 @@ puts $channel {
     }
     websocket::open [lindex $argv 1] receive \
         -headers [list Authorization "Bearer $env([lindex $argv 3])"] -timeout 2000
+    # A disconnected client retains its normal keyboard-controlled exit.
     fileevent stdin readable input
     vwait forever
 }
@@ -3632,6 +4006,7 @@ set diagnosticFixture {
 set diagnosticDriver {
     set wrapperSpawn $spawn_id
     set wrapper [exp_pid]
+    close_on_eof -i $wrapperSpawn 0
     set terminalPath $spawn_out(slave,name)
     log_user 0
     match_max 131072
@@ -3733,10 +4108,11 @@ set diagnosticDriver {
             }
         }
         set result [wait -i $wrapperSpawn]
+        close -i $wrapperSpawn
         set expected 7
         switch $mode {
             normal { set expected 0 }
-            backend-eof { set expected 1 }
+            backend-eof { set expected 7 }
             child-death { set expected 137 }
             launchfail - launchfail-closed - missing { set expected 1 }
             signal-term { set expected 143 }
@@ -3864,6 +4240,8 @@ set diagnosticDriver {
                 if {[string is integer -strict $child] && $child > 0} { exec kill -KILL $child }
             }
         }
+        catch {wait -i $wrapperSpawn}
+        catch {close -i $wrapperSpawn}
         set detail [string map [list "\r" {\r} "\n" {\n}] [string range $message 0 1023]]
         puts stderr "diagnostic fixture $mode: $detail"
         exit 1
@@ -3878,7 +4256,7 @@ file mkdir $env(DIAGNOSTIC_EMPTY_PATH)
 set quotedWrapper [file join $scratch {launcher 'with spaces} codex-retry]
 file mkdir [file dirname $quotedWrapper]
 file copy $wrapper $quotedWrapper
-# Every driver owns a distinct PTY and PID files. Run two independent cases at
+# Every driver owns a distinct PTY and PID files. Run four independent cases at
 # a time so repeated forced-shutdown coverage fits the frozen suite deadline.
 proc diagnostic_batch {channels} {
     set failures {}
@@ -3903,7 +4281,7 @@ set failed [catch {
         if {$actualLaunch} { set launch [list $expectedLauncher --yolo] }
         set configuredDriver "set timeout 6\n[list set expectedLauncher $expectedLauncher]\n[list set launcherPath $launchedWrapper]\n[list set actualLaunch $actualLaunch]\n[list cd $scratch]\n[list spawn -noecho {*}$launch]\n$diagnosticDriver"
         lappend jobs [open [list | expect -c $configuredDriver 2>@1] r]
-        if {[llength $jobs] == 2} {
+        if {[llength $jobs] == 4} {
             set batch $jobs
             set jobs {}
             diagnostic_batch $batch
@@ -3919,9 +4297,38 @@ unset -nocomplain env(DIAGNOSTIC_MODE) env(DIAGNOSTIC_PID) env(DIAGNOSTIC_TUI_PI
 file delete -force $scratch
 check {!$failed} "fake backend diagnostic isolation failed: $message"
 
+} on error {message options} {
+    # Preserve failure details and cleanup while exposing the failing group to
+    # launchers that can retain only the process exit status.
+    puts stderr [dict get $options -errorinfo]
+    set unitFailure $unitPhase
 } finally {
+    if {$transportJob ne ""} {
+        # Drain and reap even after a parent assertion fails, before removing
+        # the child's scratch root. Blocking close preserves its exit status.
+        set failed [catch {
+            fileevent $transportJob readable ""
+            fconfigure $transportJob -blocking 1
+            puts -nonewline [read $transportJob]
+        } message]
+        if {$failed} {
+            puts stderr "transport output: $message"
+            if {!$unitFailure} { set unitFailure 19 }
+        }
+        if {[catch {close $transportJob} message options]} {
+            puts stderr "transport regressions: $message"
+            if {!$unitFailure} {
+                set unitFailure 19
+                set code [dict get $options -errorcode]
+                if {[lindex $code 0] eq "CHILDSTATUS" && [lindex $code 2] >= 48 && [lindex $code 2] <= 61} {
+                    set unitFailure [lindex $code 2]
+                }
+            }
+        }
+    }
     unset -nocomplain env(XDG_CONFIG_HOME) env(TMPDIR)
     array set env $configEnvironment
     file delete -force $configScratch
 }
+if {$unitFailure} { exit $unitFailure }
 puts "PASS: structured retries, opt-in recovery, input/settings, backoff, cancellation, progress, IDs, arguments, resume permissions, proxy/PTY forwarding, authentication, and cleanup"

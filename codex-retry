@@ -16,6 +16,18 @@ namespace eval retry {
     variable finished {}
 }
 
+# A transport lifetime owns callbacks, never model work or session settings.
+namespace eval transport {
+    variable sequence 0
+    variable generation 0
+    variable reattaching 0
+    variable unavailable 0
+}
+
+proc transport::dispatch {generation command args} {
+    if {$generation == $::transport::generation} { {*}$command {*}$args }
+}
+
 proc field {value args} {
     if {[catch {dict get $value {*}$args} result]} { return "" }
     return $result
@@ -71,8 +83,7 @@ proc automatic::selected {object thread args} {
 # Activation can attach to work already running in another client. An empty
 # guard value means active work is confirmed but its turn ID is unavailable.
 proc automatic::snapshot {result} {
-    variable live; variable flags
-    if {![dict get $flags auto_reset_limit] && ![dict get $flags auto_continue_after_stop]} { return }
+    variable live
     set thread [text $result thread id]
     if {$thread eq ""} { return }
     set active {}
@@ -93,8 +104,9 @@ proc automatic::snapshot {result} {
 }
 
 proc automatic::read_only {method} {
+    # Read/unread marks affect inbox metadata, never turn input or settings.
     expr {$method in {thread/read thread/list thread/loaded/list thread/search thread/searchOccurrences
-        thread/turns/list thread/items/list thread/items/read thread/timeline/list thread/goal/get
+        thread/readState/update thread/turns/list thread/items/list thread/items/read thread/timeline/list thread/goal/get
         thread/queue/list thread/backgroundTerminals/list thread/attachment/list
         thread/attachmentOwner/list thread/realtime/listVoices account/read account/rateLimits/read
         account/usage/read account/workspaceMessages/read account/gatewayOAuth/read}}
@@ -292,7 +304,7 @@ proc automatic::queue {phase {delay 0}} {
     variable current; variable timer
     after cancel $timer
     dict set current phase $phase
-    set timer [after $delay automatic::advance]
+    set timer [after $delay [list transport::dispatch $::transport::generation automatic::advance]]
 }
 
 proc automatic::completed {turn} {
@@ -463,7 +475,8 @@ proc automatic::rpc {method params phase} {
     dict set current opId $key
     dict set current phase $phase
     if {$phase eq "verify"} { dict set current limitsChanged 0 }
-    set timer [after 10000 [list automatic::stop "account recovery request timed out; its outcome is unknown"]]
+    set timer [after 10000 [list transport::dispatch $::transport::generation \
+        automatic::stop "account recovery request timed out; its outcome is unknown"]]
     backend_send [json_dump [huddle create id $id method [huddle string $method] params $params]]
 }
 
@@ -631,7 +644,7 @@ proc recovery::client {json} {
         set ::automatic::selection {}
         # A pending activation is not proof that either the old or new UI
         # selection is resumable. Only the latest successful reply can select it.
-        set target ""
+        if {!$::transport::reattaching} { set target "" }
         set pending {}
         if {[huddle exists $object id] && [huddle type $object id] in {string number} && \
             [huddle exists $object params] && [huddle type $object params] eq "dict"} {
@@ -706,8 +719,14 @@ proc recovery::server {object message {automaticValid 0}} {
     set id [huddle get_stripped $object result thread id]
     if {$id eq "" || ($expected ne "" && $id ne $expected)} { return }
     if {$automaticValid} { automatic::snapshot [huddle get $object result] }
+    set ::transport::reattaching 0
+    set ::transport::unavailable 0
     if {$ephemeral || [dict exists $deleted $id] || \
-        [field $message result thread ephemeral] eq "true"} { return }
+        [field $message result thread ephemeral] eq "true"} {
+        set target ""
+        set yolo 0
+        return
+    }
     set target $id
     if {$automaticValid} { automatic::selected $object $id result }
     if {![huddle exists $object result approvalPolicy] || \
@@ -1131,7 +1150,7 @@ proc retry::schedule {} {
     if {$timer eq "" && [field $current accepted] && \
         [field $current status] eq "failed" && [field $current overloaded] && \
         ![field $current progress]} {
-        set timer [after $delay retry::fire]
+        set timer [after $delay [list transport::dispatch $::transport::generation retry::fire]]
         set delay [expr {min(1800000, $delay * 2)}]
     }
 }
@@ -1166,9 +1185,10 @@ proc retry::response_id {json} {
     regsub -all {"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4}))*"} $payload 0 structure
     if {[regexp {["\\]} $structure]} { return "" }
     set closing ""
-    foreach span [regexp -all -inline -indices {[][{}]} $structure] {
-        set index [lindex $span 0]
-        set character [string index $structure $index]
+    set delimiters [regexp -all -inline {[][{}]} $structure]
+    set remaining [llength $delimiters]
+    foreach character $delimiters {
+        incr remaining -1
         switch -- $character {
             \{ { append closing \} }
             \[ { append closing \] }
@@ -1176,8 +1196,8 @@ proc retry::response_id {json} {
                 if {$character ne [string index $closing end]} { return "" }
                 set closing [string range $closing 0 end-1]
                 if {$closing eq ""} {
-                    if {[regexp {^[ \t\r\n]*\}[ \t\r\n]*$} \
-                        [string range $structure [expr {$index + 1}] end]]} { return $id }
+                    # Only the response's final brace may follow the payload.
+                    if {$remaining == 1 && [regexp {(?:\}|\])[ \t\r\n]*\}[ \t\r\n]*$} $structure]} { return $id }
                     return ""
                 }
             }
@@ -1208,7 +1228,8 @@ proc retry::server {json} {
     if {$method in {account/updated account/gatewayOAuth/changed}} { reset }
     set automaticVisible 1
     set automaticValid 0
-    if {$::automatic::current ne "" || $::automatic::ids ne "" || \
+    if {$::automatic::current ne "" || $::automatic::ids ne "" || $::automatic::live ne "" || \
+        $::transport::reattaching || \
         [dict get $::automatic::flags auto_reset_limit] || [dict get $::automatic::flags auto_continue_after_stop]} {
         if {[catch {automatic::decode $json} typed]} {
             set ::automatic::selection {}
@@ -1337,13 +1358,49 @@ proc retry::server {json} {
     return $visible
 }
 
+proc transport::retire {} {
+    # Invalidate callbacks before closing channels, which may dispatch EOF again.
+    set ::transport::generation [incr ::transport::sequence]
+    automatic::cancel
+    retry::reset
+    foreach name {usedIds internal finished} { set ::retry::$name {} }
+    foreach name {ids selection live} { set ::automatic::$name {} }
+    foreach name {pending seen deleted} { set ::recovery::$name {} }
+    foreach name {client backend} {
+        if {[info exists ::$name]} {
+            set $name [set ::$name]
+            unset ::$name
+        }
+    }
+    foreach socket [array names ::handshakes] { drop_handshake $socket }
+    foreach socket [array names ::auxiliary::clients] { auxiliary::close $socket }
+    if {[info exists client]} {
+        catch {websocket::configure $client -keepalive 0}
+        catch {websocket::close $client}
+        catch {close $client}
+    }
+    if {[info exists backend]} { close_backend $backend }
+}
+
+proc transport::lost {message} {
+    if {$::resume::armed || $::resume::pending ne ""} {
+        resume::reject "$message before resume --yolo permissions were confirmed"
+    }
+    set ::transport::reattaching 1
+    set ::transport::unavailable 1
+    retire
+    diagnostics::retain "codex-retry: $message; waiting for native TUI reconnection\n"
+}
+
 proc backend_send {json} {
-    if {[websocket::send $::backend text [json_dump [::huddle::json2huddle $json]]] < 0} {
-        error "shared app-server proxy send failed"
+    set json [json_dump [::huddle::json2huddle $json]]
+    if {[catch {websocket::send $::backend text $json} sent] || $sent < 0} {
+        transport::lost "shared app-server proxy send failed"
     }
 }
 
-proc backend_event {channel type json} {
+proc backend_event {channel type json {generation ""}} {
+    if {$generation ne "" && $generation != $::transport::generation} { return }
     if {![info exists ::backend] || $::backend ne $channel} { return }
     if {[catch {
         switch -- $type {
@@ -1351,25 +1408,28 @@ proc backend_event {channel type json} {
                 if {![info exists ::client]} { error "shared app-server sent data before TUI connection" }
                 set visible [retry::server $json]
                 set failure $::resume::failure
-                if {$visible && [websocket::send $::client text $json] < 0} {
+                if {$visible && ([catch {websocket::send $::client text $json} sent] || $sent < 0)} {
                     if {$failure ne ""} { error $failure }
-                    cleanup
+                    transport::lost "native TUI connection closed"
                 }
                 if {$failure ne ""} { error $failure }
             }
             close - disconnect {
-                set ::proxyError 1
-                if {![info exists ::proxyMessage]} { set ::proxyMessage "shared app-server proxy disconnected" }
-                # Release the connection and cancel retries, but let the native
-                # TUI drain its disconnect output through the normal exit path.
-                cleanup
+                # Protocol/size/policy rejection is fatal, not a server restart.
+                if {$type eq "close" && [lindex $json 0] in {1002 1003 1007 1008 1009 1010}} {
+                    error "shared app-server proxy rejected WebSocket protocol ([lindex $json 0])"
+                }
+                transport::lost "shared app-server proxy disconnected"
             }
-            error - timeout - binary { error "shared app-server proxy transport failed" }
+            timeout { transport::lost "shared app-server proxy transport timed out" }
+            error - binary { error "shared app-server proxy transport failed" }
         }
     } message]} { bgerror $message }
 }
 
-proc connection {socket type message} {
+proc connection {socket type message {generation ""}} {
+    if {$generation ne "" && ($generation != $::transport::generation || \
+        ($type ne "connect" && (![info exists ::client] || $socket ne $::client)))} { return }
     # Tcllib logs callback exceptions; make proxy failures terminate visibly.
     if {[catch {
         switch -- $type {
@@ -1377,13 +1437,27 @@ proc connection {socket type message} {
                 set ::client $socket
             }
             text {
+                set message [cwd_client $message]
                 set message [resume::client $message]
                 recovery::client $message
                 retry::client $message
                 backend_send $message
             }
-            disconnect - close { cleanup }
-            error - timeout { error $message }
+            disconnect - close {
+                if {$type eq "close" && [lindex $message 0] in {1002 1003 1007 1008 1009 1010}} {
+                    error "native TUI rejected WebSocket protocol ([lindex $message 0])"
+                }
+                if {$::resume::failure ne ""} {
+                    # The reply dispatcher reports this rejection after forwarding.
+                    transport::retire
+                } elseif {$::resume::armed || $::resume::pending ne ""} {
+                    transport::lost "native TUI connection closed"
+                } else {
+                    set ::transport::reattaching 1
+                    transport::retire
+                }
+            }
+            error - timeout - binary { error "native TUI connection failed" }
         }
     } result]} { bgerror $result }
 }
@@ -1394,26 +1468,52 @@ namespace eval auxiliary {
     variable clients
     variable backends
     variable keys
+    variable tickets
+    variable ids
 }
 
 proc auxiliary::close {socket} {
-    variable clients; variable backends; variable keys
+    variable clients; variable backends; variable keys; variable tickets; variable ids
     if {![info exists clients($socket)]} { return }
     set channel $clients($socket)
     unset clients($socket) backends($channel)
-    unset -nocomplain keys($socket)
+    unset -nocomplain keys($socket) tickets($socket) ids($socket)
     catch {websocket::configure $socket -keepalive 0}
     catch {websocket::close $socket}
     catch {::close $socket}
     close_backend $channel
 }
 
-proc auxiliary::event {socket type message} {
-    variable clients
-    if {![info exists clients($socket)]} { return }
+proc auxiliary::event {ticket socket type message} {
+    variable clients; variable backends; variable tickets; variable ids
+    if {$ticket == $::transport::generation && [info exists ::client] && $socket eq $::client} {
+        connection $socket $type $message $ticket
+        return
+    }
+    if {![info exists tickets($socket)] || $tickets($socket) != $ticket} { return }
     if {[catch {
         switch -- $type {
             text {
+                # A reconnecting picker may arrive first. Only a real activation
+                # promotes its already initialized bridge to the primary role.
+                if {![info exists ::client] && ![info exists ::backend]} {
+                    set object [automatic::decode $message]
+                    if {[huddle exists $object id]} {
+                        dict set ids($socket) [json_dump [huddle get $object id]] 1
+                    }
+                    if {[automatic::text $object method] in {thread/start thread/resume thread/fork}} {
+                        if {![huddle exists $object id] || [huddle type $object id] ni {number string} || \
+                            ![automatic::is $object dict params]} { error "invalid thread activation" }
+                        set ::client $socket
+                        set ::backend $clients($socket)
+                        set ::transport::generation $ticket
+                        set ::retry::usedIds $ids($socket)
+                        unset ids($socket)
+                        unset backends($::backend) clients($socket) tickets($socket)
+                        connection $socket text $message $ticket
+                        return
+                    }
+                }
                 set message [json_dump [::huddle::json2huddle $message]]
                 if {[websocket::send $clients($socket) text $message] < 0} { close $socket }
             }
@@ -1422,14 +1522,19 @@ proc auxiliary::event {socket type message} {
     }]} { close $socket }
 }
 
-proc auxiliary::backend {channel type message} {
-    variable backends
-    if {![info exists backends($channel)]} { return }
+proc auxiliary::backend {ticket channel type message} {
+    variable backends; variable tickets
+    if {$ticket == $::transport::generation && [info exists ::backend] && $channel eq $::backend} {
+        backend_event $channel $type $message $ticket
+        return
+    }
+    if {![info exists backends($channel)] || $tickets($backends($channel)) != $ticket} { return }
     set socket $backends($channel)
     if {[catch {
         switch -- $type {
             text {
-                ::huddle::json2huddle $message
+                # Keep large picker replies on the primary envelope fast path.
+                if {[retry::response_id $message] eq ""} { ::huddle::json2huddle $message }
                 if {[websocket::send $socket text $message] < 0} { close $socket }
             }
             close - disconnect - error - timeout - binary { close $socket }
@@ -1437,19 +1542,19 @@ proc auxiliary::backend {channel type message} {
     }]} { close $socket }
 }
 
-proc auxiliary::ready {channel ready} {
-    variable backends; variable keys
-    if {![info exists backends($channel)]} { return }
+proc auxiliary::ready {ticket channel ready} {
+    variable backends; variable keys; variable tickets
+    if {![info exists backends($channel)] || $tickets($backends($channel)) != $ticket} { return }
     set socket $backends($channel)
     if {!$ready || [catch {
-        websocket::takeover $channel auxiliary::backend 0
-        upgrade_client $socket $keys($socket) auxiliary::event
+        websocket::takeover $channel [list auxiliary::backend $ticket] 0
+        upgrade_client $socket $keys($socket) [list auxiliary::event $ticket]
         unset keys($socket)
     }]} { close $socket }
 }
 
 proc auxiliary::open {socket key} {
-    variable clients; variable backends; variable keys
+    variable clients; variable backends; variable keys; variable tickets
     if {[catch {
         # The endpoint credential belongs to the native TUI, not the tunnel.
         set credential $::env(CODEX_RETRY_TOKEN)
@@ -1461,7 +1566,8 @@ proc auxiliary::open {socket key} {
         set clients($socket) $channel
         set backends($channel) $socket
         set keys($socket) $key
-        backend_upgrade $channel auxiliary::ready
+        set tickets($socket) [incr ::transport::sequence]
+        backend_upgrade $channel [list auxiliary::ready $tickets($socket)]
     }]} {
         if {[info exists clients($socket)]} { close $socket } else { catch {::close $socket} }
     }
@@ -1475,20 +1581,23 @@ proc upgrade_client {socket key handler} {
 
 proc accept {socket address port} {
     fconfigure $socket -blocking 0 -buffering line -encoding ascii -translation crlf
-    set ::handshakes($socket) [dict create lines {} size 0 \
-        timer [after 10000 [list drop_handshake $socket]]]
-    fileevent $socket readable [list handshake $socket]
+    set ticket [incr ::transport::sequence]
+    set ::handshakes($socket) [dict create ticket $ticket lines {} size 0 \
+        timer [after 10000 [list drop_handshake $socket $ticket]]]
+    fileevent $socket readable [list handshake $socket $ticket]
 }
 
-proc drop_handshake {socket} {
-    if {[info exists ::handshakes($socket)]} {
-        after cancel [dict get $::handshakes($socket) timer]
-        unset ::handshakes($socket)
-    }
+proc drop_handshake {socket {ticket ""}} {
+    if {![info exists ::handshakes($socket)] || \
+        ($ticket ne "" && [dict get $::handshakes($socket) ticket] != $ticket)} { return }
+    after cancel [dict get $::handshakes($socket) timer]
+    unset ::handshakes($socket)
     catch {close $socket}
 }
 
-proc handshake {socket} {
+proc handshake {socket {ticket ""}} {
+    if {![info exists ::handshakes($socket)] || \
+        ($ticket ne "" && [dict get $::handshakes($socket) ticket] != $ticket)} { return }
     while {1} {
         if {[catch {gets $socket line} count]} { drop_handshake $socket; return }
         if {$count < 0} { break }
@@ -1524,9 +1633,10 @@ proc handshake {socket} {
                 set key [websocket::sec-websocket-accept [dict get $upgrade key]]
                 after cancel [dict get $::handshakes($socket) timer]
                 unset ::handshakes($socket)
-                if {[info exists ::client]} {
+                if {[info exists ::client] || ![info exists ::backend]} {
                     auxiliary::open $socket $key
-                } elseif {[catch {upgrade_client $socket $key connection}]} {
+                } elseif {[catch {upgrade_client $socket $key \
+                    [list transport::dispatch $::transport::generation connection]}]} {
                     catch {close $socket}
                 }
             } else { drop_handshake $socket }
@@ -1614,21 +1724,10 @@ proc terminate {children} {
 }
 
 proc cleanup {} {
-    automatic::cancel
-    set ::automatic::live {}
-    retry::reset
+    transport::retire
     resume::reset
     catch {close $::listener}
     unset -nocomplain ::listener
-    foreach socket [array names ::handshakes] { drop_handshake $socket }
-    foreach socket [array names ::auxiliary::clients] { auxiliary::close $socket }
-    catch {close $::client}
-    unset -nocomplain ::client
-    if {[info exists ::backend]} {
-        set channel $::backend
-        unset ::backend
-        close_backend $channel
-    }
     diagnostics::finish
 }
 
@@ -1637,8 +1736,8 @@ proc close_backend {channel} {
         after cancel [dict get $::upgrades($channel) timer]
         unset ::upgrades($channel)
     }
-    set children [pid $channel]
-    fileevent $channel readable ""
+    if {[catch {pid $channel} children]} { return }
+    catch {fileevent $channel readable ""}
     catch {websocket::configure $channel -keepalive 0}
     terminate $children
     fconfigure $channel -blocking 1
@@ -1695,16 +1794,18 @@ proc backend_upgrade {channel callback {timeout 10000}} {
     set random [open /dev/urandom rb]
     set key [binary encode base64 -maxlen 0 [read $random 16]]
     close $random
-    set ::upgrades($channel) [dict create accept [websocket::sec-websocket-accept $key] \
+    set ticket [incr ::transport::sequence]
+    set ::upgrades($channel) [dict create ticket $ticket accept [websocket::sec-websocket-accept $key] \
         headers {} size 0 callback $callback \
-        timer [after $timeout [list backend_upgraded $channel 0]]]
+        timer [after $timeout [list backend_upgraded $channel 0 $ticket]]]
     fconfigure $channel -blocking 0 -buffering none -encoding ascii -translation crlf
     puts $channel "GET / HTTP/1.1\nHost: localhost\nUpgrade: websocket\nConnection: Upgrade\nSec-WebSocket-Version: 13\nSec-WebSocket-Key: $key\n"
-    fileevent $channel readable [list backend_upgrade_read $channel]
+    fileevent $channel readable [list backend_upgrade_read $channel $ticket]
 }
 
-proc backend_upgrade_read {channel} {
-    if {![info exists ::upgrades($channel)]} { return }
+proc backend_upgrade_read {channel {ticket ""}} {
+    if {![info exists ::upgrades($channel)] || \
+        ($ticket ne "" && [dict get $::upgrades($channel) ticket] != $ticket)} { return }
     set ready 0
     if {[catch {
         while {[gets $channel line] >= 0} {
@@ -1731,12 +1832,13 @@ proc backend_upgrade_read {channel} {
         }
         if {[eof $channel] || [dict get $::upgrades($channel) size] + \
             [chan pending input $channel] > 16384} { error "incomplete upgrade" }
-    }]} { backend_upgraded $channel 0; return }
-    if {$ready} { backend_upgraded $channel 1 }
+    }]} { backend_upgraded $channel 0 $ticket; return }
+    if {$ready} { backend_upgraded $channel 1 $ticket }
 }
 
-proc backend_upgraded {channel ready} {
-    if {![info exists ::upgrades($channel)]} { return }
+proc backend_upgraded {channel ready {ticket ""}} {
+    if {![info exists ::upgrades($channel)] || \
+        ($ticket ne "" && [dict get $::upgrades($channel) ticket] != $ticket)} { return }
     set state $::upgrades($channel)
     unset ::upgrades($channel)
     after cancel [dict get $state timer]
@@ -1750,7 +1852,7 @@ proc backend_attach {{timeout 10000}} {
     backend_upgrade $::backend {apply {{channel ready} {set ::backendReady [expr {$ready ? 1 : -1}]}}} $timeout
     vwait ::backendReady
     if {$::backendReady != 1} { error "shared app-server WebSocket attachment failed or timed out" }
-    websocket::takeover $::backend backend_event 0
+    websocket::takeover $::backend [list transport::dispatch $::transport::generation backend_event] 0
 }
 
 proc start_backend {options} {
@@ -1800,6 +1902,38 @@ proc detached_value {argument} {
         -s --sandbox -a --ask-for-approval -C --cd --add-dir -i --image
         --remote --remote-auth-token-env
     }}]
+}
+
+# This launch-only default outlives transport reconnections of the same TUI.
+set ::implicitCwd ""
+proc cwd_client {json} {
+    if {$::implicitCwd eq ""} { return $json }
+    set object [::huddle::json2huddle $json]
+    if {[automatic::text $object method] in {thread/resume thread/fork} && \
+        [automatic::is $object string params cwd] && \
+        [huddle get_stripped $object params cwd] eq $::implicitCwd} {
+        # Native retains remote --cd across session changes; saved roots must win.
+        huddle set object params cwd [huddle null]
+        return [json_dump $object]
+    }
+    return $json
+}
+
+proc cwd_arguments {arguments} {
+    set ::implicitCwd ""
+    set command ""
+    for {set i 0} {$i < [llength $arguments]} {incr i} {
+        set argument [lindex $arguments $i]
+        if {$argument eq "--"} { break }
+        if {$argument in {-C --cd} || [regexp {^--cd=|^-C.+} $argument]} { return $arguments }
+        if {[detached_value $argument]} { incr i; continue }
+        if {$command eq "" && ![string match -* $argument]} { set command $argument }
+    }
+    # Remote thread/start otherwise inherits the shared daemon's unrelated cwd.
+    # Saved sessions keep native cwd selection, including startup pickers.
+    if {$command in {resume fork}} { return $arguments }
+    set ::implicitCwd [pwd]
+    return [linsert $arguments 0 --cd $::implicitCwd]
 }
 
 proc resume_arguments {arguments} {
@@ -1855,6 +1989,8 @@ proc main {arguments} {
     global spawn_out tuiSpawn
     automatic::configure
     package require websocket
+    # Match Codex's bounded remote frame/message size on every bridge.
+    set ::websocket::WS(maxlength) [expr {128 << 20}]
     # Tcllib's default logger writes to stdout. Retain fixed transport labels,
     # without protocol payloads, until the TUI has released the terminal.
     foreach level [logger::levels] {
@@ -1867,6 +2003,7 @@ proc main {arguments} {
         catch {set ::terminal::saved [exec stty -g < /dev/tty]}
     }
     lassign [resume_arguments $arguments] arguments yolo
+    set arguments [cwd_arguments $arguments]
     resume::reset
     set ::resume::armed $yolo
     set random [open /dev/urandom rb]
@@ -1931,6 +2068,9 @@ proc main {arguments} {
     if {[info exists ::proxyMessage]} { catch {puts stderr "codex-retry: $::proxyMessage"} }
     # Optional guidance must preserve the TUI's exit status even if stderr fails.
     catch {
+        if {$::transport::unavailable} {
+            puts stderr "codex-retry: native reconnection did not restore a selected session."
+        }
         puts stderr "codex-retry: client disconnected; shared server and background work may continue."
         if {!$::presentation::replaced} { puts -nonewline stderr [recovery::advice] }
     }

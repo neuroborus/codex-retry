@@ -43,6 +43,7 @@ namespace eval screen {
     variable saved {0 0}
     variable pending ""
     variable synchronized 0
+    variable frames 0
 }
 proc screen::erase {row first last} {
     variable lines
@@ -55,8 +56,9 @@ proc screen::scroll {count} {
     set lines [concat [lrange $lines $count end] [lrepeat $count $blank]]
 }
 proc screen::csi {parameters command} {
-    variable lines; variable blank; variable x; variable y; variable saved; variable synchronized
+    variable lines; variable blank; variable x; variable y; variable saved; variable synchronized; variable frames
     if {$parameters eq "?2026" && $command in {h l}} {
+        if {$synchronized && $command eq "l"} { incr frames }
         set synchronized [expr {$command eq "h"}]
         return
     }
@@ -165,6 +167,20 @@ proc screen::text {} {
     regsub -all {[ \t\n]} [join $lines \n] {} text
     return $text
 }
+proc screen::composer {draft} {
+    variable lines; variable x; variable y; variable pending; variable synchronized
+    # Retained history cells alone cannot establish that the composer is live.
+    # Wait for a complete redraw with the cursor immediately after its draft.
+    expr {!$synchronized && $pending eq "" && $x >= [string length $draft] &&
+        [string range [lindex $lines $y] [expr {$x - [string length $draft]}] \
+            [expr {$x - 1}]] eq $draft}
+}
+proc screen::cleared {draft column frame} {
+    variable x; variable pending; variable synchronized; variable frames
+    # Ctrl+D needs an empty composer; a delay cannot confirm the preceding clear.
+    expr {!$synchronized && $pending eq "" && $frames > $frame &&
+        $x == $column && [string first $draft [text]] < 0}
+}
 
 # The wrapped run uses the same rejecting backend through a Tcllib bridge in
 # place of `codex app-server proxy`. The actual native TUI still owns both PTY streams.
@@ -192,6 +208,14 @@ set scratch [file normalize [lindex $argv 0]]
 set wrapped [expr {[lindex $argv 1] eq "wrapped"}]
 check {[llength $argv] in {1 2} && [file isdirectory $scratch]} "private fixture directory required"
 if {$wrapped} { set env(PATH) "[file join $scratch bin]:$env(PATH)" }
+set launchRoot [file join $scratch client-launch]
+set serverRoot [file join $scratch server-default]
+set explicitRoot [file join $scratch {explicit directory}]
+set savedRoot [file join $scratch saved-session]
+set pickedRoot [file join $scratch picked-session]
+foreach directory [list $launchRoot $serverRoot $explicitRoot $savedRoot $pickedRoot] {
+    file mkdir $directory
+}
 set threadId 01900000-0000-7000-8000-000000000001
 set turnId 01900000-0000-7000-8000-000000000002
 set random [open /dev/urandom rb]
@@ -209,14 +233,14 @@ set turn [string map [list @ID@ [js $turnId] @ITEM@ $item] {
     {"id":@ID@,"rootTurnId":null,"items":[@ITEM@],"itemsView":"full",
      "status":"completed","error":null,"startedAt":1,"completedAt":1,"durationMs":0}
 }]
-set thread [string map [list @ID@ [js $threadId] @ROOT@ [js $scratch] \
+set thread [string map [list @ID@ [js $threadId] @ROOT@ [js $savedRoot] \
     @PATH@ [js [file join $scratch fake-rollout.jsonl]] @TURN@ $turn] {
     {"id":@ID@,"sessionId":@ID@,"environments":null,"extra":null,
      "forkedFromId":null,"parentThreadId":null,"preview":"Neutral fixture",
      "ephemeral":false,"section":null,"sectionEnteredAt":null,"projectId":null,
      "historyMode":"legacy","modelProvider":"openai","model":"fixture",
      "reasoningEffort":null,"createdAt":1,"updatedAt":1,"recencyAt":null,
-     "status":{"type":"idle"},"path":@PATH@,"cwd":@ROOT@,"cliVersion":"0.163.0",
+     "status":{"type":"idle"},"path":@PATH@,"cwd":@ROOT@,"cliVersion":"0.164.0",
      "originator":"fixture","source":"cli","canAcceptDirectInput":true,
      "threadSource":null,"agentNickname":null,"agentRole":null,"gitInfo":null,
      "name":null,"daybreakEnabled":null,"turns":[@TURN@]}
@@ -224,6 +248,7 @@ set thread [string map [list @ID@ [js $threadId] @ROOT@ [js $scratch] \
 set pickedId 01900000-0000-7000-8000-000000000003
 set pickedTurnId 01900000-0000-7000-8000-000000000005
 set pickedThread [string map [list $threadId $pickedId $turnId $pickedTurnId \
+    [js $savedRoot] [js $pickedRoot] \
     fixture-message picked-message \
     [js [file join $scratch fake-rollout.jsonl]] [js [file join $scratch picked-rollout.jsonl]] \
     {Neutral fixture} {Picker target} \
@@ -265,6 +290,10 @@ proc result_for {method message object} {
         check {$requested in [list $threadId $pickedId $decoyId]} "unrelated session requested"
         if {$method eq "thread/resume"} {
             check {$requested ne $decoyId} "unrelated session requested"
+            foreach key {cwd runtimeWorkspaceRoots model} {
+                check {![huddle exists $object params $key] || \
+                    [huddle type $object params $key] eq "null"} "native session lifecycle was incomplete"
+            }
         }
         if {$requested eq $pickedId} { set thread $pickedThread }
         if {$requested eq $decoyId} { set thread $decoyThread }
@@ -279,7 +308,8 @@ proc result_for {method message object} {
                 codexHome [js $scratch] platformFamily [js unix] platformOs [js linux]]
         }
         thread/resume {
-            return [string map [list @THREAD@ $thread @ROOT@ [js $scratch]] {
+            set root [dict get [json::json2dict $thread] cwd]
+            return [string map [list @THREAD@ $thread @ROOT@ [js $root]] {
                 {"thread":@THREAD@,"model":"fixture","modelProvider":"openai",
                  "serviceTier":null,"disabledPluginIds":[],"cwd":@ROOT@,
                  "runtimeWorkspaceRoots":[],"instructionSources":[],"approvalPolicy":"on-request",
@@ -345,6 +375,8 @@ proc result_for {method message object} {
 
 set methods {}
 set resumed 0
+set reconnectStage initial
+set initializeIds {}
 set disconnected 0
 set exited 0
 set peer ""
@@ -379,6 +411,7 @@ proc connection {socket type text} {
                 if {$method eq "initialize"} {
                     check {[dict get $::peers $socket] eq "connected"} "native metadata handshake was incomplete"
                     dict set ::peers $socket initialize
+                    lappend ::initializeIds [dict get $message id]
                 } else {
                     check {[dict get $::peers $socket] in {initialize initialized}} "native metadata handshake was incomplete"
                 }
@@ -390,15 +423,23 @@ proc connection {socket type text} {
                     id [huddle jsondump $id "" ""] result $result]
                 if {$method eq "thread/resume"} {
                     check {$::peer eq "" || $socket eq $::peer} "native session lifecycle was incomplete"
+                    if {$::reconnectStage eq "waiting"} {
+                        check {[dict get $message params threadId] eq $::pickedId} "unrelated session requested"
+                        check {$::pickerStage eq "picked"} "native session lifecycle was incomplete"
+                        set ::reconnectStage restored
+                        set ::restoreFrame $::screen::frames
+                    } elseif {[dict get $message params threadId] eq $::pickedId} {
+                        check {$::pickerStage eq "selecting"} "native session lifecycle was incomplete"
+                        set ::pickerStage picked
+                    }
                     set ::peer $socket
                     set ::selectedId [dict get $message params threadId]
                     incr ::resumed
                     token_usage
                     control checkpoint name [js resumed]
                     if {$::selectedId eq $::pickedId} {
-                        check {$::pickerStage eq "selecting"} "native session lifecycle was incomplete"
-                        set ::pickerStage picked
                         set ::snapshotAttempts 0
+                        set ::composerAttempts 0
                         set ::snapshotRequested 0
                     }
                 }
@@ -412,7 +453,11 @@ proc connection {socket type text} {
             }
             disconnect {
                 dict unset ::peers $socket
-                if {$socket eq $::peer} { set ::disconnected 1 }
+                if {$socket eq $::peer} {
+                    if {$::reconnectStage eq "waiting"} {
+                        set ::peer ""
+                    } else { set ::disconnected 1 }
+                }
                 if {$socket ne $::peer && $::pickerStage eq "cancelling"} {
                     set ::pickerStage reopen
                     after 100 open_picker
@@ -462,7 +507,7 @@ proc handshake {socket} {
             unset ::pending($socket)
             dict set ::peers $socket connected
             incr ::connections
-            websocket::takeover $socket connection 1
+            websocket::takeover $socket $::nativeHandler 1
             return
         }
         check {![eof $socket] && [dict get $::pending($socket) bytes] + [chan pending input $socket] <= 16384} "incomplete native handshake"
@@ -473,12 +518,19 @@ set output ""
 set quitOffset -1
 set snapshotRequested 0
 set snapshotAttempts 0
+set composerAttempts 0
 set footerRestored 0
 set pickedPresented 0
 set selectedId $threadId
 set pickerStage initial
 proc native_input {bytes} {
     control input data [js [binary encode base64 -maxlen 0 $bytes]]
+}
+proc clear_native {draft} {
+    check {[screen::composer $draft]} "native never entered interactive mode after rendering history"
+    set state [list $draft [expr {$::screen::x - [string length $draft]}] $::screen::frames]
+    native_input "\025"
+    return $state
 }
 proc native_type {text {done {}}} {
     # Picker input must arrive as keystrokes, rather than a single paste event.
@@ -488,8 +540,17 @@ proc native_type {text {done {}}} {
         if {$done ne ""} { after 250 $done }
         return
     }
+    check {![info exists ::typingNext]} "native session lifecycle was incomplete"
     native_input [string index $text 0]
-    after 50 [list native_type [string range $text 1 end] $done]
+    set next [list native_type [string range $text 1 end] $done]
+    if {$::nativeHandler eq "cwd_probe_event"} {
+        after 50 $next
+    } else {
+        # The driver may batch control lines. Start pacing only after it has
+        # written this key to the PTY and acknowledged it with a snapshot.
+        set ::typingNext $next
+        control snapshot
+    }
 }
 proc open_picker {} {
     native_type /resume {native_input "\r"}
@@ -533,13 +594,27 @@ proc observe {event} {
             append ::output $bytes
             check {[string length $::output] <= 262144} "unbounded native presentation"
             screen::feed $bytes
+            if {$::pickerStage eq "opening" && [screen::cleared {*}$::pickerClearState]} {
+                set ::pickerStage cancel
+                open_picker
+            }
             picker_presented
             select_picker
+            if {$::reconnectStage eq "editing" && \
+                [screen::composer RECONNECT_DRAF!]} {
+                set ::reconnectStage clearing
+                token_usage
+                set ::clearState [clear_native RECONNECT_DRAF!]
+            }
+            if {$::reconnectStage eq "clearing" && [screen::cleared {*}$::clearState]} {
+                set ::reconnectStage verified
+                quit_native
+            }
             # A history write can temporarily release the terminal. Its final
             # bytes need not arrive in the same observation as raw-mode reentry.
             set history [screen::text]
             set marker [expr {$::pickerStage eq "picked" ? "FIXTURE_PICKED_END" : "FIXTURE_LIVE_END"}]
-            if {!$::snapshotRequested && $::resumed && \
+            if {!$::snapshotRequested && $::resumed && $::reconnectStage ne "waiting" && \
                 [string first $marker $history] >= 0} {
                 if {$::pickerStage eq "picked"} {
                     check {$::quitOffset < 0} "live history crossed the exit boundary"
@@ -557,6 +632,12 @@ proc observe {event} {
             }
         }
         snapshot {
+            if {[info exists ::typingNext]} {
+                set next $::typingNext
+                unset ::typingNext
+                after 50 $next
+                return
+            }
             if {[dict get $event canonical] || [dict get $event restored]} {
                 check {[incr ::snapshotAttempts] <= 50} "native never entered interactive mode after rendering history"
                 after 10 {control snapshot}
@@ -564,15 +645,69 @@ proc observe {event} {
             }
             check {![dict get $event canonical] && ![dict get $event restored]} "native never entered interactive mode"
             check {$::quitOffset < 0} "duplicate quit request"
+            if {$::wrapped && $::reconnectStage in {draft restored} &&
+                (![screen::composer RECONNECT_DRAFT] ||
+                 ($::reconnectStage eq "restored" && $::screen::frames <= $::restoreFrame))} {
+                # Resume replies, redraws and raw-mode observations arrive on
+                # separate streams. Recheck the composer, including after a
+                # snapshot request made from cells retained across reconnect.
+                check {[incr ::composerAttempts] <= 20} "native never entered interactive mode after rendering history"
+                after 100 {control snapshot}
+                return
+            }
             # Initial replay can replace usage received alongside the resume
             # reply. Publish the same cumulative snapshot once the UI is live,
             # then let its event loop consume it before requesting normal exit.
             if {$::pickerStage eq "initial"} {
-                set ::pickerStage cancel
-                after 100 open_picker
+                if {$::wrapped} {
+                    # The snapshot observes the wrapper's outer PTY. Prove the
+                    # inner TUI accepts edits before sending a picker command.
+                    set ::pickerStage preparing
+                    after 100 {native_type CWD_READY {
+                        set ::pickerStage ready
+                        set ::composerAttempts 0
+                        control snapshot
+                    }}
+                } else {
+                    set ::pickerStage cancel
+                    after 100 open_picker
+                }
+            } elseif {$::pickerStage eq "ready"} {
+                if {![screen::composer CWD_READY]} {
+                    check {[incr ::composerAttempts] <= 20} "native never entered interactive mode after rendering history"
+                    after 100 {control snapshot}
+                    return
+                }
+                set ::pickerStage opening
+                set ::pickerClearState [clear_native CWD_READY]
             } elseif {$::pickerStage eq "picked"} {
-                token_usage
-                after 100 quit_native
+                if {$::wrapped && $::reconnectStage eq "initial"} {
+                    native_type RECONNECT_DRAFT {
+                        set ::reconnectStage draft
+                        set ::snapshotAttempts 0
+                        set ::composerAttempts 0
+                        control snapshot
+                    }
+                } elseif {$::wrapped && $::reconnectStage eq "draft"} {
+                    check {[string first RECONNECT_DRAFT [screen::text]] >= 0} "native session lifecycle was incomplete"
+                    set ::reconnectStage waiting
+                    set ::snapshotRequested 0
+                    set ::snapshotAttempts 0
+                    # Lose only this synthetic server connection after its
+                    # draft is rendered. Reattachment must not submit any work.
+                    # A replacement can resume before the close callback arrives.
+                    set peer $::peer
+                    set ::peer ""
+                    websocket::close $peer 1001
+                } elseif {$::wrapped} {
+                    check {$::reconnectStage eq "restored" &&
+                        [string first RECONNECT_DRAFT [screen::text]] >= 0} "native session lifecycle was incomplete"
+                    set ::reconnectStage editing
+                    native_input "\177!"
+                } else {
+                    token_usage
+                    after 100 quit_native
+                }
             }
         }
         exited {
@@ -589,10 +724,15 @@ proc observe {event} {
 
 proc finish {} {
     if {!$::exited || !$::disconnected || [dict size $::peers] != 0} { return }
-    check {$::resumed == 2 && $::selectedId eq $::pickedId && $::quitOffset >= 0 && $::footerRestored} "native session lifecycle was incomplete"
-    check {$::connections >= 3 && $::pickerLists >= 2 && $::pickerSearches == 1} "native session lifecycle was incomplete"
+    set expectedResumes [expr {$::wrapped ? 3 : 2}]
+    check {$::resumed == $expectedResumes && $::selectedId eq $::pickedId && $::quitOffset >= 0 && $::footerRestored} "native session lifecycle was incomplete"
+    check {$::connections >= ($::wrapped ? 4 : 3) && $::pickerLists >= 2 && $::pickerSearches == 1} "native session lifecycle was incomplete"
     check {[llength [lsearch -all -exact $::methods initialize]] == $::connections && \
         [llength [lsearch -all -exact $::methods initialized]] >= 1} "native metadata handshake was incomplete"
+    if {$::wrapped} {
+        check {$::reconnectStage eq "verified" &&
+            [llength [lsearch -all -exact $::initializeIds initialize]] >= 2} "native metadata handshake was incomplete"
+    }
     set boundary [string last $::disablePaste $::output]
     set enabled [string last $::enablePaste $::output]
     check {$enabled >= 0 && $enabled < $::quitOffset && $boundary >= $::quitOffset && \
@@ -668,11 +808,262 @@ proc read_control {} {
     } message]} { bgerror $message }
 }
 
+# Two short native launches share the rejecting metadata backend. The first
+# starts fresh, selects an unloaded saved session and reconnects; the second
+# proves an explicit path with spaces reaches thread/start unchanged.
+proc cwd_probe_event {socket type text} {
+    if {[catch {
+        if {$type ne "text"} { return }
+        check {[incr ::probeRequests] <= 128} "unbounded native metadata requests"
+        set message [json::json2dict $text]
+        set method [dict get $message method]
+        if {$method eq "initialized"} { return }
+        set object [::huddle::json2huddle $text]
+        if {$method eq "thread/start"} {
+            set root $::serverRoot
+            if {[huddle exists $object params cwd] && [huddle type $object params cwd] eq "string"} {
+                set root [dict get $message params cwd]
+            }
+            check {$::probePhase eq "starting" && \
+                $root eq $::probeRoot} "native session lifecycle was incomplete"
+            if {$::probeExplicit} {
+                set ::probePhase rejected
+                websocket::send $socket text [json::write object \
+                    id [huddle jsondump [huddle get $object id] "" ""] \
+                    error {{"code":-32600,"message":"fixture rejects session creation"}}]
+                return
+            }
+            set result [::huddle::json2huddle [result_for thread/resume \
+                [dict create params [dict create threadId $::threadId]] [huddle create]]]
+            huddle set result cwd [huddle string $root]
+            huddle set result thread cwd [huddle string $root]
+            huddle set result thread turns [huddle list]
+            set result [huddle jsondump $result "" ""]
+            set ::probePhase fresh
+        } else {
+            # result_for is an allowlist: every work API fails before execution.
+            set result [result_for $method $message $object]
+            if {$method eq "config/read"} {
+                # Remote folder consent reads the synthetic server's config.
+                set result [::huddle::json2huddle $result]
+                set projects [huddle create]
+                foreach root [list $::launchRoot $::explicitRoot $::savedRoot $::pickedRoot] {
+                    huddle set projects $root [huddle create trust_level [huddle string trusted]]
+                }
+                huddle set result config projects $projects
+                set result [huddle jsondump $result "" ""]
+            }
+        }
+        websocket::send $socket text [json::write object \
+            id [huddle jsondump [huddle get $object id] "" ""] result $result]
+        if {$method eq "thread/resume"} {
+            check {[dict get $message params threadId] eq $::pickedId && \
+                $::probePhase in {picker reconnecting}} "native session lifecycle was incomplete"
+            set ::selectedId $::pickedId
+            set ::probePhase [expr {$::probePhase eq "picker" ? "picked" : "restored"}]
+            set ::probeResumeFrame $::screen::frames
+            set ::probePeer $socket
+        }
+    } message] == 1} {
+        set ::probeFailure $message
+        set ::probeDone 1
+    }
+}
+proc cwd_probe_output {bytes} {
+    if {[catch {
+        incr ::probeBytes [string length $bytes]
+        check {$::probeBytes <= 262144} "unbounded native presentation"
+        screen::feed $bytes
+        if {$::probePhase eq "starting" && !$::probeTrusted && \
+            [string first Trustthisfolder? [screen::text]] >= 0} {
+            # Consent is limited to the isolated launch roots, before any draft.
+            check {$::probeRoot in [list $::launchRoot $::explicitRoot] && \
+                [file dirname $::probeRoot] eq $::scratch} "private fixture directory required"
+            set ::probeTrusted 1
+            native_input "\r"
+        }
+        # Answer terminal queries, including a query split across PTY reads.
+        append ::probeTail $bytes
+        while {[set query [string first "\033\[6n" $::probeTail]] >= 0} {
+            native_input "\033\[1;1R"
+            set ::probeTail [string range $::probeTail [expr {$query + 4}] end]
+        }
+        set ::probeTail [string range $::probeTail end-2 end]
+        if {$::probePhase eq "fresh" && \
+            [string first client-launch [screen::text]] >= 0} {
+            # Startup can paint the directory before the composer accepts commands.
+            # Confirm an editable draft before opening the picker; never submit it.
+            set ::probePhase ready
+            native_type CWD_READY
+        }
+        if {$::probePhase eq "ready" && [screen::composer CWD_READY]} {
+            set ::probePhase opening
+            set ::probeClearState [clear_native CWD_READY]
+        }
+        if {$::probePhase eq "opening" && [screen::cleared {*}$::probeClearState]} {
+            set ::probePhase picker
+            set ::pickerStage search_ready
+            open_picker
+        }
+        if {$::probePhase eq "picker"} { picker_presented; select_picker }
+        if {$::probePhase in {picked restored} && \
+            $::screen::frames > $::probeResumeFrame && \
+            [string first FIXTURE_PICKED_END [screen::text]] >= 0} {
+            if {$::probePhase eq "picked"} {
+                set ::probePhase reconnecting
+                websocket::close $::probePeer 1001
+            } else {
+                # A history frame can precede raw-mode reentry. Prove the
+                # composer accepts edits, then observe its clear before exit.
+                set ::probePhase finishing
+                native_type CWD_READY
+            }
+        }
+        if {$::probePhase eq "finishing" && [screen::composer CWD_READY]} {
+            set ::probePhase closing
+            set ::probeClearState [clear_native CWD_READY]
+        }
+        if {$::probePhase eq "closing" && [screen::cleared {*}$::probeClearState]} {
+            set ::probePhase done
+            native_input "\004"
+        }
+    } message]} {
+        set ::probeFailure $message
+        set ::probeDone 1
+    }
+}
+proc cwd_probes {} {
+    package require Expect
+    set environment [array get ::env]
+    set directory [pwd]
+    set logging [log_user]
+    log_user 0
+    set ::stty_init {rows 36 columns 180}
+    set native [auto_execok codex]
+    set wrapper [file normalize [file join [file dirname [info script]] .. codex-retry]]
+    set fixture [file normalize [info script]]
+    set bin [file join $::scratch cwd-bin]
+    file mkdir $bin
+    set channel [open [file join $bin codex] w]
+    puts $channel {#!/bin/sh}
+    puts $channel {if [ "$1 $2 $3" = "app-server daemon start" ]; then exit 0; fi}
+    # Shell quoting applies only to fixture-owned executable paths.
+    set fixture "'[string map [list ' {'\''}] $fixture]'"
+    set native "'[string map [list ' {'\''}] [lindex $native 0]]'"
+    set serverDirectory "'[string map [list ' {'\''}] $::serverRoot]'"
+    puts $channel "if \[ \"\$1 \$2\" = \"app-server proxy\" \]; then cd $serverDirectory && exec expect $fixture --backend; exit 1; fi"
+    puts $channel "exec $native \"\$@\""
+    close $channel
+    file attributes [file join $bin codex] -permissions 0700
+    rename native_input control_native_input
+    proc ::native_input {bytes} { send -i $::probeSpawn -- $bytes }
+    try {
+        # Preserve Tcl's special env array trace so children inherit changes.
+        array unset ::env *
+        foreach name {PATH TCLLIBPATH LD_LIBRARY_PATH} {
+            if {[dict exists $environment $name]} { set ::env($name) [dict get $environment $name] }
+        }
+        set ::env(PATH) "$bin:$::env(PATH)"
+        foreach name {HOME CODEX_HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_STATE_HOME TMPDIR} {
+            set ::env($name) [file join $::scratch cwd-home]
+        }
+        file mkdir $::env(HOME)
+        # Trust only fixture-owned roots in this private native configuration.
+        set channel [open [file join $::env(CODEX_HOME) config.toml] w]
+        foreach root [list $::launchRoot $::explicitRoot $::savedRoot $::pickedRoot] {
+            puts $channel [format {[projects.%s]} [js $root]]
+            puts $channel {trust_level = "trusted"}
+        }
+        close $channel
+        check {[exec /usr/bin/printenv HOME CODEX_HOME PATH] eq \
+            "$::env(HOME)\n$::env(CODEX_HOME)\n$::env(PATH)"} "private native environment was not inherited"
+        set ::env(TERM) xterm-256color
+        set ::env(LANG) C.UTF-8
+        set ::env(NATIVE_EXIT_ENDPOINT) $::endpoint
+        set ::env(NATIVE_EXIT_TOKEN) $::token
+        cd $::launchRoot
+        set ::nativeHandler cwd_probe_event
+        foreach ::probeExplicit {0 1} {
+            set ::probeRoot [expr {$::probeExplicit ? $::explicitRoot : $::launchRoot}]
+            set ::probePhase starting
+            set ::probeFailure ""
+            set ::probeTail ""
+            set ::probeTrusted 0
+            set ::probeDone 0
+            set ::probeRequests 0
+            set ::probeBytes 0
+            set arguments {}
+            if {$::probeExplicit} { set arguments [list --cd $::explicitRoot] }
+            set timer [after 8000 {
+                set ::probeFailure "native session lifecycle was incomplete"
+                switch -- $::probePhase {
+                    fresh - ready - opening {
+                        set ::probeFailure "native never entered interactive mode"
+                    }
+                    picker - reconnecting { set ::probeFailure "native exit timeout awaiting thread resume" }
+                    picked - restored - finishing - closing {
+                        set ::probeFailure "native never entered interactive mode after rendering history"
+                    }
+                    rejected - done { set ::probeFailure "native exit timeout awaiting native exit" }
+                }
+                set ::probeDone 1
+            }]
+            spawn -noecho $wrapper {*}$arguments
+            set ::probeSpawn $spawn_id
+            set child [exp_pid]
+            close_on_eof -i $::probeSpawn 0
+            try {
+                fconfigure $::probeSpawn -encoding binary -translation binary
+                expect_background -i $::probeSpawn -re {(?s).+} {
+                    cwd_probe_output $expect_out(0,string)
+                } eof { set ::probeDone 1 }
+                if {!$::probeDone} { vwait ::probeDone }
+                expect_background -i $::probeSpawn
+                check {$::probeFailure eq ""} $::probeFailure
+                check {$::probePhase eq ($::probeExplicit ? "rejected" : "done")} "native session lifecycle was incomplete"
+                set status [wait -i $::probeSpawn]
+                set child ""
+                check {[lindex $status 2] == 0 && [lindex $status 3] == $::probeExplicit} "native normal exit status changed"
+            } finally {
+                after cancel $timer
+                expect_background -i $::probeSpawn
+                if {$child ne ""} {
+                    catch {exec kill -TERM $child}
+                    catch {expect -i $::probeSpawn -timeout 1 eof}
+                    catch {exec kill -KILL $child}
+                    catch {wait -i $::probeSpawn}
+                }
+                catch {close -i $::probeSpawn}
+            }
+        }
+    } finally {
+        cd $directory
+        array unset ::env *
+        array set ::env $environment
+        rename native_input {}
+        rename control_native_input native_input
+        log_user $logging
+        foreach socket [dict keys $::peers] { catch {close $socket} }
+        set ::peers {}
+        set ::connections 0
+        set ::selectedId $::threadId
+        set ::pickerStage initial
+        set ::pickerSearches 0
+        set ::nativeHandler connection
+        namespace eval ::screen {
+            set lines [lrepeat 36 $blank]
+            set x 0; set y 0; set saved {0 0}; set pending ""; set synchronized 0; set frames 0
+        }
+    }
+}
+
 fconfigure stdin -blocking 0 -encoding utf-8 -translation lf
 fconfigure stdout -buffering line -encoding utf-8 -translation lf
 set listener [socket -server accept -myaddr 127.0.0.1 0]
 set endpoint ws://127.0.0.1:[lindex [fconfigure $listener -sockname] 2]/
-fileevent stdin readable read_control
+set nativeHandler connection
 after 20000 {bgerror "native exit characterization timed out"}
+if {$wrapped && [catch {cwd_probes} message]} { bgerror $message }
+fileevent stdin readable read_control
 control launch endpoint [js $endpoint] token [js $token] session [js $threadId]
 vwait forever

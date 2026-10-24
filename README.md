@@ -4,12 +4,13 @@ A Tcl/Expect wrapper that keeps the native Codex TUI and retries confirmed
 model overload through the [App Server protocol](https://learn.chatgpt.com/docs/app-server).
 
 Requires `codex`, `expect`, and Tcllib, with the shared-server commands available
-in Codex CLI 0.163.0.
+in Codex CLI 0.164.0.
 On Debian/Ubuntu, install the Tcl dependencies with `sudo apt install expect tcllib`.
 Run the wrapper with interactive Codex arguments:
 
 ```sh
 ./codex-retry
+./codex-retry --cd "/path/to/my project"
 ./codex-retry resume --last
 ./codex-retry resume SESSION_ID --yolo
 ./codex-retry resume --last --yolo
@@ -43,6 +44,24 @@ reaping the child and restoring the terminal.
 Large unrelated startup replies use their request ID and envelope boundaries
 for routing without decoding the payload, keeping keyboard forwarding responsive.
 Other response layouts use the full JSON parser.
+WebSocket messages are bounded to 128 MiB, matching the native Codex
+remote client, so large session histories can pass through the wrapper.
+A primary backend disconnect cancels all pending retries and automatic recovery,
+retires the lost bridge and connection state, and keeps the private endpoint and
+native TUI alive. The native client's reconnect attempts open fresh owned proxy
+bridges; the wrapper adds no reconnect loop. Temporary picker connections remain
+isolated, including when a picker reconnects first. Only a real thread activation
+selects the replacement primary connection. Reattachment forwards native requests
+and preserves native settings; it never replays interrupted work, submits
+`continue`, resumes a goal, or consumes an account reset. Fresh manually submitted
+work remains eligible for the structured retry rules below.
+
+If a replacement remains unavailable, the TUI retains its draft, keyboard control
+and ordinary exit behavior. Exit diagnostics report an unrestored connection and
+offer the last verified session's resume command. A disconnect before launch
+resume YOLO permissions are confirmed still stops the launch with an error.
+Guarded permission failures and invalid primary JSON or WebSocket protocol
+still stop the wrapper.
 
 Background app-server diagnostics are kept out of the interactive terminal.
 After the TUI exits and releases the terminal, the wrapper prints them to stderr
@@ -80,8 +99,18 @@ your shell, and displaying its value would not restore the closed wrapper endpoi
 
 ## Arguments and compatibility
 
+Fresh launches default to the physical directory where you run the wrapper,
+even when the shared server started elsewhere. The wrapper supplies native
+`--cd` for that default; an explicit `--cd` (`-C`) takes precedence. Ordinary
+`resume` and `fork` launches receive no default override and keep native saved
+session directory selection. On later session selection or reconnection, the
+wrapper clears only its matching automatic default from resume/fork requests,
+so saved session directories still apply. Explicit directory overrides retain
+native behavior.
+
 The wrapper forwards your arguments to the native Codex TUI, preserving quoted
-values, ordering, and argument boundaries, with the resume YOLO exception below.
+values, ordering, and argument boundaries, with that launch default and the
+resume YOLO exception below.
 This includes options such as
 `--model` (`-m`), `--cd` (`-C`), `--profile` (`-p`), `--ask-for-approval` (`-a`),
 `--sandbox` (`-s`), `--image` (`-i`), and `--no-alt-screen`. The installed Codex
@@ -132,6 +161,11 @@ input forwarding, shared-server attachment and ownership, cold startup, terminal
 restoration, and failure without model work. Native connection checks block
 inference and cover TUI initialization and both native and wrapped exits using
 synthetic history, live lookalikes, token totals, terminal restoration and cleanup.
+They inspect outbound session creation for fresh and explicit launch directories
+and protect saved directories during native picker selection and reconnection.
+The wrapped native fixture also replaces a synthetic server connection and checks
+reauthentication, repeated initialization, same-session resume and draft retention,
+with every work request rejected before execution.
 These checks do not verify real stored-session resume behavior or cover every
 Codex flag or subcommand. App Server is experimental, so check compatibility when
 upgrading Codex.
@@ -147,6 +181,9 @@ Retries wait 5, 10, 20, 40 seconds, and so on, capped at 30 minutes, without
 jitter or an attempt limit. Success resets the delay. Duplicate and stale events
 do not schedule extra retries. New submitted input, steering, interruption,
 thread switching, account/auth changes, and disconnection cancel a pending retry.
+Native read/unread acknowledgements (`thread/readState/update`) only change inbox
+metadata and preserve pending retries and opt-in recovery, including after tool
+progress. They do not authorize recovery or acknowledge a model request.
 Conflicting activity in the same thread from another client also cancels replay,
 including settings changes, a different live turn, and additional or changed
 user messages in our turn. Duplicate notifications of our original input remain
