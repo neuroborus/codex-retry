@@ -139,6 +139,175 @@ proc automatic::decode {json} {
     return $object
 }
 
+# One selected goal and one outstanding native metadata request. Retry resets
+# retain the baseline; provenance belongs only to the current request/turn.
+namespace eval goal {
+    variable snapshot ""
+    variable pending {}
+    variable proof {}
+}
+proc goal::forget {{baseline 0}} {
+    variable snapshot; variable pending; variable proof
+    set pending {}
+    set proof {}
+    if {$baseline} { set snapshot "" }
+}
+proc goal::cancel {} {
+    forget 1
+    automatic::cancel
+    retry::reset
+}
+proc goal::owner {} {
+    set current $::retry::current
+    if {[field $current turnId] eq ""} { return "" }
+    return [list [field $current rpcId] [field $current threadId] [field $current turnId]]
+}
+proc goal::identity {value} {
+    if {![automatic::is $value dict] || [automatic::text $value threadId] eq "" || \
+        ![automatic::is $value string objective] || \
+        [automatic::text $value status] ni {active blocked}} { return "" }
+    foreach key {createdAt updatedAt tokensUsed timeUsedSeconds} {
+        if {![automatic::is $value number $key] || \
+            ![regexp {^-?[0-9]+$} [huddle get_stripped $value $key]]} { return "" }
+    }
+    set budget [huddle null]
+    if {[huddle exists $value tokenBudget]} {
+        set budget [huddle get $value tokenBudget]
+        if {[huddle type $budget] ne "null" && \
+            ([huddle type $budget] ne "number" || \
+             ![regexp {^-?[0-9]+$} [huddle get_stripped $budget]])} { return "" }
+    }
+    return [huddle create threadId [huddle get $value threadId] \
+        createdAt [huddle get $value createdAt] objective [huddle get $value objective] tokenBudget $budget]
+}
+proc goal::same {value} {
+    variable snapshot
+    set identity [identity $value]
+    if {$snapshot eq "" || $identity eq "" || ![huddle equal [identity $snapshot] $identity]} { return 0 }
+    foreach key {updatedAt tokensUsed timeUsedSeconds} {
+        if {[huddle get_stripped $value $key] < [huddle get_stripped $snapshot $key]} { return 0 }
+    }
+    return 1
+}
+proc goal::client {object} {
+    variable snapshot; variable pending; variable proof
+    set method [automatic::text $object method]
+    set thread [automatic::text $object params threadId]
+    if {$method ni {thread/goal/get thread/goal/set}} {
+        if {$method eq "turn/start" && $snapshot ne "" && \
+            $thread eq [automatic::text $snapshot threadId]} {
+            forget
+        } elseif {![automatic::read_only $method] && \
+            ([string match "thread/*" $method] || [string match "turn/*" $method] || \
+             [string match "account/*" $method] || \
+             $method in {review/start modelProvider/auth/set modelProvider/auth/clear})} { forget 1 }
+        return 0
+    }
+    if {$thread eq "" || ![automatic::is $object dict params] || \
+        ![huddle exists $object id] || [huddle type $object id] ni {string number}} {
+        if {$method eq "thread/goal/set"} { forget 1 }
+        return 0
+    }
+    set id [json_dump [huddle get $object id]]
+    if {$method eq "thread/goal/get"} {
+        # Foreign reads cannot replace the selected goal or an in-flight mutation.
+        if {($snapshot eq "" || $thread eq [automatic::text $snapshot threadId]) && \
+            ([field $::retry::current threadId] in [list "" $thread]) && \
+            [field $pending method] ne "thread/goal/set" && ![dict exists $::retry::usedIds $id]} {
+            set pending [dict create rpcId $id method $method threadId $thread]
+        }
+        return 0
+    }
+    set owned [owner]
+    if {$snapshot eq "" || $owned eq "" || $thread ne [lindex $owned 1] || \
+        $thread ne [automatic::text $snapshot threadId] || $pending ne "" || \
+        [dict exists $::retry::usedIds $id] || \
+        [automatic::text $object params origin] ne "automatic" || \
+        [automatic::text $object params status] ne "blocked"} { forget 1; return 0 }
+    foreach key [huddle keys [huddle get $object params]] {
+        if {$key ni {threadId origin status objective tokenBudget}} { forget 1; return 0 }
+    }
+    foreach key {objective tokenBudget} {
+        if {[huddle exists $object params $key] && ![automatic::is $object null params $key] && \
+            ![huddle equal [huddle get $object params $key] [huddle get [identity $snapshot] $key]]} {
+            forget 1
+            return 0
+        }
+    }
+    set proof {}
+    set pending [dict create rpcId $id method $method threadId $thread owner $owned]
+    return 1
+}
+proc goal::server {object} {
+    variable snapshot; variable pending; variable proof
+    set method [automatic::text $object method]
+    if {![huddle exists $object method] && [huddle exists $object id] && \
+        [json_dump [huddle get $object id]] eq [field $pending rpcId]} {
+        set request $pending
+        set pending {}
+        if {![huddle exists $object error] && [automatic::is $object dict result goal] && \
+            [automatic::text $object result goal threadId] eq [dict get $request threadId] && \
+            [automatic::text $object result goal status] in {paused usageLimited budgetLimited complete}} {
+            cancel
+            return 0
+        }
+        if {[huddle exists $object error] || ![automatic::is $object dict result goal] || \
+            [identity [huddle get $object result goal]] eq "" || \
+            [automatic::text $object result goal threadId] ne [dict get $request threadId]} {
+            if {[dict get $request method] eq "thread/goal/set" || \
+                ($snapshot ne "" && [automatic::is $object null result goal])} {
+                cancel
+            } else { forget 1 }
+            return 0
+        }
+        set value [huddle get $object result goal]
+        if {[dict get $request method] eq "thread/goal/set"} {
+            if {[owner] ne [dict get $request owner] || ![same $value] || \
+                [automatic::text $value status] ne "blocked"} { cancel; return 0 }
+            set proof [dict create owner [owner] goal $value]
+        } elseif {$snapshot ne "" && ![same $value]} {
+            cancel
+        } elseif {$snapshot ne "" && ![huddle equal $snapshot $value]} {
+            set proof {}
+        }
+        set snapshot $value
+        return 0
+    }
+    if {$method ne "thread/goal/updated"} { return 0 }
+    set thread [automatic::text $object params threadId]
+    if {$thread eq ""} { cancel; return 0 }
+    if {$thread ne [field $::retry::current threadId]} {
+        if {$snapshot ne "" && $thread eq [automatic::text $snapshot threadId]} { forget 1 }
+        return 0
+    }
+    set owned [owner]
+    if {$owned ne "" && ![huddle exists $object id] && [automatic::is $object dict params goal]} {
+        set value [huddle get $object params goal]
+        if {[same $value] && [automatic::text $value threadId] eq $thread} {
+            if {[automatic::is $object string params turnId] && \
+                [automatic::text $object params turnId] eq [lindex $owned 2]} {
+                # Accounting cannot resolve an outstanding native metadata request.
+                if {[field $proof owner] ne $owned || ![huddle equal [dict get $proof goal] $value]} {
+                    set proof {}
+                }
+                set snapshot $value
+                return 1
+            }
+            if {(![huddle exists $object params turnId] || [automatic::is $object null params turnId]) && \
+                [field $proof owner] eq $owned && [huddle equal [dict get $proof goal] $value]} { return 1 }
+        }
+    }
+    cancel
+    return 0
+}
+
+# An unresolved automatic mutation must not outlive backoff and dispatch work.
+proc goal::ready {} {
+    if {[field $::goal::pending method] ne "thread/goal/set"} { return 1 }
+    cancel
+    return 0
+}
+
 proc automatic::configure {} {
     variable flags; variable configWarning
     set flags {auto_reset_limit 0 auto_continue_after_stop 0}
@@ -333,7 +502,7 @@ proc automatic::completed {turn} {
     queue $phase
 }
 
-proc automatic::server {object} {
+proc automatic::server {object {goalMetadata 0}} {
     variable current; variable ids; variable flags; variable live
     set method [text $object method]
     set thread [text $object params threadId]
@@ -412,6 +581,7 @@ proc automatic::server {object} {
         return $visible
     }
     if {[text $object params threadId] ne [field $current threadId]} { return $visible }
+    if {$method eq "thread/goal/updated" && $goalMetadata} { return $visible }
     if {$method in {thread/closed thread/archived thread/deleted thread/reverted
         thread/settings/updated thread/queue/changed thread/goal/updated thread/goal/cleared
         thread/environment/connected thread/environment/disconnected model/rerouted}} {
@@ -588,6 +758,7 @@ proc automatic::advance {} {
     variable current; variable timer
     set timer ""
     if {$current eq "" || ![field $current accepted]} { return }
+    if {![goal::ready]} { return }
     switch -- [dict get $current phase] {
         read_ready { rpc account/rateLimits/read [huddle create] read }
         consume_ready { rpc account/rateLimitResetCredit/consume [dict get $current redemption] consume }
@@ -999,9 +1170,16 @@ proc retry::client {json {manual 1}} {
     variable current; variable usedIds
     set object [::huddle::json2huddle $json]
     set message [json::json2dict $json]
+    set method [field $message method]
+    set goalMetadata 0
+    if {$method in {thread/goal/get thread/goal/set}} {
+        if {[catch {automatic::decode $json} goalObject]} {
+            goal::forget 1
+        } else { set goalMetadata [goal::client $goalObject] }
+    } else { goal::client $object }
     # Canceling an automatic chain may clear current before steering is recorded.
     set prior $current
-    if {$manual} {
+    if {$manual && !$goalMetadata} {
         if {[dict get $::automatic::flags auto_reset_limit] || \
             [dict get $::automatic::flags auto_continue_after_stop]} {
             if {[catch {automatic::decode $json} typed]} {
@@ -1009,12 +1187,12 @@ proc retry::client {json {manual 1}} {
             } else { automatic::client $typed }
         } else { automatic::client $object }
     }
-    set method [field $message method]
     if {([string match "account/*" $method] && ![automatic::read_only $method]) || \
         $method in {modelProvider/auth/set modelProvider/auth/clear}} { reset }
     if {$method ne "" && [dict exists $message id]} {
         dict set usedIds [json_dump [huddle get $object id]] 1
     }
+    if {$goalMetadata} { return }
     set threadId [field $message params threadId]
     if {$current ne "" && $method ne "" && $threadId ne "" && \
         $threadId ne [field $current threadId] && \
@@ -1160,6 +1338,8 @@ proc retry::fire {} {
     set timer ""
     if {[field $current accepted] ne "1" || [field $current status] ne "failed" || \
         [field $current overloaded] ne "1" || [field $current progress]} { return }
+    if {![goal::ready]} { return }
+    goal::forget
     set request [dict get $current request]
     set previous [dict get $current rpcId]
     set id [next_id]
@@ -1212,10 +1392,39 @@ proc retry::server {json} {
     set id [response_id $json]
     if {$id ne "" && $id ne [field $::resume::pending rpcId] && \
         $id ne [field $::recovery::pending rpcId] && ![dict exists $internal $id] && \
+        $id ne [field $::goal::pending rpcId] && \
         $id ne [field $::automatic::current rpcId] && ![dict exists $::automatic::ids $id] && \
         ($current eq "" || $id ne [field $current rpcId])} { return 1 }
     set message [json::json2dict $json]
+    if {[dict exists $message id]} {
+        set id [json_dump [huddle get [::huddle::json2huddle $json] id]]
+    }
     set method [field $message method]
+    set goalMetadata 0
+    if {$method eq "thread/goal/updated" || \
+        ($id ne "" && $id eq [field $::goal::pending rpcId])} {
+        if {[catch {automatic::decode $json} goalObject]} {
+            goal::cancel
+        } else { set goalMetadata [goal::server $goalObject] }
+    }
+    if {$method in {account/updated account/gatewayOAuth/changed} || \
+        ([field $message params threadId] ne "" && \
+         ([field $message params threadId] eq [field $current threadId] || \
+          ($::goal::snapshot ne "" && [field $message params threadId] eq \
+           [automatic::text $::goal::snapshot threadId])) && \
+         $method in {thread/closed thread/archived thread/deleted thread/reverted thread/settings/updated
+             thread/queue/changed thread/goal/cleared thread/environment/connected
+             thread/environment/disconnected model/rerouted})} { goal::forget 1 }
+    if {$method in {turn/started turn/completed} && \
+        [field $message params threadId] eq [field $current threadId]} {
+        set turn [field $message params turn id]
+        set owned [goal::owner]
+        if {$owned ne "" && $turn ne "" && $turn ne [lindex $owned 2] && \
+            ![dict exists $finished [list [field $current threadId] $turn]]} {
+            goal::forget 1
+        } elseif {$owned ne "" && $turn eq [lindex $owned 2] && $method eq "turn/completed" && \
+            [field $message params turn status] in {completed interrupted}} { goal::forget }
+    }
     # Legacy compaction is turn progress, just like a contextCompaction item.
     # Require unambiguous IDs even when optional recovery is disabled.
     if {$method eq "thread/compacted" && ([catch {automatic::decode $json} compacted] || \
@@ -1240,7 +1449,7 @@ proc retry::server {json} {
             set automaticVisible [expr {![dict exists $::automatic::ids $id]}]
         } else {
             set automaticValid 1
-            set automaticVisible [automatic::server $typed]
+            set automaticVisible [automatic::server $typed $goalMetadata]
         }
     }
     set response [expr {$method eq "" && [dict exists $message id] && \
@@ -1298,7 +1507,8 @@ proc retry::server {json} {
     }
     if {[field $params threadId] ne [dict get $current threadId]} { return $visible }
     if {$method in {thread/closed thread/archived thread/deleted thread/reverted
-        thread/settings/updated thread/queue/changed thread/goal/updated thread/goal/cleared}} {
+        thread/settings/updated thread/queue/changed thread/goal/cleared} || \
+        ($method eq "thread/goal/updated" && !$goalMetadata)} {
         reset
     } elseif {$method eq "turn/started" && $turnId ne "" && \
         $turnId ne [field $current previous] && \
@@ -1363,6 +1573,7 @@ proc transport::retire {} {
     set ::transport::generation [incr ::transport::sequence]
     automatic::cancel
     retry::reset
+    goal::forget 1
     foreach name {usedIds internal finished} { set ::retry::$name {} }
     foreach name {ids selection live} { set ::automatic::$name {} }
     foreach name {pending seen deleted} { set ::recovery::$name {} }

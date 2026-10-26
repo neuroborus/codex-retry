@@ -935,6 +935,495 @@ foreach source {activation settings} {
     }
 }
 
+# Goal accounting and automatic stalls must preserve owned overload recovery.
+set goalSequence 0
+proc goal_fixture {{status active}} {
+    return [huddle create threadId [huddle string t1] objective [huddle string "fixture goal"] \
+        status [huddle string $status] createdAt [huddle number 1] updatedAt [huddle number 2] \
+        tokensUsed [huddle number 12] timeUsedSeconds [huddle number 1] tokenBudget [huddle null]]
+}
+proc goal_read_request_fixture {} {
+    set id [huddle string goal-read-[incr ::goalSequence]]
+    retry::client [json_dump [huddle create id $id method [huddle string thread/goal/get] \
+        params [huddle create threadId [huddle string t1]]]]
+    return $id
+}
+proc goal_read_fixture {{goal ""}} {
+    if {$goal eq ""} { set goal [goal_fixture] }
+    set id [goal_read_request_fixture]
+    check {[retry::server [json_dump [huddle create id $id result [huddle create goal $goal]]]] == 1} \
+        "native goal read reply was hidden"
+    return $id
+}
+proc goal_event {goal turn} {
+    return [json_dump [huddle create method [huddle string thread/goal/updated] \
+        params [huddle create threadId [huddle string t1] turnId $turn goal $goal]]]
+}
+foreach follow {0 1} {
+    foreach progress {0 1} {
+        foreach ordering {before_failure after_failure} {
+            auto_begin 0 $follow
+            goal_read_fixture
+            if {$progress} {
+                user_event item/started {{"type":"commandExecution","id":"goal-progress"}} $autoTurn
+            }
+            if {$ordering eq "before_failure"} {
+                retry::server [goal_event [goal_fixture] [huddle string $autoTurn]]
+            }
+            completed $autoTurn
+            if {$ordering eq "after_failure"} {
+                retry::server [goal_event [goal_fixture blocked] [huddle string $autoTurn]]
+            }
+            set expected [expr {!$progress || $follow}]
+            check {[dict size $timers] == $expected && $sent eq ""} \
+                "owned goal metadata canceled overload recovery or bypassed its opt-in"
+            if {$expected} {
+                check {[lindex $delays end] == 5000} "goal accounting changed overload backoff"
+                fire
+                if {$progress} {
+                    auto_followup
+                } else {
+                    check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                        [huddle get $autoRequest params]]} "goal accounting changed original-input replay"
+                }
+                check {[llength $sent] == 1} "goal accounting duplicated model work"
+            }
+        }
+    }
+}
+foreach ordering {before_failure after_failure} {
+    auto_begin 0 1
+    goal_read_fixture
+    user_event item/started {{"type":"commandExecution","id":"automatic-goal-progress"}} $autoTurn
+    if {$ordering eq "after_failure"} { completed $autoTurn }
+    set id [huddle string goal-stall-[incr goalSequence]]
+    retry::client [json_dump [huddle create id $id method [huddle string thread/goal/set] \
+        params [huddle create threadId [huddle string t1] origin [huddle string automatic] \
+            status [huddle string blocked] objective [huddle null] tokenBudget [huddle null]]]]
+    set goal [goal_fixture blocked]
+    check {[retry::server [json_dump [huddle create id $id result [huddle create goal $goal]]]] == 1} \
+        "native automatic goal acknowledgement was hidden"
+    retry::server [goal_event $goal [huddle null]]
+    retry::server [goal_event $goal [huddle null]]
+    if {$ordering eq "before_failure"} { completed $autoTurn }
+    check {[dict size $timers] == 1 && $sent eq "" && [lindex $delays end] == 5000} \
+        "verified native automatic goal stall canceled overload continuation"
+    fire
+    auto_followup
+    check {[llength $sent] == 1} "automatic goal metadata duplicated continuation"
+}
+
+# A baseline read before manual work survives activation and retry resets.
+automatic::cancel
+retry::reset
+recovery::client {{"id":"goal-activation","method":"thread/resume","params":{"threadId":"t1"}}}
+retry::client {{"id":"goal-activation","method":"thread/resume","params":{"threadId":"t1"}}}
+retry::server {{"id":"goal-activation","result":{"thread":{"id":"t1","status":{"type":"idle"}},"model":"fixture-model","modelProvider":"openai"}}}
+goal_read_fixture
+auto_begin 1 1
+retry::server [goal_event [goal_fixture blocked] [huddle string $autoTurn]]
+completed $autoTurn
+check {[dict size $timers] == 1 && $sent eq ""} "activation-time goal baseline was lost on manual work"
+fire
+check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+    [huddle get $autoRequest params]]} "activation goal accounting changed input or settings"
+
+proc goal_set_fixture {} {
+    return [huddle create id [huddle string goal-set-[incr ::goalSequence]] \
+        method [huddle string thread/goal/set] params [huddle create threadId [huddle string t1] \
+            origin [huddle string automatic] status [huddle string blocked] \
+            objective [huddle null] tokenBudget [huddle null]]]
+}
+proc goal_ack_fixture {request {goal ""}} {
+    if {$goal eq ""} { set goal [goal_fixture blocked] }
+    check {[retry::server [json_dump [huddle create result [huddle create goal $goal] \
+        id [huddle get $request id]]]] == 1} "native goal acknowledgement was hidden or misrouted"
+}
+proc goal_failure_fixture {{progress 1} {follow 1}} {
+    auto_begin 0 $follow
+    goal_read_fixture
+    if {$progress} { user_event item/started {{"type":"commandExecution","id":"goal-tool"}} $::autoTurn }
+    completed $::autoTurn
+}
+proc goal_canceled_fixture {message} {
+    completed $::autoTurn
+    retry::fire
+    automatic::advance
+    check {[dict size $::timers] == 0 && $::sent eq ""} $message
+}
+
+# Accounting may advance, and the native optional budget may be omitted.
+auto_begin 0 0
+set goal [huddle remove [goal_fixture] tokenBudget]
+goal_read_fixture $goal
+huddle set goal updatedAt [huddle number 3]
+huddle set goal tokensUsed [huddle number 20]
+huddle set goal timeUsedSeconds [huddle number 2]
+retry::server [goal_event $goal [huddle string $autoTurn]]
+completed $autoTurn
+check {[dict size $timers] == 1} "owned goal accounting canceled default overload replay"
+fire
+check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+    [huddle get $autoRequest params]]} "goal accounting changed original-input replay"
+retry::client {{"method":"thread/goal/clear","params":{"threadId":"t1"}}}
+
+# Neither foreign read replies nor metadata alone establish a baseline or turn.
+foreach source {missing foreign_id typed_id} {
+    retry::client {{"method":"thread/goal/clear","params":{"threadId":"t1"}}}
+    auto_begin 0 1
+    set readId [huddle number [incr goalSequence]]
+    retry::client [json_dump [huddle create id $readId method [huddle string thread/goal/get] \
+        params [huddle create threadId [huddle string t1]]]]
+    if {$source ne "missing"} {
+        set responseId [huddle string [huddle get_stripped $readId]]
+        if {$source eq "foreign_id"} { set responseId [huddle string foreign-goal-read] }
+        retry::server [json_dump [huddle create id $responseId result [huddle create goal [goal_fixture]]]]
+    }
+    completed $autoTurn
+    retry::server [goal_event [goal_fixture blocked] [huddle string $autoTurn]]
+    goal_canceled_fixture "unverified read reply established a goal baseline"
+}
+
+# Native automatic stalls preserve either replay or opt-in continuation.
+foreach follow {0 1} {
+    foreach progress {0 1} {
+        goal_failure_fixture $progress $follow
+        set goalRequest [goal_set_fixture]
+        retry::client [json_dump $goalRequest]
+        goal_ack_fixture $goalRequest
+        retry::server [goal_event [goal_fixture blocked] [huddle null]]
+        check {[dict size $timers] == (!$progress || $follow) && $sent eq ""} \
+            "automatic goal metadata bypassed flags or lost safe replay"
+        if {[dict size $timers]} {
+            fire
+            if {$progress} { auto_followup } else {
+                check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                    [huddle get $autoRequest params]]} "automatic stall replayed different input or settings"
+            }
+            check {[llength $sent] == 1} "automatic stall duplicated recovery"
+        }
+    }
+}
+
+# Goal metadata cannot replace the acknowledgement of the model request.
+foreach source {correlated native} {
+    auto_begin 0 1 0
+    goal_read_fixture
+    started $autoTurn
+    user_event item/started {{"type":"commandExecution","id":"early-goal-tool"}} $autoTurn
+    if {$source eq "native"} {
+        set goalRequest [goal_set_fixture]
+        retry::client [json_dump $goalRequest]
+        goal_ack_fixture $goalRequest
+        retry::server [goal_event [goal_fixture blocked] [huddle null]]
+    } else { retry::server [goal_event [goal_fixture blocked] [huddle string $autoTurn]] }
+    completed $autoTurn
+    check {[dict size $timers] == 0 && $sent eq ""} "goal metadata acknowledged model work"
+    reply {"foreign-goal-ack"} $autoTurn
+    check {[dict size $timers] == 0} "foreign reply acknowledged goal-preserved work"
+    reply $autoId $autoTurn
+    check {[dict size $timers] == 1} "early goal metadata lost acknowledged overload recovery"
+    fire
+    auto_followup
+}
+
+# Both native numeric and string IDs acknowledge metadata without changing type.
+foreach type {number string} {
+    goal_failure_fixture
+    set goalRequest [goal_set_fixture]
+    huddle set goalRequest id [huddle $type [incr goalSequence]]
+    retry::client [json_dump $goalRequest]
+    goal_ack_fixture $goalRequest
+    # A same-goal read between the acknowledgement and notification is harmless.
+    goal_read_fixture [goal_fixture blocked]
+    retry::server [goal_event [goal_fixture blocked] [huddle string $autoTurn]]
+    retry::server [goal_event [goal_fixture blocked] [huddle null]]
+    check {[dict size $timers] == 1} "typed goal ID or harmless read lost automatic stall recovery"
+    fire
+    auto_followup
+}
+
+# A rejected read stays metadata, but cannot supply a goal preservation baseline.
+goal_failure_fixture
+set readId [huddle string rejected-goal-read]
+retry::client [json_dump [huddle create id $readId method [huddle string thread/goal/get] \
+    params [huddle create threadId [huddle string t1]]]]
+retry::server [json_dump [huddle create id $readId error [huddle create \
+    code [huddle number -32601] message [huddle string unavailable]]]]
+check {[dict size $timers] == 1} "rejected metadata read canceled an independently eligible failure"
+retry::server [goal_event [goal_fixture blocked] [huddle string $autoTurn]]
+goal_canceled_fixture "rejected read authorized goal preservation"
+
+# Correlated goal reads report terminal stops before or after overload completes.
+foreach progress {0 1} {
+    foreach status {paused usageLimited budgetLimited complete} {
+        foreach ordering {before_failure after_failure} {
+            auto_begin 0 1
+            goal_read_fixture
+            if {$progress} { user_event item/started {{"type":"commandExecution","id":"goal-read-stop-tool"}} $autoTurn }
+            if {$ordering eq "after_failure"} { completed $autoTurn }
+            goal_read_fixture [goal_fixture $status]
+            goal_canceled_fixture "terminal goal read allowed overload recovery"
+        }
+    }
+}
+
+# Stale terminal notifications cannot resolve another turn's pending mutation.
+foreach progress {0 1} {
+    foreach status {completed interrupted} {
+        foreach outcome {error unresolved success} {
+            set staleTurn stale-goal-[incr goalSequence]
+            completed $staleTurn $status
+            goal_failure_fixture $progress
+            set goalRequest [goal_set_fixture]
+            retry::client [json_dump $goalRequest]
+            set pendingTimers $timers
+            completed $staleTurn $status
+            check {$timers eq $pendingTimers} "stale completion changed overload backoff"
+            switch -- $outcome {
+                error {
+                    retry::server [json_dump [huddle create id [huddle get $goalRequest id] \
+                        error [huddle create code [huddle number -32602] message [huddle string rejected]]]]
+                    goal_canceled_fixture "stale completion masked a rejected automatic mutation"
+                }
+                unresolved {
+                    fire
+                    goal_canceled_fixture "stale completion erased an unresolved automatic mutation"
+                }
+                success {
+                    goal_ack_fixture $goalRequest
+                    retry::server [goal_event [goal_fixture blocked] [huddle null]]
+                    check {[dict size $timers] == 1} "stale completion lost valid automatic mutation correlation"
+                    fire
+                    if {$progress} { auto_followup } else {
+                        check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                            [huddle get $autoRequest params]]} "stale completion changed original-input replay"
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Owned accounting cannot hide a subsequent correlated read of a changed goal.
+foreach progress {0 1} {
+    foreach {key value} {unchanged null createdAt 9 objective {"changed objective"} tokenBudget 100} {
+        retry::client {{"method":"thread/goal/clear","params":{"threadId":"t1"}}}
+        goal_failure_fixture $progress
+        set readId [goal_read_request_fixture]
+        set goal [goal_fixture]
+        huddle set goal updatedAt [huddle number 3]
+        huddle set goal tokensUsed [huddle number 13]
+        retry::server [goal_event $goal [huddle string $autoTurn]]
+        if {$key ne "unchanged"} { huddle set goal $key [::huddle::json2huddle $value] }
+        check {[retry::server [json_dump [huddle create id $readId result [huddle create goal $goal]]]] == 1} \
+            "interleaved native goal read reply was hidden"
+        if {$key ne "unchanged"} {
+            goal_canceled_fixture "owned accounting masked a conflicting goal read"
+        } else {
+            check {[dict size $timers] == 1} "unchanged interleaved goal read canceled overload recovery"
+            fire
+            if {$progress} { auto_followup } else {
+                check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                    [huddle get $autoRequest params]]} "interleaved goal read changed original-input replay"
+            }
+        }
+    }
+}
+
+# Nullable mutation fields mean unchanged, including a non-null typed budget.
+foreach explicit {0 1} {
+    retry::client {{"method":"thread/goal/clear","params":{"threadId":"t1"}}}
+    auto_begin 0 1
+    set goal [goal_fixture]
+    huddle set goal tokenBudget [huddle number 100]
+    goal_read_fixture $goal
+    completed $autoTurn failed serverOverloaded {[{"type":"commandExecution","id":"budget-tool"}]}
+    set goalRequest [goal_set_fixture]
+    if {$explicit} {
+        huddle set goalRequest params tokenBudget [huddle number 100]
+        huddle set goalRequest params objective [huddle string "fixture goal"]
+    }
+    retry::client [json_dump $goalRequest]
+    huddle set goal status [huddle string blocked]
+    goal_ack_fixture $goalRequest $goal
+    retry::server [goal_event $goal [huddle null]]
+    check {[dict size $timers] == 1} "native nullable fields changed a goal budget"
+    fire
+    auto_followup
+    retry::client {{"method":"thread/goal/clear","params":{"threadId":"t1"}}}
+}
+
+# Same-turn IDs and acknowledged automatic provenance never excuse a real change.
+foreach source {correlated native} {
+    foreach {key value} {
+        threadId {"other"} createdAt 9 objective {"another goal"} tokenBudget 100 tokenBudget {"100"}
+        status {"paused"} status {"usageLimited"} status {"budgetLimited"} status {"complete"}
+        updatedAt 0 tokensUsed 0
+    } {
+        goal_failure_fixture
+        if {$source eq "native"} {
+            set goalRequest [goal_set_fixture]
+            retry::client [json_dump $goalRequest]
+            goal_ack_fixture $goalRequest
+        }
+        set goal [goal_fixture blocked]
+        huddle set goal $key [::huddle::json2huddle $value]
+        set turn [huddle null]
+        if {$source eq "correlated"} { set turn [huddle string $autoTurn] }
+        retry::server [goal_event $goal $turn]
+        goal_canceled_fixture "changed goal metadata preserved recovery"
+    }
+}
+foreach turn [list [huddle null] [huddle string foreign-goal-turn] [huddle number 1]] {
+    goal_failure_fixture
+    retry::server [goal_event [goal_fixture blocked] $turn]
+    goal_canceled_fixture "uncorrelated goal update preserved recovery"
+}
+
+# Automatic origin alone cannot authorize a goal mutation.
+foreach {key value} {
+    origin {"user"} origin null origin {"AUTOMATIC"} origin true
+    status {"paused"} objective {"changed"} tokenBudget 100 tokenBudget {"100"}
+    threadId {"other"}
+} {
+    goal_failure_fixture
+    set goalRequest [goal_set_fixture]
+    huddle set goalRequest params $key [::huddle::json2huddle $value]
+    retry::client [json_dump $goalRequest]
+    goal_ack_fixture $goalRequest
+    retry::server [goal_event [goal_fixture blocked] [huddle null]]
+    goal_canceled_fixture "manual or changed goal request preserved recovery"
+}
+goal_failure_fixture
+set goalRequest [goal_set_fixture]
+set goalRequest [huddle remove $goalRequest params origin]
+retry::client [json_dump $goalRequest]
+goal_ack_fixture $goalRequest
+goal_canceled_fixture "missing goal origin preserved recovery"
+
+# Only the matching typed request ID and a successful same-goal reply prove origin.
+foreach response {error malformed foreign_id numeric_id changed_goal notification_first unresolved reused_id} {
+    goal_failure_fixture
+    set goalRequest [goal_set_fixture]
+    if {$response eq "numeric_id"} { huddle set goalRequest id [huddle number 700001] }
+    if {$response eq "reused_id"} { huddle set goalRequest id [::huddle::json2huddle $autoId] }
+    retry::client [json_dump $goalRequest]
+    switch -- $response {
+        error { retry::server [json_dump [huddle create id [huddle get $goalRequest id] \
+            error [huddle create code [huddle number -32602] message [huddle string rejected]]]] }
+        malformed { retry::server [json_dump [huddle create id [huddle get $goalRequest id] result [huddle create]]] }
+        foreign_id { huddle set goalRequest id [huddle string foreign-goal-response]; goal_ack_fixture $goalRequest }
+        numeric_id { huddle set goalRequest id [huddle string 700001]; goal_ack_fixture $goalRequest }
+        changed_goal {
+            set goal [goal_fixture blocked]
+            huddle set goal objective [huddle string changed]
+            goal_ack_fixture $goalRequest $goal
+        }
+        notification_first {
+            retry::server [goal_event [goal_fixture blocked] [huddle null]]
+            goal_ack_fixture $goalRequest
+        }
+        unresolved { fire }
+        reused_id { goal_ack_fixture $goalRequest }
+    }
+    retry::server [goal_event [goal_fixture blocked] [huddle null]]
+    goal_canceled_fixture "unverified goal acknowledgement authorized recovery"
+}
+
+# A second in-flight mutation is ambiguous; another client's read is harmless.
+foreach concurrent {mutation read} {
+    goal_failure_fixture
+    set goalRequest [goal_set_fixture]
+    retry::client [json_dump $goalRequest]
+    if {$concurrent eq "mutation"} {
+        retry::client [json_dump [goal_set_fixture]]
+    } else {
+        retry::client {{"id":"foreign-goal-get","method":"thread/goal/get","params":{"threadId":"other"}}}
+        retry::server [json_dump [huddle create id [huddle string foreign-goal-get] \
+            result [huddle create goal [goal_fixture]]]]
+    }
+    goal_ack_fixture $goalRequest
+    retry::server [goal_event [goal_fixture blocked] [huddle null]]
+    if {$concurrent eq "mutation"} {
+        goal_canceled_fixture "overlapping goal mutations retained provenance"
+    } else {
+        check {[dict size $timers] == 1} "foreign goal read invalidated automatic stall recovery"
+        fire
+        auto_followup
+    }
+}
+
+# Interleaved owned accounting cannot acknowledge or erase a pending mutation.
+foreach outcome {success error unresolved} {
+    goal_failure_fixture
+    set goalRequest [goal_set_fixture]
+    retry::client [json_dump $goalRequest]
+    retry::server [goal_event [goal_fixture] [huddle string $autoTurn]]
+    switch -- $outcome {
+        success {
+            goal_ack_fixture $goalRequest
+            retry::server [goal_event [goal_fixture blocked] [huddle null]]
+            fire
+            auto_followup
+        }
+        error {
+            retry::server [json_dump [huddle create id [huddle get $goalRequest id] \
+                error [huddle create code [huddle number -32602] message [huddle string rejected]]]]
+            goal_canceled_fixture "owned accounting masked a rejected automatic mutation"
+        }
+        unresolved {
+            fire
+            goal_canceled_fixture "owned accounting acknowledged an unresolved automatic mutation"
+        }
+    }
+}
+
+# An old proof cannot cross another turn, manual context change or disconnection.
+foreach boundary {new_turn foreign_turn settings clear disconnect} {
+    goal_failure_fixture
+    set goalRequest [goal_set_fixture]
+    retry::client [json_dump $goalRequest]
+    goal_ack_fixture $goalRequest
+    retry::server [goal_event [goal_fixture blocked] [huddle null]]
+    switch -- $boundary {
+        new_turn {
+            fire
+            set id [auto_followup]
+            set sent {}
+            reply $id next-goal-turn
+            set autoTurn next-goal-turn
+            completed $autoTurn
+        }
+        foreign_turn { started foreign-goal-turn }
+        settings { retry::client {{"method":"thread/settings/update","params":{"threadId":"t1","model":"changed"}}} }
+        clear { retry::client {{"method":"thread/goal/clear","params":{"threadId":"t1"}}} }
+        disconnect { transport::retire }
+    }
+    goal_ack_fixture $goalRequest
+    retry::server [goal_event [goal_fixture blocked] [huddle null]]
+    goal_canceled_fixture "stale automatic goal proof crossed a context boundary"
+}
+
+# Automatic goal updates retain accumulated overload delay across follow-ups.
+auto_begin 1 1
+goal_read_fixture
+foreach delay {5000 10000 20000} {
+    completed $autoTurn failed serverOverloaded {[{"type":"commandExecution","id":"goal-backoff-tool"}]}
+    set goalRequest [goal_set_fixture]
+    retry::client [json_dump $goalRequest]
+    goal_ack_fixture $goalRequest
+    foreach duplicate {1 2} { retry::server [goal_event [goal_fixture blocked] [huddle null]] }
+    check {[dict size $timers] == 1 && [lindex $delays end] == $delay} "goal lifecycle reset or duplicated overload backoff"
+    fire
+    set id [auto_followup]
+    set autoTurn goal-backoff-$delay
+    reply $id $autoTurn
+}
+completed $autoTurn completed
+check {$retry::delay == 5000 && [dict size $timers] == 0} "goal-preserved recovery failed to reset on success"
+retry::client {{"method":"thread/goal/clear","params":{"threadId":"t1"}}}
+
 # Installed metadata requests neither steer work nor change the selected thread.
 set metadataSequence 0
 proc metadata_read {method thread} {

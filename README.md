@@ -184,6 +184,34 @@ thread switching, account/auth changes, and disconnection cancel a pending retry
 Native read/unread acknowledgements (`thread/readState/update`) only change inbox
 metadata and preserve pending retries and opt-in recovery, including after tool
 progress. They do not authorize recovery or acknowledge a model request.
+
+Goal usage and lifecycle notifications with status `active` or `blocked` can
+also preserve eligibility. The wrapper requires a known goal snapshot from a
+correlated native `thread/goal/get` reply, unchanged thread and creation identity,
+objective and typed token budget, and accounting that has not moved backwards.
+A notification's string `turnId` must match the owned turn. Native automatic
+stalls instead require this client's `thread/goal/set` with
+`origin: "automatic"` and `status: "blocked"`, a successful same-goal reply with
+the matching typed request ID, then an exact matching notification whose
+`turnId` is null or absent. Null or omitted objective/budget mutation fields mean
+unchanged. Duplicate matching notifications preserve the existing timer.
+Native goal requests, replies and notifications pass through unchanged.
+
+The goal snapshot can arrive during activation before manual work and survives
+retry resets. Request provenance expires on new work or context changes; all
+goal tracking is bounded and in memory, and is cleared on disconnection.
+Manual goal changes, pause/clear, changed identity, objective or budget, and
+`paused`, `usageLimited`, `budgetLimited` or `complete` updates cancel recovery.
+Correlated goal reads also cancel on stopped or changed goals, including when
+owned accounting arrives before the read reply. Stale completions from older
+turns preserve pending metadata correlation.
+Goal updates with unknown baselines, foreign/stale IDs or ambiguous provenance cancel it:
+an unscoped notification before its acknowledgement cannot prove automatic
+origin. An automatic mutation still unresolved when backoff expires cancels
+recovery. Goal metadata never acknowledges model work, enables a recovery flag
+or creates recovery without the qualifying completed failure. The wrapper sends
+no goal-resume API call and cannot resume an external Agent Runner run.
+
 Conflicting activity in the same thread from another client also cancels replay,
 including settings changes, a different live turn, and additional or changed
 user messages in our turn. Duplicate notifications of our original input remain
@@ -307,6 +335,8 @@ event fixtures, controlled timers, and a fake backend without model calls or
 waiting through backoff. Fixtures cover opt-in configuration, reset eligibility
 and verification, repeated and mixed-mode continuation, deduplication and
 cancellation, plus warnings and responsive input through fake PTYs.
+Goal fixtures reproduce controlled event sequences and cancellation boundaries;
+they do not replay a historical session stream or exercise live model inference.
 
 Project guidance lives in `AGENTS.md` and `.agents/skills/`; `CLAUDE.md` and
 `.claude/skills` are relative symlinks to those canonical files.
