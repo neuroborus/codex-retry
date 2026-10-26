@@ -132,7 +132,7 @@ foreach reset {0 1} {
 file delete [file join $configScratch codex-retry config.json]
 automatic::configure
 set autoSequence 0
-proc auto_begin {{reset 0} {follow 1} {acknowledge 1}} {
+proc auto_begin {{reset 0} {follow 1} {acknowledge 1} {client ""}} {
     automatic::cancel
     retry::reset
     set ::sent {}
@@ -147,6 +147,7 @@ proc auto_begin {{reset 0} {follow 1} {acknowledge 1}} {
     huddle set ::autoRequest params toolOutput [huddle create text [huddle string old-output]]
     huddle set ::autoRequest params additionalContext [huddle create old [huddle string context]]
     huddle set ::autoRequest params parentTurnId [huddle string old-parent]
+    if {$client ne ""} { huddle set ::autoRequest params clientUserMessageId [huddle string $client] }
     retry::client [json_dump $::autoRequest]
     if {$acknowledge} { reply $::autoId $::autoTurn; started $::autoTurn }
 }
@@ -1164,6 +1165,765 @@ foreach progress {0 1} {
             if {$ordering eq "after_failure"} { completed $autoTurn }
             goal_read_fixture [goal_fixture $status]
             goal_canceled_fixture "terminal goal read allowed overload recovery"
+        }
+    }
+}
+
+# A completed goal observed before fresh manual work is historical metadata.
+# Refreshing that unchanged goal must not cancel a different manually started task.
+proc historical_goal_fixture {{follow 1} {acknowledge 1} {reset 0} {client ""}} {
+    automatic::cancel
+    retry::reset
+    goal::forget 1
+    set ::automatic::live {}
+    goal_read_fixture [goal_fixture complete]
+    auto_begin $reset $follow $acknowledge $client
+}
+foreach follow {0 1} {
+    foreach progress {0 1} {
+        foreach ordering {before_failure after_failure} {
+            historical_goal_fixture $follow
+            if {$progress} {
+                user_event item/started {{"type":"commandExecution","id":"historical-goal-tool"}} $autoTurn
+            }
+            if {$ordering eq "after_failure"} { completed $autoTurn }
+            set previous [list $retry::current $automatic::current $retry::delay $timers $delays]
+            goal_read_fixture [goal_fixture complete]
+            goal_read_fixture [goal_fixture complete]
+            check {[list $retry::current $automatic::current $retry::delay $timers $delays] eq $previous} \
+                "historical goal refresh changed ownership, timer or accumulated backoff"
+            if {$ordering eq "before_failure"} { completed $autoTurn }
+            set expected [expr {!$progress || $follow}]
+            check {[dict size $timers] == $expected && $sent eq ""} \
+                "refreshing a historical completed goal canceled fresh overload recovery"
+            if {$expected} {
+                check {[lindex $delays end] == 5000} "historical goal refresh changed backoff"
+                fire
+                if {$progress} {
+                    auto_followup
+                } else {
+                    check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                        [huddle get $autoRequest params]]} "historical goal refresh changed replay input"
+                }
+                check {[llength $sent] == 1} "historical goal refresh duplicated work"
+            }
+        }
+    }
+}
+
+# Historical reads before acknowledgement cannot acknowledge or complete work.
+foreach progress {0 1} {
+    foreach ordering {before_failure after_failure} {
+        historical_goal_fixture 1 0
+        started $autoTurn
+        if {$progress} { user_event item/started {{"type":"commandExecution","id":"historical-early-tool"}} $autoTurn }
+        if {$ordering eq "after_failure"} { completed $autoTurn }
+        goal_read_fixture [goal_fixture complete]
+        check {[dict size $timers] == 0 && $sent eq ""} "historical metadata acknowledged model work"
+        if {$ordering eq "before_failure"} { completed $autoTurn }
+        reply {"foreign-historical-ack"} $autoTurn
+        check {[dict size $timers] == 0} "foreign reply acknowledged historical-goal work"
+        reply $autoId $autoTurn
+        check {[dict size $timers] == 1} "historical refresh lost recovery after the real acknowledgement"
+        fire
+        if {$progress} { auto_followup }
+        check {[llength $sent] == 1} "early historical metadata duplicated work"
+    }
+}
+
+# Recovery chains keep their one exponential timer across exact historical reads.
+foreach progress {0 1} {
+    historical_goal_fixture
+    set turn $autoTurn
+    foreach delay {5000 10000 20000} {
+        if {$progress} { user_event item/started {{"type":"commandExecution","id":"historical-chain-tool"}} $turn }
+        completed $turn
+        set previous [list $timers $delays $retry::delay]
+        goal_read_fixture [goal_fixture complete]
+        completed $turn
+        check {[list $timers $delays $retry::delay] eq $previous && [lindex $delays end] == $delay} \
+            "historical refresh or duplicate failure restarted overload backoff"
+        fire
+        set recovery [::huddle::json2huddle [lindex $sent end]]
+        if {$progress} { auto_followup } else {
+            check {[huddle equal [huddle get $recovery params] [huddle get $autoRequest params]]} \
+                "historical recovery chain changed original input or settings"
+        }
+        set turn historical-retry-[incr goalSequence]
+        reply [json_dump [huddle get $recovery id]] $turn
+        started $turn
+    }
+    completed $turn completed
+    check {[dict size $timers] == 0 && $retry::delay == 5000 && [llength $sent] == 3} \
+        "historical recovery chain duplicated work or failed to reset on success"
+}
+
+# Only the exact validated completed baseline is historical; changes still stop.
+foreach progress {0 1} {
+    foreach {key value} {
+        threadId {"other"} createdAt 9 objective {"changed objective"} tokenBudget 100 tokenBudget {"100"}
+        updatedAt 3 tokensUsed 13 timeUsedSeconds 2 tokensUsed {"12"}
+        status {"active"} status {"blocked"} status {"paused"}
+        status {"usageLimited"} status {"budgetLimited"}
+    } {
+        historical_goal_fixture
+        if {$progress} { user_event item/started {{"type":"commandExecution","id":"historical-change-tool"}} $autoTurn }
+        completed $autoTurn
+        set goal [goal_fixture complete]
+        huddle set goal $key [::huddle::json2huddle $value]
+        goal_read_fixture $goal
+        goal_canceled_fixture "changed completed-goal snapshot preserved recovery"
+    }
+}
+
+# First reads during work, late reads, invalid baselines and attached work cannot
+# manufacture historical provenance, even if a later refresh is exactly equal.
+foreach baseline {unknown late foreign_id typed_id malformed attached attached_default} {
+    automatic::cancel
+    retry::reset
+    goal::forget 1
+    set automatic::live {}
+    set goal [goal_fixture complete]
+    if {$baseline in {attached attached_default}} {
+        set automatic::flags [list auto_reset_limit 0 auto_continue_after_stop [expr {$baseline eq "attached"}]]
+        auto_activation {"modelProvider":"openai"} 1
+        goal_read_fixture $goal
+        completed rejected-foreign-turn completed
+    } elseif {$baseline ne "unknown"} {
+        set id [huddle number [incr goalSequence]]
+        retry::client [json_dump [huddle create id $id method [huddle string thread/goal/get] \
+            params [huddle create threadId [huddle string t1]]]]
+        set responseId $id
+        if {$baseline eq "foreign_id"} { set responseId [huddle string foreign-historical-read] }
+        if {$baseline eq "typed_id"} { set responseId [huddle string [huddle get_stripped $id]] }
+        if {$baseline eq "malformed"} { huddle set goal tokensUsed [huddle string 12] }
+        if {$baseline ne "late"} {
+            retry::server [json_dump [huddle create id $responseId result [huddle create goal $goal]]]
+        }
+    }
+    auto_begin
+    if {$baseline eq "late"} {
+        retry::server [json_dump [huddle create id $id result [huddle create goal $goal]]]
+    }
+    completed $autoTurn
+    goal_read_fixture [goal_fixture complete]
+    goal_canceled_fixture "unverified or late completed baseline authorized recovery"
+}
+
+# Historical reads cannot neutralize notifications, mutations or real context changes.
+foreach boundary {notification automatic_set manual_set steer settings thread account disconnect foreign_turn} {
+    historical_goal_fixture
+    completed $autoTurn
+    switch -- $boundary {
+        notification { retry::server [goal_event [goal_fixture complete] [huddle string $autoTurn]] }
+        automatic_set - manual_set {
+            set goalRequest [goal_set_fixture]
+            if {$boundary eq "manual_set"} { huddle set goalRequest params origin [huddle string user] }
+            retry::client [json_dump $goalRequest]
+            goal_ack_fixture $goalRequest
+        }
+        steer { retry::client [format {{"method":"turn/steer","params":{"threadId":"t1","expectedTurnId":"%s","input":[]}}} $autoTurn] }
+        settings { retry::server {{"method":"thread/settings/updated","params":{"threadId":"t1","threadSettings":{"model":"other"}}}} }
+        thread { retry::client {{"id":"historical-other-thread","method":"thread/resume","params":{"threadId":"other"}}} }
+        account { retry::server {{"method":"account/updated","params":{}}} }
+        disconnect { transport::retire }
+        foreign_turn { started foreign-historical-turn; completed foreign-historical-turn completed }
+    }
+    goal_canceled_fixture "historical baseline hid a real context change"
+    auto_begin
+    completed $autoTurn
+    goal_read_fixture [goal_fixture complete]
+    goal_canceled_fixture "historical provenance leaked across a real context change"
+}
+
+# Foreign work between the idle baseline and manual submission expires history,
+# including unscoped activity with optional recovery disabled.
+foreach activity {turn status} {
+    historical_goal_fixture 0
+    completed $autoTurn completed
+    if {$activity eq "turn"} {
+        started foreign-idle-goal-turn
+        completed foreign-idle-goal-turn completed
+    } else {
+        retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"active"}}}}
+    }
+    # Preserve the real activity guard; auto_begin intentionally clears it.
+    set id [json::write string historical-busy-[incr goalSequence]]
+    huddle set autoRequest id [::huddle::json2huddle $id]
+    retry::client [json_dump $autoRequest]
+    set autoTurn busy-historical-turn-$goalSequence
+    reply $id $autoTurn
+    completed $autoTurn
+    goal_read_fixture [goal_fixture complete]
+    goal_canceled_fixture "foreign idle work retained historical goal provenance"
+    auto_begin
+    completed $autoTurn
+    goal_read_fixture [goal_fixture complete]
+    goal_canceled_fixture "busy submission retained history for later manual work"
+}
+
+# Native activity expires both idle snapshots and pending reads, including
+# delayed activation replies received before the next manual task.
+foreach follow {0 1} {
+    foreach activity {status activation status_only_activation turns_only_activation} {
+        foreach baseline {snapshot pending} {
+            automatic::cancel
+            retry::reset
+            goal::forget 1
+            set automatic::live {}
+            set automatic::ids {}
+            set automatic::flags [list auto_reset_limit 0 auto_continue_after_stop $follow]
+            set id [json::write string historical-activation-[incr goalSequence]]
+            if {$activity ne "status"} {
+                set activation [format {{"id":%s,"method":"thread/resume","params":{"threadId":"t1"}}} $id]
+                recovery::client $activation
+                retry::client $activation
+            }
+            if {$baseline eq "snapshot"} {
+                goal_read_fixture [goal_fixture complete]
+            } else { set readId [goal_read_request_fixture] }
+            if {$activity eq "status"} {
+                retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"active"}}}}
+            } else {
+                set status active
+                set turns {[{"id":"delayed-foreign-turn","status":"inProgress","items":[]}]}
+                if {$activity eq "status_only_activation"} { set turns {[]} }
+                if {$activity eq "turns_only_activation"} { set status idle }
+                retry::server [format {{"id":%s,"result":{"thread":{"id":"t1","status":{"type":"%s"},"turns":%s}}}} \
+                    $id $status $turns]
+            }
+            retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"idle"}}}}
+            if {$baseline eq "pending"} {
+                retry::server [json_dump [huddle create id $readId result [huddle create goal [goal_fixture complete]]]]
+            }
+            auto_begin 0 $follow
+            completed $autoTurn
+            goal_read_fixture [goal_fixture complete]
+            goal_canceled_fixture "intervening native activity retained completed-goal history after becoming idle"
+        }
+    }
+}
+
+# Pending idle reads have the same activity boundary even without a baseline.
+# Keep the live-turn guard when submitting steering after foreign tool effects.
+foreach follow {0 1} {
+    foreach ordering {running idle terminal_only} {
+        automatic::cancel
+        retry::reset
+        goal::forget 1
+        set automatic::live {}
+        set automatic::ids {}
+        set sent {}
+        set automatic::flags [list auto_reset_limit 0 auto_continue_after_stop $follow]
+        set id [goal_read_request_fixture]
+        set foreignTurn pending-goal-foreign-[incr goalSequence]
+        if {$ordering eq "terminal_only"} {
+            completed $foreignTurn completed serverOverloaded {[{"type":"commandExecution","id":"pending-terminal-tool"}]}
+        } else {
+            started $foreignTurn
+            user_event item/started {{"type":"commandExecution","id":"pending-goal-tool"}} $foreignTurn
+        }
+        if {$ordering eq "idle"} { completed $foreignTurn completed }
+        retry::server [json_dump [huddle create id $id result [huddle create goal [goal_fixture complete]]]]
+        if {$ordering eq "running"} {
+            set autoRequest [::huddle::json2huddle $request]
+            set autoId [json::write string goal-steering-[incr autoSequence]]
+            huddle set autoRequest id [::huddle::json2huddle $autoId]
+            set autoTurn $foreignTurn
+            retry::client [json_dump $autoRequest]
+            reply $autoId $autoTurn
+        } else { auto_begin 0 $follow }
+        completed $autoTurn
+        if {$ordering eq "running"} {
+            check {[dict size $timers] == 0 && $sent eq ""} "late goal read allowed replay of foreign partial work"
+        }
+        goal_read_fixture [goal_fixture complete]
+        goal_canceled_fixture "pending goal read acquired history across foreign work"
+    }
+}
+
+# Context notifications are scoped to the pending read's thread, not just an
+# established snapshot or model request. An unrelated thread remains harmless.
+foreach follow {0 1} {
+    foreach method {thread/settings/updated thread/archived thread/environment/connected thread/environment/disconnected} {
+        foreach thread {t1 other} {
+            automatic::cancel
+            retry::reset
+            goal::forget 1
+            set automatic::live {}
+            set automatic::ids {}
+            set automatic::flags [list auto_reset_limit 0 auto_continue_after_stop $follow]
+            set id [goal_read_request_fixture]
+            retry::server [json_dump [huddle create method [huddle string $method] \
+                params [huddle create threadId [huddle string $thread]]]]
+            retry::server [json_dump [huddle create id $id result [huddle create goal [goal_fixture complete]]]]
+            auto_begin 0 $follow
+            completed $autoTurn
+            goal_read_fixture [goal_fixture complete]
+            if {$thread eq "t1"} {
+                goal_canceled_fixture "pending idle goal read survived a matching context change"
+            } else {
+                fire
+                check {[llength $sent] == 1 && [huddle equal \
+                    [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                    [huddle get $autoRequest params]]} "unrelated thread context invalidated historical recovery"
+            }
+        }
+    }
+}
+
+# Activity belonging to the fresh owned task still preserves historical reads.
+foreach activity {status activation} {
+    automatic::cancel
+    retry::reset
+    goal::forget 1
+    set automatic::live {}
+    set automatic::ids {}
+    set id [json::write string owned-goal-activation-[incr goalSequence]]
+    if {$activity eq "activation"} {
+        set activation [format {{"id":%s,"method":"thread/resume","params":{"threadId":"t1"}}} $id]
+        recovery::client $activation
+        retry::client $activation
+    }
+    goal_read_fixture [goal_fixture complete]
+    auto_begin 0 0
+    if {$activity eq "status"} {
+        retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"active"}}}}
+    } else {
+        retry::server [format {{"id":%s,"result":{"thread":{"id":"t1","status":{"type":"active"},"turns":[{"id":"%s","status":"inProgress","items":[]}]}}}} \
+            $id $autoTurn]
+    }
+    completed $autoTurn
+    goal_read_fixture [goal_fixture complete]
+    fire
+    check {[llength $sent] == 1 && [huddle equal \
+        [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+        [huddle get $autoRequest params]]} "owned native activity expired eligible historical recovery"
+}
+
+# Progress can arrive without turn/started; it still expires idle history and
+# prevents steering partial work from becoming a fresh replay candidate.
+proc goal_progress_fixture {method turn {thread t1}} {
+    set params [huddle create threadId [huddle string $thread] turnId [huddle string $turn]]
+    if {$method eq "item/started"} {
+        huddle set params item [huddle create type [huddle string commandExecution] id [huddle string goal-progress-tool]]
+    }
+    retry::server [json_dump [huddle create method [huddle string $method] params $params]]
+}
+proc goal_manual_fixture {turn} {
+    set ::autoRequest [::huddle::json2huddle $::request]
+    set ::autoId [json::write string goal-progress-manual-[incr ::autoSequence]]
+    set ::autoTurn $turn
+    huddle set ::autoRequest id [::huddle::json2huddle $::autoId]
+    retry::client [json_dump $::autoRequest]
+    reply $::autoId $turn
+}
+foreach follow {0 1} {
+    foreach method {item/started hook/started} {
+        foreach baseline {snapshot pending} {
+            foreach state {running idle} {
+                automatic::cancel
+                retry::reset
+                goal::forget 1
+                set automatic::live {}
+                set automatic::ids {}
+                set sent {}
+                set automatic::flags [list auto_reset_limit $follow auto_continue_after_stop $follow]
+                if {$baseline eq "snapshot"} {
+                    goal_read_fixture [goal_fixture complete]
+                } else { set id [goal_read_request_fixture] }
+                set turn progress-without-start-[incr goalSequence]
+                goal_progress_fixture $method $turn
+                if {$state eq "idle"} { completed $turn completed }
+                if {$baseline eq "pending"} {
+                    retry::server [json_dump [huddle create id $id result [huddle create goal [goal_fixture complete]]]]
+                }
+                if {$state eq "idle"} { set turn fresh-after-progress-[incr goalSequence] }
+                goal_manual_fixture $turn
+                completed $autoTurn
+                if {$state eq "running"} {
+                    check {[dict size $timers] == 0 && $sent eq ""} "progress without a start allowed steering replay"
+                }
+                goal_read_fixture [goal_fixture complete]
+                goal_canceled_fixture "foreign progress without a start preserved completed-goal history"
+            }
+        }
+    }
+}
+
+# Finished turns and other threads preserve the selected thread's history and
+# fresh-work eligibility.
+foreach method {item/started hook/started} {
+    foreach baseline {snapshot pending} {
+        foreach source {stale other_thread} {
+            automatic::cancel
+            retry::reset
+            goal::forget 1
+            set automatic::live {}
+            set automatic::ids {}
+            set sent {}
+            set automatic::flags {auto_reset_limit 0 auto_continue_after_stop 0}
+            set turn irrelevant-progress-[incr goalSequence]
+            if {$source eq "stale"} { completed $turn completed }
+            if {$baseline eq "snapshot"} {
+                goal_read_fixture [goal_fixture complete]
+            } else { set id [goal_read_request_fixture] }
+            set thread t1
+            if {$source eq "other_thread"} { set thread other }
+            goal_progress_fixture $method $turn $thread
+            if {$baseline eq "pending"} {
+                retry::server [json_dump [huddle create id $id result [huddle create goal [goal_fixture complete]]]]
+            }
+            goal_manual_fixture fresh-after-irrelevant-[incr goalSequence]
+            completed $autoTurn
+            goal_read_fixture [goal_fixture complete]
+            fire
+            check {[llength $sent] == 1 && [huddle equal \
+                [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                [huddle get $autoRequest params]]} "irrelevant progress changed historical recovery"
+        }
+    }
+}
+
+# Acknowledged owned progress needs no start notification to retain opt-in
+# continuation; the same metadata cannot enable continuation with the flag off.
+foreach follow {0 1} {
+    foreach method {item/started hook/started} {
+        automatic::cancel
+        retry::reset
+        goal::forget 1
+        set automatic::live {}
+        set automatic::ids {}
+        set sent {}
+        set automatic::flags [list auto_reset_limit 0 auto_continue_after_stop $follow]
+        goal_read_fixture [goal_fixture complete]
+        goal_manual_fixture owned-progress-without-start-[incr goalSequence]
+        goal_progress_fixture $method $autoTurn
+        completed $autoTurn
+        set previous [list $timers $delays $retry::delay]
+        goal_read_fixture [goal_fixture complete]
+        check {[dict size $timers] == $follow && [list $timers $delays $retry::delay] eq $previous} \
+            "owned progress without a start lost recovery or changed its backoff"
+        if {$follow} { fire; auto_followup }
+        check {[llength $sent] == $follow} "owned progress without a start bypassed opt-in or duplicated work"
+    }
+}
+
+# User-item correlation also bounds history for subsequent fresh work. Matching
+# echoes, finished turns and other threads cannot be mistaken for steering.
+foreach reset {0 1} {
+    foreach follow {0 1} {
+        foreach change {same content client identity stale other_thread foreign_turn} {
+            foreach delivery {notification reply started completed} {
+                if {$change in {stale other_thread foreign_turn} && $delivery ne "notification"} { continue }
+                set staleTurn goal-stale-user-[incr goalSequence]
+                if {$change eq "stale"} { completed $staleTurn completed }
+                set automatic::ids {}
+                set client goal-client-[incr goalSequence]
+                historical_goal_fixture $follow 0 $reset $client
+                started $autoTurn
+                set original [huddle create type [huddle string userMessage] \
+                    id [huddle string goal-user-$goalSequence] clientId [huddle string $client] \
+                    content [huddle get $autoRequest params input]]
+                user_event item/started [json_dump $original] $autoTurn
+                if {$delivery ne "reply"} { reply $autoId $autoTurn }
+                set item $original
+                switch -- $change {
+                    content - stale - other_thread - foreign_turn { huddle set item content 0 text [huddle string "foreign fixture input"] }
+                    client { huddle set item clientId [huddle string foreign-client] }
+                    identity { huddle set item id [huddle string additional-goal-user] }
+                }
+                set items [json::write array [json_dump $item]]
+                switch -- $delivery {
+                    notification {
+                        set turn $autoTurn
+                        set thread t1
+                        if {$change eq "stale"} { set turn $staleTurn }
+                        if {$change eq "other_thread"} { set thread other }
+                        if {$change eq "foreign_turn"} { set turn foreign-goal-user-[incr goalSequence] }
+                        user_event item/completed [json_dump $item] $turn $thread
+                    }
+                    reply { reply $autoId $autoTurn $items }
+                    started { started $autoTurn t1 $items }
+                    completed { completed $autoTurn completed serverOverloaded $items }
+                }
+                if {$change eq "foreign_turn"} {
+                    retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"idle"}}}}
+                } elseif {$delivery ne "completed"} { completed $autoTurn completed }
+                check {[dict size $timers] == 0 && $sent eq ""} "user-item correlation submitted recovery without failure"
+                goal_manual_fixture after-goal-user-item-[incr goalSequence]
+                completed $autoTurn
+                set previous [list $timers $delays $retry::delay]
+                goal_read_fixture [goal_fixture complete]
+                if {$change in {same stale other_thread}} {
+                    check {[list $timers $delays $retry::delay] eq $previous} "matching or irrelevant user item changed historical backoff"
+                    fire
+                    check {[llength $sent] == 1 && [huddle equal \
+                        [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                        [huddle get $autoRequest params]]} "matching or irrelevant user item lost historical recovery"
+                } else { goal_canceled_fixture "detected steering retained history for a later fresh task" }
+            }
+        }
+    }
+}
+
+# A generated turn may lose its retry tracker inside the opt-in detector. Clear
+# history there as well, before cancellation prevents default-engine correlation.
+foreach reset {0 1} {
+    foreach {change stopped} {same 0 content 0 client 0 identity 0 same 1 content 1 client 1} {
+        set automatic::ids {}
+        historical_goal_fixture 1 1 $reset
+        goal_progress_fixture item/started $autoTurn
+        completed $autoTurn
+        fire
+        set id [auto_followup]
+        set turn goal-generated-user-[incr goalSequence]
+        reply $id $turn
+        started $turn
+        set params [huddle get [dict get $automatic::current request] params]
+        set item [huddle create type [huddle string userMessage] \
+            id [huddle string goal-generated-echo-$goalSequence] \
+            clientId [huddle get $params clientUserMessageId] content [huddle get $params input]]
+        if {$stopped} {
+            completed $turn
+        } else { user_event item/started [json_dump $item] $turn }
+        switch -- $change {
+            content { huddle set item content 0 text [huddle string "foreign continuation input"] }
+            client { huddle set item clientId [huddle string foreign-client] }
+            identity { huddle set item id [huddle string additional-generated-user] }
+        }
+        set sent {}
+        user_event item/completed [json_dump $item] $turn
+        if {!$stopped} { completed $turn completed }
+        goal_manual_fixture after-generated-steering-[incr goalSequence]
+        completed $autoTurn
+        goal_read_fixture [goal_fixture complete]
+        if {$change eq "same"} {
+            fire
+            check {[llength $sent] == 1 && [huddle equal \
+                [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                [huddle get $autoRequest params]]} "matching generated echo lost historical recovery"
+        } else { goal_canceled_fixture "generated-turn steering retained historical recovery" }
+    }
+}
+
+# A model acknowledgement must confirm provisional ownership before idle history
+# can survive into another manual task. Retry resets alone retain the baseline.
+foreach follow {0 1} {
+    foreach event {start tool hook} {
+        foreach outcome {matching different error malformed} {
+            set automatic::ids {}
+            historical_goal_fixture $follow 0
+            set candidate provisional-goal-turn-[incr goalSequence]
+            if {$event eq "start"} {
+                started $candidate
+            } else {
+                set method item/started
+                if {$event eq "hook"} { set method hook/started }
+                goal_progress_fixture $method $candidate
+            }
+            goal_read_fixture [goal_fixture complete]
+            switch -- $outcome {
+                matching { reply $autoId $candidate }
+                different { reply $autoId actual-goal-turn-[incr goalSequence] }
+                error { retry::server [format {{"id":%s,"error":{"code":-32602,"message":"synthetic rejection"}}} $autoId] }
+                malformed { retry::server [format {{"id":%s,"result":{"turn":{}}}} $autoId] }
+            }
+            if {$outcome eq "matching"} { completed $candidate completed }
+            retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"idle"}}}}
+            goal_manual_fixture after-provisional-goal-[incr goalSequence]
+            completed $autoTurn
+            goal_read_fixture [goal_fixture complete]
+            if {$outcome eq "matching"} {
+                fire
+                check {[llength $sent] == 1 && [huddle equal \
+                    [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                    [huddle get $autoRequest params]]} "matching acknowledgement lost historical recovery"
+            } else {
+                goal_canceled_fixture "disproved provisional ownership retained completed-goal history"
+            }
+        }
+    }
+}
+
+# Thread activity is provisional before ACK, even without a turn ID. Strict
+# parsing failures must expire unresolved history before either tracker is lost.
+# With no activity, even a rejected ACK or reset preserves the idle baseline.
+foreach reset {0 1} {
+    foreach follow {0 1} {
+        foreach activity {none status start} {
+            foreach outcome {matching error malformed invalid_status duplicate_error duplicate_result reset} {
+                set automatic::ids {}
+                historical_goal_fixture $follow 0 $reset
+                set candidate thread-activity-before-ack-[incr goalSequence]
+                if {$activity eq "status"} {
+                    retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"active"}}}}
+                } elseif {$activity eq "start"} { started $candidate }
+                switch -- $outcome {
+                    matching { reply $autoId $candidate }
+                    error { retry::server [format {{"id":%s,"error":{"code":-32602,"message":"synthetic rejection"}}} $autoId] }
+                    malformed { retry::server [format {{"id":%s,"result":{"turn":{}}}} $autoId] }
+                    invalid_status { retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"unknown","items":[]}}}} $autoId $candidate] }
+                    duplicate_error {
+                        retry::server [format {{"id":%s,"error":{"code":-32602,"message":"synthetic rejection"},"error":{"code":-32602,"message":"synthetic rejection"}}} $autoId]
+                    }
+                    duplicate_result {
+                        retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}},"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}} $autoId $candidate $candidate]
+                    }
+                    reset { retry::reset }
+                }
+                if {$activity eq "none"} {
+                    retry::reset
+                } elseif {$outcome eq "matching"} { completed $candidate completed }
+                retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"idle"}}}}
+                check {[dict size $timers] == 0 && $sent eq ""} "provisional thread activity submitted work"
+                goal_manual_fixture after-thread-activity-[incr goalSequence]
+                completed $autoTurn
+                set previous [list $timers $delays $retry::delay]
+                goal_read_fixture [goal_fixture complete]
+                if {$activity eq "none" || $outcome eq "matching"} {
+                    check {[list $timers $delays $retry::delay] eq $previous} "resolved or absent activity changed historical backoff"
+                    fire
+                    check {[llength $sent] == 1 && [huddle equal \
+                        [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                        [huddle get $autoRequest params]]} "resolved or absent activity lost historical recovery"
+                } else { goal_canceled_fixture "unresolved thread activity retained historical recovery" }
+            }
+        }
+        # A rejected ACK before activity cannot establish historical ownership.
+        # Only the none control resets without any subsequent work notification.
+        foreach outcome {matching duplicate_result invalid_status method_null numeric_turn_id} {
+            foreach activity {none status start completion} {
+                set automatic::ids {}
+                historical_goal_fixture $follow 0 $reset
+                set candidate invalid-ack-before-activity-[incr goalSequence]
+                if {$outcome eq "numeric_turn_id"} { set candidate $goalSequence }
+                switch -- $outcome {
+                    matching { reply $autoId $candidate }
+                    duplicate_result {
+                        retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}},"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}} $autoId $candidate $candidate]
+                    }
+                    invalid_status { retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"unknown","items":[]}}}} $autoId $candidate] }
+                    method_null { retry::server [format {{"id":%s,"method":null,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}} $autoId $candidate] }
+                    numeric_turn_id {
+                        retry::server [format {{"id":%s,"result":{"turn":{"id":%s,"status":"inProgress","items":[]}}}} $autoId $candidate]
+                    }
+                }
+                switch -- $activity {
+                    status { retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"active"}}}} }
+                    start { started $candidate; completed $candidate completed }
+                    completion { completed $candidate completed }
+                }
+                retry::reset
+                retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"idle"}}}}
+                goal_manual_fixture after-invalid-ack-activity-[incr goalSequence]
+                completed $autoTurn
+                set previous [list $timers $delays $retry::delay]
+                goal_read_fixture [goal_fixture complete]
+                if {$outcome eq "matching" || $activity eq "none"} {
+                    check {[list $timers $delays $retry::delay] eq $previous} "valid ACK or no-activity reset changed historical backoff"
+                    fire
+                    check {[llength $sent] == 1 && [huddle equal \
+                        [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                        [huddle get $autoRequest params]]} "valid ACK or no-activity reset lost recovery"
+                } else { goal_canceled_fixture "rejected ACK established ownership for later activity" }
+            }
+        }
+        # A new manual submission must not overwrite unresolved proof before
+        # retry reset can expire it. An overload still awaiting ACK is not idle.
+        set automatic::ids {}
+        historical_goal_fixture $follow 0 $reset
+        set candidate replaced-before-ack-[incr goalSequence]
+        started $candidate
+        completed $candidate
+        retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"idle"}}}}
+        goal_manual_fixture after-unacknowledged-overload-[incr goalSequence]
+        completed $autoTurn
+        goal_read_fixture [goal_fixture complete]
+        goal_canceled_fixture "manual replacement retained unresolved historical activity"
+    }
+}
+
+# A generated continuation may discard both engines during ACK rejection. Its
+# provisional history must be reconciled before either tracker disappears.
+foreach outcome {matching different} {
+    set automatic::ids {}
+    historical_goal_fixture
+    goal_progress_fixture item/started $autoTurn
+    completed $autoTurn
+    fire
+    set autoId [auto_followup]
+    set sent {}
+    set candidate provisional-continuation-[incr goalSequence]
+    started $candidate
+    if {$outcome eq "matching"} {
+        reply $autoId $candidate
+        completed $candidate completed
+    } else { reply $autoId actual-continuation-[incr goalSequence] }
+    retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"idle"}}}}
+    goal_manual_fixture after-provisional-continuation-[incr goalSequence]
+    completed $autoTurn
+    goal_read_fixture [goal_fixture complete]
+    if {$outcome eq "matching"} {
+        fire
+        check {[llength $sent] == 1 && [huddle equal \
+            [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+            [huddle get $autoRequest params]]} "matching continuation ACK lost historical recovery"
+    } else { goal_canceled_fixture "continuation ACK rejection retained disproved history" }
+}
+
+# With no intervening activity, ordinary resets and rejected acknowledgements
+# cannot make an otherwise unchanged completed baseline a new terminal stop.
+foreach outcome {reset error malformed} {
+    set automatic::ids {}
+    historical_goal_fixture 0 0
+    switch -- $outcome {
+        reset { retry::reset }
+        error { retry::server [format {{"id":%s,"error":{"code":-32602,"message":"synthetic rejection"}}} $autoId] }
+        malformed { retry::server [format {{"id":%s,"result":{"turn":{}}}} $autoId] }
+    }
+    goal_manual_fixture after-neutral-reset-[incr goalSequence]
+    completed $autoTurn
+    goal_read_fixture [goal_fixture complete]
+    fire
+    check {[llength $sent] == 1 && [huddle equal \
+        [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+        [huddle get $autoRequest params]]} "ordinary retry reset erased completed-goal history"
+}
+
+# A terminal candidate can discard the retry tracker before its start ACK.
+# Unresolved history expires there, even if a matching ACK eventually arrives.
+foreach follow {0 1} {
+    foreach terminal {completed interrupted failed} {
+        foreach outcome {matching matching_without_read different error malformed missing} {
+            set automatic::ids {}
+            historical_goal_fixture $follow 0
+            set candidate terminal-before-ack-[incr goalSequence]
+            started $candidate
+            set code serverOverloaded
+            if {$terminal eq "failed"} { set code internalServerError }
+            completed $candidate $terminal $code
+            switch -- $outcome {
+                matching - matching_without_read { reply $autoId $candidate }
+                different { reply $autoId disproving-terminal-ack-[incr goalSequence] }
+                error { retry::server [format {{"id":%s,"error":{"code":-32602,"message":"synthetic rejection"}}} $autoId] }
+                malformed { retry::server [format {{"id":%s,"result":{"turn":{}}}} $autoId] }
+            }
+            retry::server {{"method":"thread/status/changed","params":{"threadId":"t1","status":{"type":"idle"}}}}
+            check {[dict size $timers] == 0 && $sent eq ""} "unresolved terminal ownership submitted work"
+            # A new idle read may establish history after the unresolved boundary.
+            if {$outcome eq "matching"} { goal_read_fixture [goal_fixture complete] }
+            goal_manual_fixture after-terminal-ack-[incr goalSequence]
+            completed $autoTurn
+            goal_read_fixture [goal_fixture complete]
+            if {$outcome eq "matching"} {
+                fire
+                check {[llength $sent] == 1 && [huddle equal \
+                    [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                    [huddle get $autoRequest params]]} "fresh idle baseline after a matched terminal ACK lost recovery"
+            } else {
+                goal_canceled_fixture "terminal before ACK retained disproved or unresolved historical ownership"
+            }
         }
     }
 }

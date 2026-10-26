@@ -198,13 +198,37 @@ unchanged. Duplicate matching notifications preserve the existing timer.
 Native goal requests, replies and notifications pass through unchanged.
 
 The goal snapshot can arrive during activation before manual work and survives
-retry resets. Request provenance expires on new work or context changes; all
-goal tracking is bounded and in memory, and is cleared on disconnection.
+ordinary retry resets. Request provenance expires on new work or context changes;
+all goal tracking is bounded and in memory, and is cleared on disconnection.
 Manual goal changes, pause/clear, changed identity, objective or budget, and
-`paused`, `usageLimited`, `budgetLimited` or `complete` updates cancel recovery.
+`paused`, `usageLimited`, `budgetLimited` or `complete` notifications cancel recovery.
 Correlated goal reads also cancel on stopped or changed goals, including when
-owned accounting arrives before the read reply. Stale completions from older
-turns preserve pending metadata correlation.
+owned accounting arrives before the read reply, with one historical exception:
+a validated already-complete goal read while idle, before fresh manual work,
+can be read again unchanged during that task and its recovery chain. Only an
+exact matching correlated native `thread/goal/get` reply preserves eligibility,
+including unchanged timestamps, identity, objective, budget and accounting.
+It preserves the existing timer and accumulated backoff. A completed goal first
+read during work, a read still pending when work starts, or work already live
+at attachment cannot establish this history. Real context changes and
+disconnection clear it, including pending reads. Native activity outside the
+owned fresh task expires history even if the thread later becomes idle. This
+includes tool or hook progress received without a preceding `turn/started`.
+Detected changed input, an additional user item or a mismatched native client
+identity also expires history; matching echoes and stale events preserve it.
+An acknowledgement that disproves provisional turn ownership also expires it.
+Thread-level active status before acknowledgement is provisional activity too.
+Rejection, invalid protocol data or discarding ownership while that activity is
+still unresolved expires history. Resets without intervening activity preserve
+the baseline.
+A rejected acknowledgement cannot establish ownership for later activity.
+If a turn completes, is interrupted, or fails without overload before its start
+acknowledgement, discarding its unresolved ownership tracker expires historical
+goal provenance. Even a later matching acknowledgement then needs a new
+validated idle goal read before subsequent fresh work can use that history.
+Completed-goal notifications and native mutations still cancel; historical
+metadata cannot authorize automatic goal revival.
+Stale completions from older turns preserve pending metadata correlation.
 Goal updates with unknown baselines, foreign/stale IDs or ambiguous provenance cancel it:
 an unscoped notification before its acknowledgement cannot prove automatic
 origin. An automatic mutation still unresolved when backoff expires cancels
@@ -337,6 +361,11 @@ and verification, repeated and mixed-mode continuation, deduplication and
 cancellation, plus warnings and responsive input through fake PTYs.
 Goal fixtures reproduce controlled event sequences and cancellation boundaries;
 they do not replay a historical session stream or exercise live model inference.
+Offline replay reproduces the unchanged historical-goal read canceling eligible
+recovery in the earlier runtime. Without the full event stream, this does not
+establish the cause of a reported missed recovery; a `Goal achieved` label alone
+does not establish completion of a fresh request. Source updates affect future
+wrapper processes, not an already-running process or its stopped session.
 
 Project guidance lives in `AGENTS.md` and `.agents/skills/`; `CLAUDE.md` and
 `.claude/skills` are relative symlinks to those canonical files.

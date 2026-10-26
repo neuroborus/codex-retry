@@ -99,6 +99,7 @@ proc automatic::snapshot {result} {
     if {[dict size $active] || $status eq "active"} {
         set id ""
         if {[dict size $active] == 1} { set id [lindex [dict keys $active] 0] }
+        goal::activity $thread [expr {$id ne "" && $id eq [field $::retry::current turnId]}]
         dict set live $thread $id
     } elseif {$status in {idle notLoaded systemError}} { dict unset live $thread }
 }
@@ -157,15 +158,57 @@ proc goal::cancel {} {
     automatic::cancel
     retry::reset
 }
+# Detected steering cannot carry completed-goal history into later manual work.
+proc goal::steering {} {
+    variable snapshot
+    if {$snapshot ne "" && [automatic::text $snapshot status] eq "complete"} { forget 1 }
+}
+# Idle history cannot cross intervening work, even after that work becomes idle.
+proc goal::activity {thread owned} {
+    variable snapshot; variable pending; variable proof
+    if {$owned && $thread eq [field $::retry::current threadId] && \
+        [field $::retry::current status] in {awaiting inProgress} && \
+        [field $proof historical] ne "" && \
+        [field $proof historical] eq [field $::retry::current rpcId]} {
+        if {[field $::retry::current accepted] ne "1"} { dict set proof activity 1 }
+        return
+    }
+    if {($snapshot ne "" && [automatic::text $snapshot status] eq "complete" && \
+         $thread eq [automatic::text $snapshot threadId]) || \
+        ([field $pending method] eq "thread/goal/get" && [field $pending idle] eq "1" && \
+         $thread eq [field $pending threadId])} { cancel }
+}
+# Reconcile provisional activity before either engine can discard its tracker.
+# An omitted reply cannot resolve activity that is still awaiting an ACK.
+proc goal::reconcile {{object ""}} {
+    variable proof
+    set current $::retry::current
+    if {[field $proof historical] eq "" || \
+        [field $proof historical] ne [field $current rpcId]} { return }
+    if {$object eq "" && [field $current accepted] eq "1"} { return }
+    set turn ""
+    if {$object ne "" && ![huddle exists $object error] && \
+        [automatic::text $object result turn status] in {inProgress failed completed interrupted}} {
+        set turn [automatic::text $object result turn id]
+    }
+    if {($turn eq "" && [field $proof activity] eq "1") || \
+        ([field $current turnId] ne "" && $turn ne [field $current turnId])} { forget 1; return }
+    dict for {candidate observed} [dict get $current observations] {
+        # A fresh terminal snapshot also needs ownership, even without a start.
+        if {$candidate ne $turn && ([field $observed activity] eq "1" || \
+            [dict exists $observed completion])} { forget 1; return }
+    }
+    dict unset proof activity
+}
 proc goal::owner {} {
     set current $::retry::current
     if {[field $current turnId] eq ""} { return "" }
     return [list [field $current rpcId] [field $current threadId] [field $current turnId]]
 }
-proc goal::identity {value} {
+proc goal::identity {value {statuses {active blocked}}} {
     if {![automatic::is $value dict] || [automatic::text $value threadId] eq "" || \
         ![automatic::is $value string objective] || \
-        [automatic::text $value status] ni {active blocked}} { return "" }
+        [automatic::text $value status] ni $statuses} { return "" }
     foreach key {createdAt updatedAt tokensUsed timeUsedSeconds} {
         if {![automatic::is $value number $key] || \
             ![regexp {^-?[0-9]+$} [huddle get_stripped $value $key]]} { return "" }
@@ -183,20 +226,38 @@ proc goal::identity {value} {
 proc goal::same {value} {
     variable snapshot
     set identity [identity $value]
-    if {$snapshot eq "" || $identity eq "" || ![huddle equal [identity $snapshot] $identity]} { return 0 }
+    if {$snapshot eq "" || $identity eq "" || [identity $snapshot] eq "" || \
+        ![huddle equal [identity $snapshot] $identity]} { return 0 }
     foreach key {updatedAt tokensUsed timeUsedSeconds} {
         if {[huddle get_stripped $value $key] < [huddle get_stripped $snapshot $key]} { return 0 }
     }
     return 1
 }
-proc goal::client {object} {
+proc goal::client {object {manual 1}} {
     variable snapshot; variable pending; variable proof
     set method [automatic::text $object method]
     set thread [automatic::text $object params threadId]
     if {$method ni {thread/goal/get thread/goal/set}} {
+        if {$method eq "turn/start"} { reconcile }
         if {$method eq "turn/start" && $snapshot ne "" && \
             $thread eq [automatic::text $snapshot threadId]} {
+            set historical [field $proof historical]
             forget
+            if {[automatic::text $snapshot status] eq "complete"} {
+                # A prior idle read is history only for fresh manual work or
+                # its existing recovery chain, never steering or attached work.
+                if {[huddle exists $object id] && [huddle type $object id] in {string number} && \
+                    [automatic::is $object list params input] && \
+                    [huddle llength [huddle get $object params input]] > 0 && \
+                    (($manual && [field $::retry::current status] ni {awaiting inProgress} && \
+                      [field $::retry::current threadId] in [list "" $thread] && \
+                      ![dict exists $::automatic::live $thread] && \
+                      ![dict exists $::retry::usedIds [json_dump [huddle get $object id]]]) || \
+                     (!$manual && $historical ne "" && \
+                      $historical eq [field $::retry::current rpcId]))} {
+                    set proof [dict create historical [json_dump [huddle get $object id]]]
+                } else { forget 1 }
+            }
         } elseif {![automatic::read_only $method] && \
             ([string match "thread/*" $method] || [string match "turn/*" $method] || \
              [string match "account/*" $method] || \
@@ -214,12 +275,14 @@ proc goal::client {object} {
         if {($snapshot eq "" || $thread eq [automatic::text $snapshot threadId]) && \
             ([field $::retry::current threadId] in [list "" $thread]) && \
             [field $pending method] ne "thread/goal/set" && ![dict exists $::retry::usedIds $id]} {
-            set pending [dict create rpcId $id method $method threadId $thread]
+            set pending [dict create rpcId $id method $method threadId $thread \
+                idle [expr {$::retry::current eq "" && $::automatic::current eq "" && \
+                    ![dict exists $::automatic::live $thread]}]]
         }
         return 0
     }
     set owned [owner]
-    if {$snapshot eq "" || $owned eq "" || $thread ne [lindex $owned 1] || \
+    if {$snapshot eq "" || [identity $snapshot] eq "" || $owned eq "" || $thread ne [lindex $owned 1] || \
         $thread ne [automatic::text $snapshot threadId] || $pending ne "" || \
         [dict exists $::retry::usedIds $id] || \
         [automatic::text $object params origin] ne "automatic" || \
@@ -248,14 +311,28 @@ proc goal::server {object} {
         if {![huddle exists $object error] && [automatic::is $object dict result goal] && \
             [automatic::text $object result goal threadId] eq [dict get $request threadId] && \
             [automatic::text $object result goal status] in {paused usageLimited budgetLimited complete}} {
+            set value [huddle get $object result goal]
+            set complete [expr {[dict get $request method] eq "thread/goal/get" && \
+                [identity $value {complete}] ne ""}]
+            if {$complete && $snapshot ne "" && [huddle equal $snapshot $value] && \
+                [field $proof historical] ne "" && \
+                [field $proof historical] eq [field $::retry::current rpcId]} { return 0 }
+            # Retain completed history only while idle. A late read cannot
+            # retroactively establish provenance for work already in progress.
+            set idle [expr {$complete && [field $request idle] eq "1" && \
+                $::retry::current eq "" && $::automatic::current eq "" && \
+                ![dict exists $::automatic::live [dict get $request threadId]]}]
             cancel
+            if {$idle} { set snapshot $value }
             return 0
         }
         if {[huddle exists $object error] || ![automatic::is $object dict result goal] || \
             [identity [huddle get $object result goal]] eq "" || \
             [automatic::text $object result goal threadId] ne [dict get $request threadId]} {
             if {[dict get $request method] eq "thread/goal/set" || \
-                ($snapshot ne "" && [automatic::is $object null result goal])} {
+                ($snapshot ne "" && ([automatic::is $object null result goal] || \
+                 ([automatic::text $snapshot status] eq "complete" && \
+                  ![huddle exists $object error] && [automatic::is $object dict result goal])))} {
                 cancel
             } else { forget 1 }
             return 0
@@ -430,17 +507,17 @@ proc automatic::replay {request previous} {
 
 proc automatic::user_item {item} {
     variable current
-    # Stopped turns may repeat a verified echo, but cannot establish a new identity.
-    if {[field $current phase] ne "running" && [field $current userId] eq ""} { cancel; return }
     set params [huddle get [dict get $current request] params]
     set id [text $item id]
     if {$id eq "" || ![is $item list content] || \
         ![huddle equal [retry::user_input [huddle get $params input]] \
-            [retry::user_input [huddle get $item content]]]} { cancel; return }
+            [retry::user_input [huddle get $item content]]]} { goal::steering; cancel; return }
     if {[huddle exists $params clientUserMessageId] && [huddle type $params clientUserMessageId] ne "null" && \
         (![is $params string clientUserMessageId] || \
-         [text $item clientId] ne [text $params clientUserMessageId])} { cancel; return }
-    if {[field $current userId] ne "" && [field $current userId] ne $id} { cancel; return }
+         [text $item clientId] ne [text $params clientUserMessageId])} { goal::steering; cancel; return }
+    # Stopped turns may repeat a verified echo, but cannot establish a new identity.
+    if {[field $current phase] ne "running" && [field $current userId] eq ""} { cancel; return }
+    if {[field $current userId] ne "" && [field $current userId] ne $id} { goal::steering; cancel; return }
     dict set current userId $id
 }
 proc automatic::items {turn} {
@@ -507,9 +584,20 @@ proc automatic::server {object {goalMetadata 0}} {
     set method [text $object method]
     set thread [text $object params threadId]
     set turn [text $object params turn id]
+    set progress [expr {[string match "item/*" $method] || [string match "hook/*" $method] || \
+        $method in {thread/compacted turn/plan/updated turn/diff/updated
+            rawResponseItem/completed rawResponse/completed mcpServer/elicitation/request}}]
+    set activityTurn $turn
+    if {$progress} { set activityTurn [text $object params turnId] }
+    set owned [expr {$activityTurn ne "" && \
+        ($activityTurn eq [field $::retry::current turnId] || \
+         ([field $::retry::current status] eq "awaiting" && \
+          [field $::retry::current turnId] eq "" && \
+          $activityTurn ne [field $::retry::current previous]))}]
     if {$thread ne "" && $turn ne ""} {
         if {$method eq "turn/started" && [text $object params turn status] eq "inProgress" && \
             ![dict exists $::retry::finished [list $thread $turn]]} {
+            goal::activity $thread $owned
             dict set live $thread $turn
         } elseif {$method eq "turn/completed" && [field $live $thread] eq $turn && \
             [text $object params turn status] in {completed failed interrupted}} { dict unset live $thread }
@@ -518,14 +606,24 @@ proc automatic::server {object {goalMetadata 0}} {
     if {$thread ne "" && $method eq "thread/status/changed"} {
         set status [text $object params status type]
         if {$status eq "active"} {
+            goal::activity $thread 1
             if {![dict exists $live $thread]} { dict set live $thread "" }
             if {$thread eq [field $current threadId] && [field $current phase] ne "running"} { cancel }
         } elseif {$status in {idle notLoaded systemError}} { dict unset live $thread }
+    }
+    # Work need not deliver turn/started before progress. Retain its live guard
+    # before the empty-current return, without reviving finished turns or echoes.
+    if {$progress && $thread ne "" && \
+        ($method ni {item/started item/completed} || [text $object params item type] ne "userMessage" || !$owned) && \
+        ($activityTurn eq "" || ![dict exists $::retry::finished [list $thread $activityTurn]])} {
+        goal::activity $thread $owned
+        dict set live $thread $activityTurn
     }
     set id ""
     if {[huddle exists $object id]} { set id [json_dump [huddle get $object id]] }
     set response [expr {![huddle exists $object method] && $id ne ""}]
     set visible [expr {$method ne "" || ![dict exists $ids $id]}]
+    if {$response && $id eq [field $::retry::current rpcId]} { goal::reconcile $object }
     if {$current eq ""} { return $visible }
     if {$method eq "" && $id ne "" && $id eq [field $current opId]} {
         if {!$response || [huddle exists $object error] || ![is $object dict result]} {
@@ -613,9 +711,7 @@ proc automatic::server {object {goalMetadata 0}} {
         if {$current eq "" || [field $current done] || \
             [field $current phase] ni {running overload} || $method ne "turn/completed"} { return $visible }
         completed $turn
-    } elseif {[string match "item/*" $method] || [string match "hook/*" $method] || \
-        $method in {thread/compacted turn/plan/updated turn/diff/updated
-            rawResponseItem/completed rawResponse/completed mcpServer/elicitation/request}} {
+    } elseif {$progress} {
         set turnId [text $object params turnId]
         if {$turnId ne "" && $turnId ne [field $current turnId] && $turnId ne [field $current early] && \
             [dict exists $::retry::finished [list [field $current threadId] $turnId]]} { return $visible }
@@ -1160,6 +1256,7 @@ proc resume::acknowledge {object} {
 
 proc retry::reset {} {
     variable current; variable timer; variable delay
+    goal::reconcile
     after cancel $timer
     set timer ""
     set current {}
@@ -1176,7 +1273,7 @@ proc retry::client {json {manual 1}} {
         if {[catch {automatic::decode $json} goalObject]} {
             goal::forget 1
         } else { set goalMetadata [goal::client $goalObject] }
-    } else { goal::client $object }
+    } else { goal::client $object $manual }
     # Canceling an automatic chain may clear current before steering is recorded.
     set prior $current
     if {$manual && !$goalMetadata} {
@@ -1239,7 +1336,9 @@ proc retry::observe {turnId key value} {
     if {$turnId ne "" && ($turnId eq [field $current turnId] || \
         ([field $current turnId] eq "" && $turnId ne [field $current previous]))} {
         dict set current observations $turnId $key $value
+        return 1
     }
+    return 0
 }
 
 # App Server supplies the default empty spans when echoing submitted text.
@@ -1274,12 +1373,12 @@ proc retry::user_item {turnId item} {
                 [huddle get_stripped $item clientId] eq [huddle get_stripped $params clientUserMessageId]}]
         }
     }] || !$matches} {
-        observe $turnId progress 1
+        if {[observe $turnId progress 1]} { goal::steering }
         return
     }
     set previous [field $current observations $turnId userId]
     if {$previous ne "" && $previous ne $id} {
-        observe $turnId progress 1
+        if {[observe $turnId progress 1]} { goal::steering }
     } else {
         observe $turnId userId $id
     }
@@ -1316,6 +1415,10 @@ proc retry::update {} {
         dict set current status [field $turn status]
         dict set current overloaded [expr {[field $turn error codexErrorInfo] eq "serverOverloaded"}]
         if {[field $current status] ne "failed" || ![field $current overloaded]} {
+            # Discarding unresolved terminal ownership also expires idle history;
+            # a late ACK can no longer be reconciled against this tracker.
+            if {![field $current accepted] && $::goal::snapshot ne "" && \
+                [automatic::text $::goal::snapshot status] eq "complete"} { goal::forget 1 }
             reset
             return
         }
@@ -1339,12 +1442,12 @@ proc retry::fire {} {
     if {[field $current accepted] ne "1" || [field $current status] ne "failed" || \
         [field $current overloaded] ne "1" || [field $current progress]} { return }
     if {![goal::ready]} { return }
-    goal::forget
     set request [dict get $current request]
     set previous [dict get $current rpcId]
     set id [next_id]
     set rpcId [json_dump $id]
     huddle set request id $id
+    goal::client $request 0
     dict set internal $rpcId 1
     foreach {key value} [list request $request rpcId $rpcId \
         previous [dict get $current turnId] turnId "" status awaiting \
@@ -1401,6 +1504,8 @@ proc retry::server {json} {
     }
     set method [field $message method]
     set goalMetadata 0
+    set goalTracking [expr {$::goal::pending ne "" || \
+        ($::goal::snapshot ne "" && [automatic::text $::goal::snapshot status] eq "complete")}]
     if {$method eq "thread/goal/updated" || \
         ($id ne "" && $id eq [field $::goal::pending rpcId])} {
         if {[catch {automatic::decode $json} goalObject]} {
@@ -1410,17 +1515,29 @@ proc retry::server {json} {
     if {$method in {account/updated account/gatewayOAuth/changed} || \
         ([field $message params threadId] ne "" && \
          ([field $message params threadId] eq [field $current threadId] || \
+          [field $message params threadId] eq [field $::goal::pending threadId] || \
           ($::goal::snapshot ne "" && [field $message params threadId] eq \
            [automatic::text $::goal::snapshot threadId])) && \
          $method in {thread/closed thread/archived thread/deleted thread/reverted thread/settings/updated
              thread/queue/changed thread/goal/cleared thread/environment/connected
              thread/environment/disconnected model/rerouted})} { goal::forget 1 }
     if {$method in {turn/started turn/completed} && \
-        [field $message params threadId] eq [field $current threadId]} {
+        ([field $message params threadId] eq [field $current threadId] || \
+         [field $message params threadId] eq [field $::goal::pending threadId] || \
+         ($::goal::snapshot ne "" && [field $message params threadId] eq \
+          [automatic::text $::goal::snapshot threadId]))} {
         set turn [field $message params turn id]
         set owned [goal::owner]
         if {$owned ne "" && $turn ne "" && $turn ne [lindex $owned 2] && \
             ![dict exists $finished [list [field $current threadId] $turn]]} {
+            goal::forget 1
+        } elseif {$owned eq "" && \
+            (($::goal::snapshot ne "" && [automatic::text $::goal::snapshot status] eq "complete" && \
+              ([field $::goal::proof historical] eq "" || \
+               [field $::goal::proof historical] ne [field $current rpcId])) || \
+             ([field $::goal::pending method] eq "thread/goal/get" && \
+              [field $::goal::pending idle] eq "1")) && \
+            ![dict exists $finished [list [field $message params threadId] $turn]]} {
             goal::forget 1
         } elseif {$owned ne "" && $turn eq [lindex $owned 2] && $method eq "turn/completed" && \
             [field $message params turn status] in {completed interrupted}} { goal::forget }
@@ -1437,10 +1554,14 @@ proc retry::server {json} {
     if {$method in {account/updated account/gatewayOAuth/changed}} { reset }
     set automaticVisible 1
     set automaticValid 0
+    # Historical goals need activation/activity guards with both flags off too.
     if {$::automatic::current ne "" || $::automatic::ids ne "" || $::automatic::live ne "" || \
+        ($id ne "" && $id eq [field $::recovery::pending rpcId]) || \
+        $goalTracking || \
         $::transport::reattaching || \
         [dict get $::automatic::flags auto_reset_limit] || [dict get $::automatic::flags auto_continue_after_stop]} {
         if {[catch {automatic::decode $json} typed]} {
+            goal::reconcile
             set ::automatic::selection {}
             if {$::automatic::current ne "" && \
                 [field $::automatic::current phase] ni {running overload}} {
@@ -1489,7 +1610,11 @@ proc retry::server {json} {
     }
     if {$current eq ""} { return $visible }
     if {$response && $id eq [dict get $current rpcId]} {
-        if {[dict exists $message error]} {
+        # Historical ownership cannot be established through a rejected ACK.
+        if {[dict exists $message error] || ($goalTracking && \
+            (!$automaticValid || [huddle exists $typed method] || \
+             [automatic::text $typed result turn id] eq "" || \
+             [automatic::text $typed result turn status] ni {inProgress failed completed interrupted}))} {
             reset
         } else {
             set turn [field $message result turn]
