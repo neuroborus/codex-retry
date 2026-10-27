@@ -1,7 +1,8 @@
 # codex-retry
 
 A Tcl/Expect wrapper that keeps the native Codex TUI and retries confirmed
-model overload through the [App Server protocol](https://learn.chatgpt.com/docs/app-server).
+model overload and narrowly verified transient model-transport failures through
+the [App Server protocol](https://learn.chatgpt.com/docs/app-server).
 
 Requires `codex`, `expect`, and Tcllib, with the shared-server commands available
 in Codex CLI 0.164.0.
@@ -11,6 +12,7 @@ Run the wrapper with interactive Codex arguments:
 ```sh
 ./codex-retry
 ./codex-retry --cd "/path/to/my project"
+./codex-retry --yolo
 ./codex-retry resume --last
 ./codex-retry resume SESSION_ID --yolo
 ./codex-retry resume --last --yolo
@@ -32,7 +34,7 @@ or losing its bridge keeps the main TUI connected. Picker metadata does not
 affect the main TUI's retries, launch permissions or selected-session exit advice.
 Selecting a session still uses the native TUI's normal session handoff.
 Recovery decisions use structured events exclusively. By default, only the
-overload retry below is enabled; the optional recovery modes submit a new
+overload/transport retry below is enabled; the optional recovery modes submit a new
 `continue` turn only when explicitly configured.
 Terminal input/output, window resizing, and TUI exit status pass through.
 `Ctrl+C` stays under native TUI control, including stopping an active turn and
@@ -59,7 +61,7 @@ work remains eligible for the structured retry rules below.
 If a replacement remains unavailable, the TUI retains its draft, keyboard control
 and ordinary exit behavior. Exit diagnostics report an unrestored connection and
 offer the last verified session's resume command. A disconnect before launch
-resume YOLO permissions are confirmed still stops the launch with an error.
+YOLO permissions are confirmed still stops the launch with an error.
 Guarded permission failures and invalid primary JSON or WebSocket protocol
 still stop the wrapper.
 
@@ -110,7 +112,7 @@ native behavior.
 
 The wrapper forwards your arguments to the native Codex TUI, preserving quoted
 values, ordering, and argument boundaries, with that launch default and the
-resume YOLO exception below.
+explicit YOLO exception below.
 This includes options such as
 `--model` (`-m`), `--cd` (`-C`), `--profile` (`-p`), `--ask-for-approval` (`-a`),
 `--sandbox` (`-s`), `--image` (`-i`), and `--no-alt-screen`. The installed Codex
@@ -129,40 +131,52 @@ session.
   is rejected.
 - `--no-daemon` cannot be combined with the remote mode used by this wrapper.
   See the [Codex CLI reference](https://learn.chatgpt.com/docs/cli/reference).
-- For interactive `resume`, the wrapper consumes explicit `--yolo` or
-  `--dangerously-bypass-approvals-and-sandbox`, before or after `resume`.
-  Codex CLI 0.163.0 rejects these permission overrides on remote resume before
-  connecting. The wrapper instead requests `approvalPolicy: "never"` and
-  `sandbox: "danger-full-access"` on the launch's `thread/resume` RPC: commands
-  run without approvals or the Codex sandbox. Prompts and option values containing
-  either spelling are preserved; `--` ends flag recognition. Ordinary launches
-  and resumes retain native behavior, including new-session YOLO flags.
-- Resume YOLO retains native conflicts with `-a`/`--ask-for-approval` and
+- For fresh interactive launches and interactive `resume`, the wrapper consumes
+  explicit `--yolo` or `--dangerously-bypass-approvals-and-sandbox`, including
+  either side of `resume`. Codex CLI 0.164.0 retains launch permission overrides
+  and rejects later native `/resume` selection before sending a resume RPC.
+  The wrapper instead requests `approvalPolicy: "never"` and
+  `sandbox: "danger-full-access"` on the intended startup `thread/start` or
+  `thread/resume` RPC: commands run without approvals or the Codex sandbox.
+  Prompts and option values containing either spelling are preserved; `--` ends
+  flag recognition. Launches without these explicit flags retain native behavior.
+- Explicit YOLO retains native conflicts with `-a`/`--ask-for-approval` and
   `--approve-for-me` (alias `--not-so-yolo`). A non-null named `permissions`
-  profile on the resume RPC is also incompatible with the requested sandbox;
+  profile on the startup RPC is also incompatible with the requested sandbox;
   the wrapper rejects it rather than removing it. Other arguments and config
   overrides remain available for native or server validation.
-- The server decides the effective permissions. The wrapper verifies the matching
-  response's request ID, thread ID, approval policy, and sandbox before allowing
-  work, and forwards confirmed responses and profile provenance unchanged.
+- The server decides the effective permissions. Before allowing work, the wrapper
+  verifies the correlated response's request ID, approval policy, sandbox and a
+  nonempty thread ID. A resume must return exactly the requested thread ID;
+  a fresh start establishes its identity from the reply. Confirmed responses
+  and profile provenance pass through unchanged.
   A server rejection, malformed acknowledgement, permission mismatch, or premature
   work request stops the guarded launch with an error. Native RPC errors are
   forwarded and their messages included in the wrapper's failure guidance.
-  The launch override applies once to the intended resume. Manual thread changes
-  cancel it; changes during verification stop the launch. After confirmation,
-  subsequent manual permission changes and later threads remain native-owned.
+  The launch override applies once to the intended startup activation. Manual
+  thread changes cancel it; changes during verification stop the launch. After confirmation,
+  subsequent manual permission changes, native `/resume` selections and reconnects
+  remain native-owned, including saved session permissions and directories.
+  The wrapper never reapplies launch YOLO after a manual change.
+- Other permission flags and inline permission configuration remain subject to
+  native limitations. In particular, inline `approval_policy` or `sandbox_mode`
+  overrides can still trigger the native remote-resume rejection; translating
+  YOLO to inline config would not avoid it. The explicit-flag fix applies to new
+  wrapper processes and does not change an already-running TUI.
 - This tool is intended for interactive sessions, including `resume --last`.
   Non-interactive commands such as `exec`, `review`, `login`, and `mcp` are
   outside its supported scope. Run them directly with `codex`, for example
   `codex exec "Review the changes"`.
 
-Offline fixtures and fake Codex PTY checks cover resume permissions, config and
+Offline fixtures and fake Codex PTY checks cover startup permissions, config and
 input forwarding, shared-server attachment and ownership, cold startup, terminal
 restoration, and failure without model work. Native connection checks block
 inference and cover TUI initialization and both native and wrapped exits using
 synthetic history, live lookalikes, token totals, terminal restoration and cleanup.
 They inspect outbound session creation for fresh and explicit launch directories
-and protect saved directories during native picker selection and reconnection.
+and protect saved directories during native picker selection and reconnection,
+including a fresh explicit-YOLO launch with verified startup rights followed by
+selection of an unloaded synthetic saved session with native permissions.
 The wrapped native fixture also replaces a synthetic server connection and checks
 reauthentication, repeated initialization, same-session resume and draft retention,
 with every work request rejected before execution.
@@ -172,14 +186,40 @@ upgrading Codex.
 
 ## Retry behavior
 
-A retry requires an acknowledged `turn/start` and a matching `turn/completed`
-with `status: "failed"` and `error.codexErrorInfo: "serverOverloaded"`.
-The original input and settings are reused with a fresh request ID. This starts
+A retry requires this client's acknowledged `turn/start` and a matching
+thread/turn `turn/completed` with `status: "failed"`. Qualified failures are
+`error.codexErrorInfo: "serverOverloaded"` and these narrow transport mappings:
+
+- An object `codexErrorInfo` with exactly one of `responseStreamConnectionFailed`,
+  `responseStreamDisconnected`, `responseTooManyFailedAttempts` or
+  `httpConnectionFailed`. Its payload must be an object containing only optional
+  `httpStatusCode`: absent, null, or integer 408, 429, 500, 502, 503 or 504.
+  Permanent HTTP failures (including 401), string/fractional statuses, mixed
+  discriminators and unknown shapes are excluded. Plain string spellings of
+  these object variants are excluded too.
+- CLI 0.164.0's string `codexErrorInfo: "other"` with exactly one of these JSON
+  `error.message` values:
+  `stream disconnected before completion: stream closed before response.completed`
+  or `stream disconnected before completion: websocket closed by server before response.completed`.
+  Additional details and misalignment metadata must be absent or null.
+  Unknown error fields and non-null metadata also exclude transport recovery.
+  Similar text, generic `other`, and policy/auth/request/limit codes cannot
+  establish this mapping.
+
+Native internal retries run first. Error notifications, either value of
+`willRetry`, reconnect banners, retry counts and elapsed time never authorize
+wrapper work. A running turn or native retry that later succeeds needs no
+follow-up. This model-stream recovery does not change the proxy/TUI disconnect
+contract: losing that connection still cancels pending work.
+
+Before observable progress, recovery reuses the original input and settings with
+a fresh request ID, even when both recovery flags are false. This starts
 a new turn in the same thread; it does not rewind history or roll back effects.
 
 Retries wait 5, 10, 20, 40 seconds, and so on, capped at 30 minutes, without
-jitter or an attempt limit. Success resets the delay. Duplicate and stale events
-do not schedule extra retries. New submitted input, steering, interruption,
+jitter or an attempt limit. Mixed overload/transport failures retain the same
+accumulated delay. Success or fresh manual work resets it. Duplicate and stale
+events do not schedule extra retries. New submitted input, steering, interruption,
 thread switching, account/auth changes, and disconnection cancel a pending retry.
 Native read/unread acknowledgements (`thread/readState/update`) only change inbox
 metadata and preserve pending retries and opt-in recovery, including after tool
@@ -222,7 +262,7 @@ Rejection, invalid protocol data or discarding ownership while that activity is
 still unresolved expires history. Resets without intervening activity preserve
 the baseline.
 A rejected acknowledgement cannot establish ownership for later activity.
-If a turn completes, is interrupted, or fails without overload before its start
+If a turn completes, is interrupted, or has an unqualified failure before its start
 acknowledgement, discarding its unresolved ownership tracker expires historical
 goal provenance. Even a later matching acknowledgement then needs a new
 validated idle goal read before subsequent fresh work can use that history.
@@ -245,15 +285,15 @@ Automatic replay stops after model output, non-user item activity (including
 tool execution and automatic context compaction), MCP elicitation requests, or
 hook activity, including early events and start snapshots. Correlated legacy
 `thread/compacted` notifications also count as progress and preserve ownership
-for opt-in recovery after a later overload. Manual compaction cancels recovery.
-Hooks and MCP elicitation without a turn ID conservatively block replay in the
-active thread.
+for opt-in recovery after a later qualified failure. Manual compaction cancels
+recovery. Hooks and MCP elicitation without a turn ID conservatively block replay
+in the active thread.
 Other failures and ambiguous request rejections require manual recovery.
-The default behavior covers overload before observable progress; it is not a
-general transaction recovery mechanism.
-To continue after overload following model/tool/hook progress, enable
-`auto_continue_after_stop` below. This submits a new `continue` turn using the
-same exponential delay, rather than replaying the original request.
+The default behavior covers qualified failures before observable progress; it is
+not a general transaction recovery mechanism.
+To continue after a qualified overload/transport failure following model/tool/hook
+progress, enable `auto_continue_after_stop` below. This submits a new `continue`
+turn using the same exponential delay, rather than replaying the original request.
 
 ## Optional recovery
 
@@ -315,18 +355,19 @@ verification read. Further changes warn and leave work stopped, without another
 redemption.
 
 `auto_continue_after_stop` handles the confirmed native content stop represented
-by `cyberPolicy` in CLI 0.163.0 and `serverOverloaded` after observable progress.
-It requires this client's acknowledged `turn/start` and a matching
-`turn/completed` with `status: "failed"` and a string `error.codexErrorInfo`
-exactly equal to the applicable code. The wrapper forwards the native failure,
-then submits exactly the plain ASCII user text
-`continue` as one new turn in the same thread. Content stops continue immediately;
-overload follow-ups wait 5, 10, 20 seconds, and so on up to 30 minutes, without an
-attempt limit. Consecutive overloads retain the delay even when a new `continue`
-is needed; success or manual new work resets it. Before progress, overloads keep
-the original-input replay behavior regardless of this flag.
-Generic refusal text, `other`, `misalignmentPolicyViolation`, transient safety
-buffering, opaque moderation metadata, error notifications alone and successful
+by `cyberPolicy` in CLI 0.163.0 and qualified overload/transport failures after
+observable progress. It requires this client's acknowledged `turn/start` and a matching
+`turn/completed` with `status: "failed"` and either the exact string
+`error.codexErrorInfo: "cyberPolicy"` or the typed transport/overload mapping above.
+The wrapper forwards the native failure, then submits exactly the plain ASCII
+user text `continue` as one new turn in the same thread. Content stops continue immediately;
+overload/transport follow-ups wait 5, 10, 20 seconds, and so on up to 30 minutes,
+without an attempt limit. Mixed qualified failures retain the delay even when
+a new `continue` is needed; success or manual new work resets it. Before progress,
+qualified failures keep the original-input replay behavior regardless of this flag.
+With this flag disabled, progressed work remains stopped.
+Generic refusal text, unverified `other`, `misalignmentPolicyViolation`, transient
+safety buffering, opaque moderation metadata, error notifications alone and successful
 completion do not trigger it. Other CLI versions or stop types require a verified
 protocol mapping; there is no terminal-text fallback.
 
@@ -340,14 +381,14 @@ Each distinct qualifying failure can recover, including failures of automatic
 continuations. There is no per-chain or total-attempt cap, and the modes have
 no shared allowance. Each usage-limit incident requires fresh eligibility and
 verification with an available earned reset. Duplicate or stale events cannot
-repeat a continuation or redemption for the same failure. Overload retries
+repeat a continuation or redemption for the same failure. Overload/transport retries
 before progress retain their original input, settings and backoff. IDs,
 ownership and ordering must be unambiguous.
 Pre-existing active work reported by activation/history snapshots or
 thread-status events cannot be claimed as this client's newly started turn.
 Metadata reads preserve recovery eligibility without changing the selected thread.
 Manual turn/thread, settings or goal changes, conflicting same-thread activity,
-account changes and disconnection cancel pending recovery, including overload
+account changes and disconnection cancel pending recovery, including overload/transport
 retries of its automatic continuation. Late progress, including new or changed
 work in repeated terminal snapshots, also cancels queued recovery.
 Native warnings appear through the typed warning notification; if delivery is

@@ -334,7 +334,7 @@ try {
             if {[lindex $result 2] != 0 || [lindex $result 3] != $expected} { error "transport exit status: $result; output: $output" }
             if {$terminal ne $before || [string first "\033\[?1006l" $output] < 0} { error "terminal was not restored" }
             if {$env(TRANSPORT_CASE) eq "guard"} {
-                if {[string first "before resume --yolo permissions were confirmed" $output] < 0 ||
+                if {[string first "before launch --yolo permissions were confirmed" $output] < 0 ||
                     [string first REATTACHED $output] >= 0} { error "unverified launch was allowed to reconnect" }
             } elseif {![regexp {To resume this session, run:\r*\n[^\r\n]* resume transport-session} $output]} {
                 error "missing confirmed-session resume advice"

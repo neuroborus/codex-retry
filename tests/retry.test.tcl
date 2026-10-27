@@ -549,6 +549,274 @@ fire
 auto_followup
 check {[llength $sent] == 4} "partial progress blocked the neutral reset follow-up"
 
+# Completed native stream failures share overload replay and opt-in follow-ups.
+proc stream_completed {turn error {items {[]}} {thread t1} {status failed}} {
+    retry::server [json::write object method [json::write string turn/completed] params \
+        [json::write object threadId [json::write string $thread] turn \
+            [json::write object id [json::write string $turn] status [json::write string $status] \
+                items $items error $error]]]
+}
+set streamError {{"message":"stream disconnected before completion: stream closed before response.completed","codexErrorInfo":"other","additionalDetails":null,"misalignment":null}}
+set websocketError {{"message":"stream disconnected before completion: websocket closed by server before response.completed","codexErrorInfo":"other"}}
+set streamProgress {[{"type":"agentMessage","id":"partial-stream-output","text":"Neutral partial output."}]}
+set streamErrors [list $streamError $websocketError]
+foreach variant {responseStreamConnectionFailed responseStreamDisconnected responseTooManyFailedAttempts httpConnectionFailed} {
+    foreach payload {{{}} {{"httpStatusCode":null}} {{"httpStatusCode":408}} {{"httpStatusCode":429}}
+        {{"httpStatusCode":500}} {{"httpStatusCode":502}} {{"httpStatusCode":503}} {{"httpStatusCode":504}}} {
+        lappend streamErrors [json::write object message [json::write string "Neutral transport failure."] \
+            codexErrorInfo [json::write object $variant $payload]]
+    }
+}
+foreach error $streamErrors {
+    foreach follow {0 1} {
+        foreach progressed {0 1} {
+            auto_begin 0 $follow
+            set items [expr {$progressed ? $streamProgress : {[]}}]
+            stream_completed $autoTurn $error $items
+            stream_completed $autoTurn $error $items
+            set eligible [expr {!$progressed || $follow}]
+            check {[dict size $timers] == $eligible && $sent eq ""} "stream recovery bypassed progress/opt-in or acted before backoff"
+            if {$eligible} {
+                check {[lindex $delays end] == 5000} "stream recovery skipped its initial delay"
+                fire
+                if {$progressed} {
+                    auto_followup
+                } else {
+                    check {[huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+                        [huddle get $autoRequest params]]} "stream replay changed original input, attachments or settings"
+                }
+                check {[llength $sent] == 1} "stream failure duplicated work or consumed a reset"
+                stream_completed $autoTurn $error $items
+                check {[dict size $timers] == 0} "stale stream completion re-armed recovery"
+            }
+        }
+    }
+}
+# Reset eligibility never grants permission to continue partial stream work.
+foreach error [list $streamError $websocketError] {
+    foreach follow {0 1} {
+        auto_begin 1 $follow
+        user_event item/started {{"type":"commandExecution","id":"stream-tool"}} $autoTurn
+        stream_completed $autoTurn $error
+        check {[dict size $timers] == $follow && $sent eq ""} "reset flag authorized partial stream continuation"
+        if {$follow} { fire; auto_followup; check {[llength $sent] == 1} "stream recovery tried an account operation" }
+    }
+}
+
+# Unknown shapes, policy/auth failures and lookalike messages stay excluded.
+set rejectedStreams {}
+foreach variant {responseStreamConnectionFailed responseStreamDisconnected responseTooManyFailedAttempts httpConnectionFailed} {
+    lappend rejectedStreams [limits_fixture $streamError {codexErrorInfo} [json::write string $variant]]
+    foreach payload {null {[]} {["httpStatusCode",503]} {"httpStatusCode 503"} 503 true
+        {{"httpStatusCode":"503"}} {{"httpStatusCode":503.0}} {{"httpStatusCode":5.03e2}}
+        {{"httpStatusCode":true}} {{"httpStatusCode":[]}} {{"httpStatusCode":{}}}
+        {{"httpStatusCode":-503}} {{"httpStatusCode":0}} {{"httpStatusCode":400}}
+        {{"httpStatusCode":401}} {{"httpStatusCode":403}} {{"httpStatusCode":404}}
+        {{"httpStatusCode":409}} {{"httpStatusCode":422}} {{"httpStatusCode":501}}
+        {{"httpStatusCode":65536}} {{"httpStatusCode":503,"unknown":null}} {{"message":"closed"}}} {
+        lappend rejectedStreams [limits_fixture $streamError {codexErrorInfo} [json::write object $variant $payload]]
+    }
+}
+foreach code {null {[]} {["other"]} {["serverOverloaded"]} {{"other":{}}} {{"unknown":{}}}
+    {{"responseStreamDisconnected":{},"httpConnectionFailed":{}}}
+    {{"responseStreamDisconnected":{},"unauthorized":{}}}
+    {{"responseStreamDisconnected":{},"unknown":null}}
+    {"unauthorized"} {"misalignmentPolicyViolation"} {"badRequest"} {"rateLimitExceeded"}} {
+    lappend rejectedStreams [limits_fixture $streamError {codexErrorInfo} $code]
+}
+foreach message [list {stream closed before response.completed} \
+    {websocket closed by server before response.completed} \
+    {stream disconnected before completion: unknown reason} \
+    {stream disconnected before completion: Stream closed before response.completed} \
+    "stream disconnected before completion: stream closed before response.completed\n" \
+    {stream disconnected before completion: stream closed before response.completed (401)} \
+    {policy: stream disconnected before completion: stream closed before response.completed}] {
+    lappend rejectedStreams [limits_fixture $streamError {message} [json::write string $message]]
+}
+foreach path {{message} {codexErrorInfo} {additionalDetails} {misalignment} {unknown}} {
+    foreach value {null false {""} {[]} {{}} {"stream disconnected before completion: stream closed before response.completed"}} {
+        if {$path in {additionalDetails misalignment} && $value eq "null"} { continue }
+        if {$path eq "message" && $value eq {"stream disconnected before completion: stream closed before response.completed"}} { continue }
+        lappend rejectedStreams [limits_fixture $streamError $path $value]
+    }
+}
+foreach error $rejectedStreams {
+    foreach progressed {0 1} {
+        auto_begin 0 $progressed
+        stream_completed $autoTurn $error [expr {$progressed ? $streamProgress : {[]}}]
+        check {[dict size $timers] == 0 && $sent eq ""} "an unverified stream error triggered recovery"
+    }
+}
+foreach code [list {"other"} {{"responseStreamDisconnected":{"httpStatusCode":503}}}] {
+    foreach key {additionalDetails misalignment unknown} {
+        auto_begin 0 1
+        set error [limits_fixture $streamError {codexErrorInfo} $code]
+        set error [limits_fixture $error $key {{"reason":"unverified"}}]
+        stream_completed $autoTurn $error $streamProgress
+        check {[dict size $timers] == 0 && $sent eq ""} "contradictory stream metadata authorized continuation"
+    }
+}
+foreach follow {0 1} {
+    foreach error {
+        {{"message":"stream disconnected before completion: stream closed before response.completed","codexErrorInfo":"unauthorized","codexErrorInfo":"other"}}
+        {{"message":"Neutral failure.","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":401,"httpStatusCode":503}}}}
+        {{"message":"Neutral failure.","codexErrorInfo":{"responseStreamDisconnected":null,"responseStreamDisconnected":{}}}}
+    } {
+        auto_begin 0 $follow
+        stream_completed $autoTurn $error
+        check {[dict size $timers] == 0 && $sent eq ""} "duplicate JSON keys authorized stream recovery"
+    }
+}
+foreach code {cyberPolicy usageLimitExceeded} {
+    auto_begin 0 0
+    set error [limits_fixture $streamError {codexErrorInfo} [json::write string $code]]
+    stream_completed $autoTurn $error
+    check {[dict size $timers] == 0 && $sent eq ""} "stream prose reclassified a policy or quota failure"
+}
+
+# Native retries and terminal ACK snapshots alone cannot create wrapper work.
+foreach error [list $streamError $websocketError [lindex $streamErrors end]] {
+    foreach progressed {0 1} {
+        foreach outcome {completed interrupted failed} {
+            auto_begin 0 1
+            if {$progressed} { user_event item/started {{"type":"agentMessage","id":"stream-output","text":"Neutral partial output."}} $autoTurn }
+            foreach willRetry {true false} {
+                retry::server [format {{"method":"error","params":{"threadId":"t1","turnId":"%s","willRetry":%s,"error":%s}}} $autoTurn $willRetry $error]
+                check {[dict size $timers] == 0 && $sent eq ""} "native retry notification scheduled wrapper work"
+            }
+            stream_completed $autoTurn $error {[]} t1 $outcome
+            check {[dict size $timers] == ($outcome eq "failed")} "native completion status did not control recovery"
+        }
+        auto_begin 0 1 0
+        started $autoTurn
+        stream_completed $autoTurn $error [expr {$progressed ? $streamProgress : {[]}}]
+        check {[dict size $timers] == 0} "stream completion acknowledged its own start"
+        reply $autoId $autoTurn
+        check {[dict size $timers] == 1 && [lindex $delays end] == 5000} "early stream failure lost ACK correlation"
+        fire
+        if {$progressed} { auto_followup }
+    }
+    auto_begin 0 1 0
+    retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"failed","items":[],"error":%s}}}} $autoId $autoTurn $error]
+    check {[dict size $timers] == 0 && $sent eq ""} "terminal start reply replaced turn/completed"
+    auto_begin 0 1 0
+    started $autoTurn
+    stream_completed $autoTurn $error $streamProgress
+    reply $autoId foreign-stream-turn
+    check {[dict size $timers] == 0 && $sent eq ""} "mismatched ACK claimed stream failure"
+}
+# A status-less start ACK still needs the matching completed failure.
+foreach error [list $streamError $websocketError [lindex $streamErrors end]] {
+    foreach order {ack-first completion-first} {
+        auto_begin 0 0 0
+        if {$order eq "completion-first"} { stream_completed $autoTurn $error }
+        check {[dict size $timers] == 0} "stream failure acted before its ACK"
+        retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","items":[]}}}} $autoId $autoTurn]
+        if {$order eq "ack-first"} {
+            check {[dict size $timers] == 0} "a status-less ACK replaced turn/completed"
+            stream_completed $autoTurn $error
+        }
+        check {[dict size $timers] == 1 && $sent eq ""} "a status-less ACK lost correlated stream recovery"
+        fire
+        check {[llength $sent] == 1 && [huddle equal [huddle get [::huddle::json2huddle [lindex $sent end]] params] \
+            [huddle get $autoRequest params]]} "a status-less ACK changed stream replay input or settings"
+    }
+}
+foreach acknowledgement {
+    {"result":{"turn":{"id":["@TURN@"],"status":"inProgress","items":[]}}}
+    {"result":{"turn":{"id":"@TURN@","status":["inProgress"],"items":[]}}}
+    {"result":{"turn":{"id":"@TURN@","status":null,"items":[]}}}
+    {"result":{"turn":{"id":"@TURN@","status":"unknown","items":[]}}}
+    {"result":{"turn":{"id":"@TURN@","status":1,"items":[]}}}
+    {"result":{"turn":{"id":"@TURN@","status":{},"items":[]}}}
+    {"result":{"turn":{"id":"@TURN@","status":"inProgress","items":[]}},"method":null}
+    {"result":{"turn":{"id":"wrong","id":"@TURN@","status":"inProgress","items":[]}}}
+} {
+    auto_begin 0 0 0
+    set fields [string map [list @TURN@ $autoTurn] $acknowledgement]
+    retry::server [format {{"id":%s,%s}} $autoId $fields]
+    stream_completed $autoTurn $streamError
+    check {[dict size $timers] == 0 && $sent eq ""} "ambiguous ACK authorized default stream replay"
+}
+foreach {path value} {
+    method {["turn/start"]}
+    id {[7]}
+    {params threadId} {["t1"]}
+    {params input} {"request"}
+} {
+    automatic::cancel
+    retry::reset
+    set automatic::flags {auto_reset_limit 0 auto_continue_after_stop 0}
+    set automatic::live {}
+    set sent {}
+    retry::client [limits_fixture $request $path $value]
+    reply 7 turn1
+    stream_completed turn1 $streamError
+    check {[dict size $timers] == 0 && $sent eq ""} "ambiguous request authorized stream replay"
+}
+foreach follow {0 1} {
+    foreach {path value} {
+        method {["turn/completed"]}
+        {params threadId} {["t1"]}
+        {params turn id} {["@TURN@"]}
+        {params turn status} {["failed"]}
+    } {
+        auto_begin 0 $follow
+        set event [format {{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"%s","status":"failed","items":[],"error":%s}}}} $autoTurn $streamError]
+        retry::server [limits_fixture $event $path [string map [list @TURN@ $autoTurn] $value]]
+        check {[dict size $timers] == 0 && $sent eq ""} "ambiguous completion authorized stream recovery"
+    }
+}
+
+# One timer retains exponential backoff across overload/stream and replay/continue.
+auto_begin 0 1
+set turn $autoTurn
+set index 0
+foreach delay {5000 10000 20000 40000 80000 160000 320000 640000 1280000 1800000 1800000} {
+    set error [lindex [list $streamError {{"message":"Neutral overload.","codexErrorInfo":"serverOverloaded"}} \
+        [lindex $streamErrors end] $websocketError] [expr {$index % 4}]]
+    set items [expr {$index % 2 ? $streamProgress : {[]}}]
+    stream_completed $turn $error $items
+    stream_completed $turn $error $items
+    check {[dict size $timers] == 1 && [lindex $delays end] == $delay} "mixed transport recovery reset backoff or duplicated its timer"
+    set original [huddle get [dict get $retry::current request] params]
+    fire
+    if {$index % 2} {
+        set id [auto_followup]
+    } else {
+        set replay [::huddle::json2huddle [lindex $sent end]]
+        check {[huddle equal [huddle get $replay params] $original]} "mixed failure replay changed effective input/settings"
+        set id [json_dump [huddle get $replay id]]
+    }
+    stream_completed $turn $error $items
+    check {[dict size $timers] == 0} "mixed chain accepted a duplicate failure"
+    set turn mixed-stream-[incr index]-$autoSequence
+    reply $id $turn
+    started $turn
+}
+completed $turn completed
+check {$retry::delay == 5000 && [dict size $timers] == 0} "success did not reset mixed transport backoff"
+
+foreach progressed {0 1} {
+    foreach {side event} {
+        client {{"method":"turn/interrupt","params":{"threadId":"t1","turnId":"ignored"}}}
+        client {{"id":510,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"Fresh manual work."}]}}}
+        client {{"method":"thread/resume","params":{"threadId":"another-thread"}}}
+        client {{"method":"thread/settings/update","params":{"threadId":"t1","model":"different"}}}
+        client {{"method":"thread/goal/clear","params":{"threadId":"t1"}}}
+        client {{"method":"account/logout","params":{}}}
+        server {{"method":"turn/started","params":{"threadId":"t1","turn":{"id":"foreign-stream-work","status":"inProgress","items":[]}}}}
+    } {
+        auto_begin 0 1
+        stream_completed $autoTurn $streamError [expr {$progressed ? $streamProgress : {[]}}]
+        set callback [lindex [dict values $timers] 0]
+        retry::$side $event
+        uplevel #0 $callback
+        stream_completed $autoTurn $streamError
+        check {[dict size $timers] == 0 && $sent eq "" && $retry::delay == 5000} "manual change failed to cancel stream recovery"
+    }
+}
+
 # Ownership, order and types are required even when progress is otherwise allowed.
 foreach ack {0 1} {
     auto_begin 1 1 $ack
@@ -1752,7 +2020,7 @@ foreach follow {0 1} {
 foreach reset {0 1} {
     foreach follow {0 1} {
         foreach activity {none status start} {
-            foreach outcome {matching error malformed invalid_status duplicate_error duplicate_result reset} {
+            foreach outcome {matching error malformed missing_status invalid_status duplicate_error duplicate_result reset} {
                 set automatic::ids {}
                 historical_goal_fixture $follow 0 $reset
                 set candidate thread-activity-before-ack-[incr goalSequence]
@@ -1763,6 +2031,7 @@ foreach reset {0 1} {
                     matching { reply $autoId $candidate }
                     error { retry::server [format {{"id":%s,"error":{"code":-32602,"message":"synthetic rejection"}}} $autoId] }
                     malformed { retry::server [format {{"id":%s,"result":{"turn":{}}}} $autoId] }
+                    missing_status { retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","items":[]}}}} $autoId $candidate] }
                     invalid_status { retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"unknown","items":[]}}}} $autoId $candidate] }
                     duplicate_error {
                         retry::server [format {{"id":%s,"error":{"code":-32602,"message":"synthetic rejection"},"error":{"code":-32602,"message":"synthetic rejection"}}} $autoId]
@@ -3172,31 +3441,45 @@ foreach arguments {{--remote ws://invalid} {--remote-auth-token-env=OTHER} {-c} 
     check {[catch {backend_options $arguments}]} "invalid wrapper options were accepted"
 }
 
-# Only actual resume flags are consumed; values and prompts remain native-owned.
-foreach {arguments expected yolo} {
-    {resume session --yolo} {resume session} 1
-    {--yolo resume --last} {resume --last} 1
-    {resume --last --dangerously-bypass-approvals-and-sandbox} {resume --last} 1
-    {--dangerously-bypass-approvals-and-sandbox resume session --yolo} {resume session} 1
+# Only explicit interactive launch flags are consumed; values and prompts stay native-owned.
+foreach {arguments expected expectedActivation} {
+    {resume session --yolo} {resume session} thread/resume
+    {--yolo resume --last} {resume --last} thread/resume
+    {resume --last --dangerously-bypass-approvals-and-sandbox} {resume --last} thread/resume
+    {--dangerously-bypass-approvals-and-sandbox resume session --yolo} {resume session} thread/resume
     {resume session {quoted prompt é} --yolo -c {model="with spaces"}}
-        {resume session {quoted prompt é} -c {model="with spaces"}} 1
-    {resume session --yolo -- --yolo resume} {resume session -- --yolo resume} 1
-    {resume --last} {resume --last} 0
-    {--yolo} {--yolo} 0
-    {--yolo {new prompt}} {--yolo {new prompt}} 0
-    {exec --yolo resume} {exec --yolo resume} 0
-    {{prompt} resume --yolo} {{prompt} resume --yolo} 0
-    {-- resume --yolo} {-- resume --yolo} 0
-    {--yolo -- resume} {--yolo -- resume} 0
-    {resume session -- --yolo} {resume session -- --yolo} 0
+        {resume session {quoted prompt é} -c {model="with spaces"}} thread/resume
+    {resume session --yolo -- --yolo resume} {resume session -- --yolo resume} thread/resume
+    {-m fixture --yolo resume --last} {-m fixture resume --last} thread/resume
+    {resume --last} {resume --last} {}
+    {--yolo} {} thread/start
+    {--yolo {new prompt}} {{new prompt}} thread/start
+    {--dangerously-bypass-approvals-and-sandbox {quoted prompt é}} {{quoted prompt é}} thread/start
+    {-m fixture --yolo -c {model="with spaces"} {quoted prompt é}}
+        {-m fixture -c {model="with spaces"} {quoted prompt é}} thread/start
+    {--yolo -m resume {new prompt}} {-m resume {new prompt}} thread/start
+    {--yolo -- --yolo resume} {-- --yolo resume} thread/start
+    {exec --yolo resume} {exec --yolo resume} {}
+    {{prompt} resume --yolo} {prompt resume} thread/start
+    {-- resume --yolo} {-- resume --yolo} {}
+    {--yolo -- resume} {-- resume} thread/start
+    {resume session -- --yolo} {resume session -- --yolo} {}
+    {{a prompt containing --yolo and resume}} {{a prompt containing --yolo and resume}} {}
     {resume session {a prompt containing --yolo and resume}}
-        {resume session {a prompt containing --yolo and resume}} 0
+        {resume session {a prompt containing --yolo and resume}} {}
     {resume --last --config=--yolo -mresume -C--yolo}
-        {resume --last --config=--yolo -mresume -C--yolo} 0
-    {resume --last -c -- --yolo} {resume --last -c --} 1
+        {resume --last --config=--yolo -mresume -C--yolo} {}
+    {resume --last -c -- --yolo} {resume --last -c --} thread/resume
 } {
-    lassign [resume_arguments $arguments] actual enabled
-    check {$actual eq $expected && $enabled == $yolo} "resume flag ownership changed arguments: $arguments"
+    lassign [resume_arguments $arguments] actual enabled activation
+    check {$actual eq $expected && $enabled == ($expectedActivation ne "") && \
+        $activation eq $expectedActivation} "launch flag ownership changed arguments or activation: $arguments"
+}
+foreach command {agents exec e review fork login logout mcp mcp-server plugin app-server
+    remote-control completion update doctor sandbox debug apply a cloud queue archive
+    delete unarchive migrate-rollouts migrate-nfs-db exec-server features help} {
+    set arguments [list --yolo $command]
+    check {[resume_arguments $arguments] eq [list $arguments 0]} "an unsupported command consumed YOLO: $command"
 }
 foreach option {-c --config --enable --disable -m --model --local-provider -p --profile
     -s --sandbox -a --ask-for-approval -C --cd --add-dir -i --image} {
@@ -3211,12 +3494,15 @@ foreach arguments {
     {resume --last --dangerously-bypass-approvals-and-sandbox -anever}
     {--approve-for-me resume --last --yolo}
     {resume session --yolo --not-so-yolo}
+    {--yolo -a never}
+    {--dangerously-bypass-approvals-and-sandbox --ask-for-approval=never {new prompt}}
+    {--yolo --approve-for-me}
+    {--not-so-yolo --yolo {new prompt}}
 } {
     check {[catch {resume_arguments $arguments} message] && [string match *conflicts* $message]} "consumption hid a native permission conflict"
 }
-check {[resume_arguments {resume --last -s read-only --yolo}] eq {{resume --last -s read-only} 1}} "an unrelated sandbox flag gained a speculative conflict"
-check {[resume_arguments {resume --last -c --approve-for-me --yolo}] eq {{resume --last -c --approve-for-me} 1}} "a value was mistaken for a conflicting flag"
-check {[resume_arguments {--yolo -a never}] eq {{--yolo -a never} 0}} "new-session conflicts stopped being native-owned"
+check {[resume_arguments {resume --last -s read-only --yolo}] eq {{resume --last -s read-only} 1 thread/resume}} "an unrelated sandbox flag gained a speculative conflict"
+check {[resume_arguments {resume --last -c --approve-for-me --yolo}] eq {{resume --last -c --approve-for-me} 1 thread/resume}} "a value was mistaken for a conflicting flag"
 check {[backend_options {resume --last -m --remote -p --config -i -c --cd --enable -- --config=prompt}] eq {}} "backend extraction interpreted another option's value"
 
 # A launch default must respect native values, prompts, errors and saved roots.
@@ -3507,18 +3793,65 @@ rename presentation::native_write presentation::write
 
 set resumeRequest {{"id":31,"method":"thread/resume","params":{"threadId":"t1","approvalPolicy":"on-request","sandbox":"read-only","permissions":null,"config":{"sample":true},"initialTurnsPage":{"limit":3},"optional":null,"empty":[]}}}
 set resumeReply {{"id":31,"result":{"thread":{"id":"t1","turns":[]},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"activePermissionProfile":{"id":"fixture","extends":null}}}}
-proc arm_resume {} {
+proc arm_resume {{activation thread/resume}} {
     set ::transport::reattaching 0
     set ::transport::unavailable 0
     retry::reset
     set ::retry::finished {}
     resume::reset
     set ::resume::armed 1
+    set ::resume::activation $activation
     set ::recovery::target ""
     set ::recovery::pending {}
     set ::recovery::seen {}
     set ::recovery::deleted {}
     set ::recovery::yolo 1
+}
+# Fresh startup has no requested thread ID: only the correlated server reply
+# can establish its identity, and its effective permissions must still match.
+set startRequest [huddle remove [::huddle::json2huddle $resumeRequest] params threadId]
+huddle set startRequest method [huddle string thread/start]
+set startRequest [json_dump $startRequest]
+set startReply [string map {t1 server-created-thread} $resumeReply]
+arm_resume thread/start
+set translated [::huddle::json2huddle [resume::client $startRequest]]
+set startExpected [::huddle::json2huddle $startRequest]
+huddle set startExpected params approvalPolicy [huddle string never]
+huddle set startExpected params sandbox [huddle string danger-full-access]
+check {[huddle equal $translated $startExpected]} "fresh YOLO changed input/settings or fabricated a requested identity"
+recovery::client [json_dump $translated]
+check {[retry::server [string map {31 {"31"}} $startReply]] == 1 && $resume::pending ne ""} "a foreign typed ID confirmed fresh startup"
+check {[retry::server {{"id":31,"method":"fixture/request","params":{}}}] == 1 && $resume::pending ne ""} "a server request confirmed fresh startup"
+check {[retry::server $startReply] == 1 && $resume::pending eq "" && \
+    $recovery::target eq "server-created-thread" && $recovery::yolo} "fresh YOLO did not verify actual identity and effective rights"
+foreach action [list $startRequest $resumeRequest \
+    {{"id":32,"method":"thread/settings/update","params":{"threadId":"server-created-thread","approvalPolicy":"on-request","sandboxPolicy":{"type":"readOnly"}}}}] {
+    check {[resume::client $action] eq $action} "confirmed startup escalated later native settings or activations"
+}
+foreach response [list \
+    [string map {{"id":"server-created-thread"} {"id":""}} $startReply] \
+    [string map {{"id":"server-created-thread"} {"id":null}} $startReply] \
+    [string map {{"id":"server-created-thread"} {"id":["server-created-thread"]}} $startReply] \
+    [string map {never on-request} $startReply] \
+    [string map {dangerFullAccess readOnly} $startReply] \
+    {{"id":31,"result":{}}} \
+    [string map {{,"result":} {,"method":null,"result":}} $startReply]] {
+    arm_resume thread/start
+    recovery::client [resume::client $startRequest]
+    check {[retry::server $response] == 0 && $resume::failure ne "" && \
+        $recovery::target eq ""} "an invalid fresh acknowledgement confirmed permissions or recovery advice"
+    check {[catch {resume::client $request}]} "an invalid fresh acknowledgement permitted work"
+}
+foreach activation {
+    {"method":"thread/start","params":{}}
+    {"id":null,"method":"thread/start","params":{}}
+    {"id":31,"method":"thread/start","params":[]}
+    {"id":31,"method":"thread/start","params":{"permissions":"named"}}
+    {"id":31,"method":"thread/start","params":{"permissions":""}}
+} {
+    arm_resume thread/start
+    check {[catch {resume::client "\{$activation\}"}]} "an unidentified or conflicting fresh activation was forwarded"
+    check {[catch {resume::client $request}]} "a rejected fresh activation permitted work"
 }
 arm_resume
 set translated [::huddle::json2huddle [resume::client $resumeRequest]]
@@ -3601,43 +3934,55 @@ rename bgerror native_bgerror
 proc bgerror {message} { lappend ::proxyFailures $message; retry::reset }
 set proxyFailures {}
 set prediction {{"id":42,"method":"thread/prediction/request","params":{"threadId":"t1","sourceTurnId":"fixture-turn"}}}
-foreach stage {armed waiting rejected} {
-    foreach method {turn/start review/start thread/shellCommand thread/queue/start thread/realtime/start
-        command/exec process/spawn mcpServer/tool/call thread/goal/set thread/prediction/request} {
-        arm_resume
-        if {$stage ne "armed"} { connection fixture text $resumeRequest }
-        if {$stage eq "rejected"} {
-            set rejection {{"id":31,"error":{"code":-32000,"message":"fixture rejection","data":{"detail":"original"}}}}
-            check {[retry::server $rejection] == 1} "native resume rejection was hidden"
+foreach activation {thread/resume thread/start} {
+    set activationRequest [expr {$activation eq "thread/start" ? $startRequest : $resumeRequest}]
+    foreach stage {armed waiting rejected} {
+        foreach method {turn/start review/start thread/shellCommand thread/queue/start thread/realtime/start
+            command/exec process/spawn mcpServer/tool/call thread/goal/set thread/prediction/request} {
+            arm_resume $activation
+            if {$stage ne "armed"} { connection fixture text $activationRequest }
+            if {$stage eq "rejected"} {
+                set rejection {{"id":31,"error":{"code":-32000,"message":"fixture rejection","data":{"detail":"original"}}}}
+                check {[retry::server $rejection] == 1} "native resume rejection was hidden"
+            }
+            set before [llength $sent]
+            set work [format {{"id":40,"method":"%s","params":{"threadId":"t1","input":[]}}} $method]
+            if {$method eq "thread/prediction/request"} { set work $prediction }
+            connection fixture text $work
+            check {[llength $sent] == $before && $retry::current eq ""} "unconfirmed permissions leaked work or a retry snapshot"
         }
-        set before [llength $sent]
-        set work [format {{"id":40,"method":"%s","params":{"threadId":"t1","input":[]}}} $method]
-        if {$method eq "thread/prediction/request"} { set work $prediction }
-        connection fixture text $work
-        check {[llength $sent] == $before && $retry::current eq ""} "unconfirmed permissions leaked work or a retry snapshot"
     }
 }
-check {[llength $proxyFailures] == 30} "guarded work did not fail visibly"
-foreach mutation {
-    {"id":32,"method":"thread/start","params":{}}
-    {"id":32,"method":"thread/fork","params":{"threadId":"other"}}
-    {"id":32,"method":"thread/settings/update","params":{"threadId":"t1","approvalPolicy":"on-request"}}
-} {
-    arm_resume
-    set action "\{$mutation\}"
-    check {[resume::client $action] eq $action && !$resume::armed} "a manual change did not disarm launch YOLO"
-    check {[resume::client $resumeRequest] eq $resumeRequest} "a later thread inherited a canceled launch override"
-    arm_resume
-    connection fixture text $resumeRequest
-    set before [llength $sent]
-    connection fixture text $action
-    connection fixture text $request
-    check {[llength $sent] == $before} "a change during verification leaked unconfirmed work"
+check {[llength $proxyFailures] == 60} "guarded work did not fail visibly"
+foreach activation {thread/resume thread/start} {
+    set activationRequest [expr {$activation eq "thread/start" ? $startRequest : $resumeRequest}]
+    set otherActivation [expr {$activation eq "thread/start" ? $resumeRequest : $startRequest}]
+    foreach action [list $otherActivation \
+        {{"id":32,"method":"thread/start","params":{}}} \
+        {{"id":32,"method":"thread/fork","params":{"threadId":"other"}}} \
+        {{"id":32,"method":"thread/settings/update","params":{"threadId":"t1","approvalPolicy":"on-request"}}}] {
+        # The first matching activation is the intended startup; every activation
+        # after it (including another start) is a manual change during verification.
+        if {[field [json::json2dict $action] method] ne $activation} {
+            arm_resume $activation
+            check {[resume::client $action] eq $action && !$resume::armed} "a manual change did not disarm launch YOLO"
+            check {[resume::client $activationRequest] eq $activationRequest} "a later thread inherited a canceled launch override"
+        }
+        arm_resume $activation
+        connection fixture text $activationRequest
+        set before [llength $sent]
+        connection fixture text $action
+        connection fixture text $request
+        check {[llength $sent] == $before} "a change during verification leaked unconfirmed work"
+    }
+    foreach stage {armed waiting} {
+        arm_resume $activation
+        if {$stage eq "waiting"} { connection fixture text $activationRequest }
+        connection fixture disconnect ""
+        check {!$resume::armed && [string match {*before launch --yolo permissions were confirmed} $resume::failure]} \
+            "disconnect silently discarded unresolved launch YOLO verification"
+    }
 }
-arm_resume
-connection fixture disconnect ""
-check {!$resume::armed && [string match {*before resume --yolo permissions were confirmed} $resume::failure]} \
-    "disconnect silently discarded unresolved launch YOLO verification"
 resume::reset
 
 arm_resume
@@ -3723,7 +4068,7 @@ foreach outcome {confirmed rejected mismatch disconnected-rejection closed-rejec
     check {$forwarded eq $expectedForwarded} "resume routing altered an authoritative response or exposed unconfirmed success"
     check {[llength $proxyFailures] == ($outcome ne "confirmed")} "resume verification failure did not halt visibly"
     if {$outcome in {rejected disconnected-rejection closed-rejection}} {
-        check {$proxyFailures eq [list "server rejected resume --yolo: fixture rejection"]} \
+        check {$proxyFailures eq [list "server rejected launch --yolo: fixture rejection"]} \
             "frontend closure replaced the authoritative resume rejection"
     }
     check {$recovery::target eq ($outcome eq "confirmed" ? "t1" : "")} "resume recovery bypassed permission verification or cleanup lost confirmation"
@@ -3797,6 +4142,27 @@ rename websocket::send websocket::native_send
 rename close_backend native_close_backend
 proc websocket::send {socket type message} { lappend ::routed [list $socket $message]; return 1 }
 proc close_backend {channel} { lappend ::closedBridges $channel }
+set availability [list $transport::reattaching $transport::unavailable]
+foreach progressed {0 1} {
+    auto_begin 0 $progressed
+    stream_completed $autoTurn $streamError [expr {$progressed ? $streamProgress : {[]}}]
+    set streamCallback [lindex [dict values $timers] 0]
+    transport::lost {shared app-server proxy disconnected}
+    uplevel #0 $streamCallback
+    check {[dict size $timers] == 0 && $sent eq "" && $retry::current eq "" && $automatic::current eq ""} \
+        "proxy loss retained pending stream recovery"
+    auto_begin 0 $progressed
+    stream_completed $autoTurn $websocketError [expr {$progressed ? $streamProgress : {[]}}]
+    set freshTimers $timers
+    uplevel #0 $streamCallback
+    check {$timers eq $freshTimers && $sent eq ""} "old generation consumed a fresh stream timer"
+    fire
+    check {[llength $sent] == 1} "fresh stream work failed after proxy retirement"
+    if {$progressed} { auto_followup }
+    automatic::cancel
+    retry::reset
+}
+lassign $availability transport::reattaching transport::unavailable
 set listener [file tempfile listenerPath]
 set client old-client
 set backend old-bridge
@@ -4573,6 +4939,7 @@ puts $channel {
     fconfigure stdin -encoding utf-8 -translation lf
     fconfigure stdout -encoding utf-8 -translation lf
     set mode $env(YOLO_FIXTURE_MODE)
+    set fresh [expr {$mode in {fresh fresh-alias}}]
     set effective $env(YOLO_FIXTURE_ENABLED)
     set confirmation {{"id":31,"result":{"thread":{"id":"t1","turns":[{"id":"saved","items":[{"type":"agentMessage","text":"synthetic history é"}]}]},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"activePermissionProfile":{"id":"server-profile","extends":"fixture-parent"}}}}
     if {!$effective} { set confirmation [string map {never on-request dangerFullAccess readOnly} $confirmation] }
@@ -4615,7 +4982,7 @@ puts $channel {
             fixture::accept serve $transport
         }
         proc serve {transport type line} {
-            global mode effective confirmation turn env
+            global mode fresh effective confirmation turn env
             if {$type eq "connect"} { set ::log [open $env(YOLO_FIXTURE_LOG) w] }
             if {$type in {close disconnect}} { catch {close $::log}; return }
             if {$type eq "text"} {
@@ -4624,8 +4991,10 @@ puts $channel {
                 flush $log
                 set message [json::json2dict $line]
                 switch [dict get $message method] {
-                    thread/resume {
-                        if {[dict get $message params threadId] eq "t1"} {
+                    thread/start - thread/resume {
+                        set starting [expr {[dict get $message method] eq "thread/start"}]
+                        if {$starting || [dict get $message params threadId] eq "t1"} {
+                            if {$starting != $fresh} { exit 3 }
                             set approval [expr {$effective ? "never" : "on-request"}]
                             set sandbox [expr {$effective ? "danger-full-access" : "read-only"}]
                             if {[dict get $message params approvalPolicy] ne $approval || \
@@ -4695,7 +5064,11 @@ puts $channel {
     set ready 0
     proc receive {socket type message} {
         if {$type eq "connect"} {
-            websocket::send $socket text {{"id":31,"method":"thread/resume","params":{"threadId":"t1","approvalPolicy":"on-request","sandbox":"read-only","config":{"sample":true},"permissions":null}}}
+            if {$::fresh} {
+                websocket::send $socket text {{"id":31,"method":"thread/start","params":{"approvalPolicy":"on-request","sandbox":"read-only","config":{"sample":true},"permissions":null}}}
+            } else {
+                websocket::send $socket text {{"id":31,"method":"thread/resume","params":{"threadId":"t1","approvalPolicy":"on-request","sandbox":"read-only","config":{"sample":true},"permissions":null}}}
+            }
             if {$::mode eq "premature"} { websocket::send $socket text $::turn }
         }
         if {$type ne "text"} { return }
@@ -4865,8 +5238,8 @@ set resumeDriver {
     }
     exit 0
 }
-# Each case owns its shared fixture, port, PTY, and request log. Collect four
-# drivers per batch so independent startup/cleanup costs can overlap.
+# Each case owns its shared fixture, port, PTY, and request log. Collect eight
+# drivers per batch to leave room for stream cases within the 55-second limit.
 proc resume_batch {cases} {
     set failures {}
     foreach case $cases {
@@ -4918,7 +5291,7 @@ proc resume_batch {cases} {
 set env(PATH) "$scratch:$savedPath"
 set jobs {}
 set failed [catch {
-    foreach mode {session cold last alias ordinary rejection mismatch malformed premature startup-rejection attachment-rejection upgrade-rejection signal-term signal-hup signal-int eof input-eof} {
+    foreach mode {session cold last alias fresh fresh-alias ordinary rejection mismatch malformed premature startup-rejection attachment-rejection upgrade-rejection signal-term signal-hup signal-int eof input-eof} {
         set env(YOLO_FIXTURE_MODE) $mode
         set env(YOLO_FIXTURE_ENABLED) [expr {$mode ne "ordinary"}]
         set env(YOLO_FIXTURE_LOG) [file join $scratch $mode.jsonl]
@@ -4928,6 +5301,12 @@ set failed [catch {
         switch $mode {
             last { set launch {--yolo resume --last}; set remaining {resume --last} }
             alias { set launch {resume t1 --dangerously-bypass-approvals-and-sandbox} }
+            fresh - fresh-alias {
+                set flag --yolo
+                if {$mode eq "fresh-alias"} { set flag --dangerously-bypass-approvals-and-sandbox }
+                set launch [list $flag {quoted launch prompt é}]
+                set remaining [list --cd [pwd] {quoted launch prompt é}]
+            }
             ordinary { set launch $remaining }
         }
         set shared [list -c {fixture="with spaces"} --enable fixture]
@@ -4938,8 +5317,8 @@ set failed [catch {
             attachment-rejection { set failureText "fixture shared attachment rejection" }
             upgrade-rejection { set failureText "shared app-server WebSocket attachment failed" }
             rejection { set failureText "fixture rejection" }
-            mismatch - malformed { set failureText "did not confirm resume --yolo permissions" }
-            premature { set failureText "work requested before resume --yolo permissions were confirmed" }
+            mismatch - malformed { set failureText "did not confirm launch --yolo permissions" }
+            premature { set failureText "work requested before launch --yolo permissions were confirmed" }
         }
         set spawnLaunch [concat [list $wrapper] $launch $shared]
         if {$mode eq "input-eof"} {
@@ -4968,7 +5347,7 @@ set failed [catch {
             port $env(YOLO_FIXTURE_PORT) sharedPid $env(YOLO_FIXTURE_SHARED_PID) \
             logPath $env(YOLO_FIXTURE_LOG) before $before failureText $failureText]
         unset sharedServer
-        if {[llength $jobs] == 4} {
+        if {[llength $jobs] == 8} {
             set batch $jobs
             set jobs {}
             resume_batch $batch
@@ -5101,14 +5480,9 @@ puts $channel {
             set ::socket $socket
             if {$::mode ne "no-thread"} {
                 websocket::send $socket text {{"id":4,"method":"thread/start","params":{"approvalPolicy":"never","sandbox":"danger-full-access"}}}
-                if {$::mode eq "switched"} {
-                    websocket::send $socket text {{"id":5,"method":"thread/resume","params":{"threadId":"switched-session","approvalPolicy":"on-request","sandbox":"read-only"}}}
-                }
-                if {$::mode eq "activation-error"} {
-                    websocket::send $socket text {{"id":6,"method":"thread/resume","params":{"threadId":"not-confirmed"}}}
-                }
+            } else {
+                websocket::send $socket text {{"id":1,"method":"fixture/ready","params":{}}}
             }
-            websocket::send $socket text {{"id":1,"method":"fixture/ready","params":{}}}
         } elseif {$type eq "text"} {
             set response [json::json2dict $message]
             if {[dict exists $response method]} {
@@ -5132,6 +5506,16 @@ puts $channel {
                 }
             } else {
                 set id [dict get $response id]
+                if {$id == 4} {
+                    # Native selection changes follow the startup acknowledgement.
+                    if {$::mode eq "switched"} {
+                        websocket::send $socket text {{"id":5,"method":"thread/resume","params":{"threadId":"switched-session","approvalPolicy":"on-request","sandbox":"read-only"}}}
+                    }
+                    if {$::mode eq "activation-error"} {
+                        websocket::send $socket text {{"id":6,"method":"thread/resume","params":{"threadId":"not-confirmed"}}}
+                    }
+                    websocket::send $socket text {{"id":1,"method":"fixture/ready","params":{}}}
+                }
                 if {$id in {4 5 6 7}} { return }
                 if {$id == 9} {
                     puts TURN_INTERRUPTED
@@ -5218,6 +5602,8 @@ file attributes [file join $scratch codex] -permissions 0755
 set diagnosticFixture {
     # Expect -c runs before normal script argument initialization.
     set argv {--yolo}
+    # Advice without an activation is an ordinary launch, not unverified YOLO.
+    if {$env(DIAGNOSTIC_MODE) eq "no-thread"} { set argv {} }
     if {[string match recovery-* $env(DIAGNOSTIC_MODE)]} {
         set env(XDG_CONFIG_HOME) [file join [file dirname $env(DIAGNOSTIC_PID)] $env(DIAGNOSTIC_MODE).config]
         file mkdir [file join $env(XDG_CONFIG_HOME) codex-retry]
@@ -5505,7 +5891,7 @@ file mkdir $env(DIAGNOSTIC_EMPTY_PATH)
 set quotedWrapper [file join $scratch {launcher 'with spaces} codex-retry]
 file mkdir [file dirname $quotedWrapper]
 file copy $wrapper $quotedWrapper
-# Every driver owns a distinct PTY and PID files. Run four independent cases at
+# Every driver owns a distinct PTY and PID files. Run eight independent cases at
 # a time so repeated forced-shutdown coverage fits the frozen suite deadline.
 proc diagnostic_batch {channels} {
     set failures {}
@@ -5530,7 +5916,7 @@ set failed [catch {
         if {$actualLaunch} { set launch [list $expectedLauncher --yolo] }
         set configuredDriver "set timeout 6\n[list set expectedLauncher $expectedLauncher]\n[list set launcherPath $launchedWrapper]\n[list set actualLaunch $actualLaunch]\n[list cd $scratch]\n[list spawn -noecho {*}$launch]\n$diagnosticDriver"
         lappend jobs [open [list | expect -c $configuredDriver 2>@1] r]
-        if {[llength $jobs] == 4} {
+        if {[llength $jobs] == 8} {
             set batch $jobs
             set jobs {}
             diagnostic_batch $batch

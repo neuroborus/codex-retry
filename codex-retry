@@ -56,7 +56,7 @@ proc json_dump {value} {
     }
 }
 
-# Opt-in follow-ups have a separate lifetime from exit advice and overload replay.
+# Opt-in follow-ups have a separate lifetime from exit advice and input replay.
 namespace eval automatic {
     variable flags {auto_reset_limit 0 auto_continue_after_stop 0}
     variable configWarning ""
@@ -74,6 +74,41 @@ proc automatic::text {object args} {
     if {[is $object string {*}$args]} { return [huddle get_stripped $object {*}$args] }
     return ""
 }
+
+# Both engines classify completed model failures from typed protocol data only.
+proc retry::transient {turn} {
+    if {[automatic::text $turn status] ne "failed" || ![automatic::is $turn dict error]} { return 0 }
+    set error [huddle get $turn error]
+    set code [automatic::text $error codexErrorInfo]
+    if {$code eq "serverOverloaded"} { return 1 }
+    if {![automatic::is $error string message]} { return 0 }
+    foreach key [huddle keys $error] {
+        if {$key ni {message codexErrorInfo additionalDetails misalignment}} { return 0 }
+        if {$key in {additionalDetails misalignment} && ![automatic::is $error null $key]} { return 0 }
+    }
+    if {$code eq "other"} {
+        return [expr {[automatic::text $error message] in {
+            {stream disconnected before completion: stream closed before response.completed}
+            {stream disconnected before completion: websocket closed by server before response.completed}
+        }}]
+    }
+    if {![automatic::is $error dict codexErrorInfo]} { return 0 }
+    set info [huddle get $error codexErrorInfo]
+    set keys [huddle keys $info]
+    if {[llength $keys] != 1} { return 0 }
+    set variant [lindex $keys 0]
+    if {$variant ni {responseStreamConnectionFailed responseStreamDisconnected
+        responseTooManyFailedAttempts httpConnectionFailed} || ![automatic::is $info dict $variant]} { return 0 }
+    set payload [huddle get $info $variant]
+    foreach key [huddle keys $payload] {
+        if {$key ne "httpStatusCode"} { return 0 }
+    }
+    if {![huddle exists $payload httpStatusCode] || [automatic::is $payload null httpStatusCode]} { return 1 }
+    if {![automatic::is $payload number httpStatusCode]} { return 0 }
+    set status [huddle get_stripped $payload httpStatusCode]
+    return [expr {[string is integer -strict $status] && $status in {408 429 500 502 503 504}}]
+}
+
 proc automatic::selected {object thread args} {
     variable selection
     set selection [dict create threadId $thread model [text $object {*}$args model] \
@@ -493,7 +528,7 @@ proc automatic::client {object} {
         previous $previous early "" userId "" phase running accepted 0 generated 0 done 0]
 }
 
-# An overload replay belongs to the same manually initiated chain.
+# A transient-failure replay belongs to the same manually initiated chain.
 proc automatic::replay {request previous} {
     variable current
     if {$current eq "" || [field $current rpcId] ne $previous || \
@@ -565,7 +600,7 @@ proc automatic::completed {turn} {
         return
     }
     set code [text $turn error codexErrorInfo]
-    if {$code eq "serverOverloaded"} {
+    if {[retry::transient $turn]} {
         if {[dict get $flags auto_continue_after_stop] && [field $current progress] eq "1"} {
             queue continue_overload $::retry::delay
             set ::retry::delay [expr {min(1800000, $::retry::delay * 2)}]
@@ -1162,13 +1197,15 @@ proc presentation::finish {} {
 
 namespace eval resume {
     variable armed 0
+    variable activation thread/resume
     variable pending {}
     variable failure ""
 }
 
 proc resume::reset {} {
-    variable armed; variable pending; variable failure
+    variable armed; variable activation; variable pending; variable failure
     set armed 0
+    set activation thread/resume
     set pending {}
     set failure ""
 }
@@ -1180,31 +1217,37 @@ proc resume::reject {message} {
     error $message
 }
 
-# Only the launch resume is overridden. Later settings and turns stay native-owned.
+# Only the intended startup activation is overridden. Later settings stay native-owned.
 proc resume::client {json} {
-    variable armed; variable pending; variable failure
+    variable armed; variable activation; variable pending; variable failure
     if {$failure ne ""} { error $failure }
     if {!$armed && $pending eq ""} { return $json }
     set message [json::json2dict $json]
     set method [field $message method]
     if {$method eq ""} { return $json }
-    if {$armed && $method eq "thread/resume"} {
+    if {$armed && $method eq $activation} {
         set armed 0
         set object [::huddle::json2huddle $json]
         if {[catch {
             set id [huddle get $object id]
-            set thread [huddle get $object params threadId]
+            # A fresh start's identity comes only from its server reply.
+            set thread ""
             set valid [expr {[huddle type [huddle get $object params]] eq "dict" && \
-                [huddle type $id] in {string number} && \
-                [huddle type $thread] eq "string" && [huddle get_stripped $thread] ne ""}]
-        }] || !$valid} { reject "cannot identify the launch resume for --yolo" }
+                [huddle type $id] in {string number}}]
+            if {$activation eq "thread/resume"} {
+                set thread [huddle get $object params threadId]
+                set valid [expr {$valid && [huddle type $thread] eq "string" && \
+                    [huddle get_stripped $thread] ne ""}]
+                set thread [huddle get_stripped $thread]
+            }
+        }] || !$valid} { reject "cannot identify the launch activation for --yolo" }
         if {[dict exists $message params permissions] && \
             [huddle type [huddle get $object params permissions]] ne "null"} {
-            reject "resume --yolo cannot be combined with a named permissions profile"
+            reject "launch --yolo cannot be combined with a named permissions profile"
         }
         huddle set object params approvalPolicy [huddle string never]
         huddle set object params sandbox [huddle string danger-full-access]
-        set pending [dict create rpcId [json_dump $id] threadId [huddle get_stripped $thread]]
+        set pending [dict create rpcId [json_dump $id] threadId $thread]
         return [json_dump $object]
     }
     if {[string match "turn/*" $method] || $method in {
@@ -1214,13 +1257,13 @@ proc resume::client {json} {
         thread/realtime/appendAudio thread/realtime/appendSpeech
         thread/goal/set thread/prediction/request
         command/exec process/spawn process/writeStdin mcpServer/tool/call
-    }} { reject "work requested before resume --yolo permissions were confirmed" }
+    }} { reject "work requested before launch --yolo permissions were confirmed" }
     if {$method in {
         thread/start thread/resume thread/fork thread/revert thread/archive
         thread/delete thread/unsubscribe thread/settings/update
     }} {
         set armed 0
-        if {$pending ne ""} { reject "resume --yolo verification canceled by a manual thread or permission change" }
+        if {$pending ne ""} { reject "launch --yolo verification canceled by a manual thread or permission change" }
     }
     return $json
 }
@@ -1231,7 +1274,7 @@ proc resume::acknowledge {object} {
     if {[huddle exists $object error]} {
         set message ""
         catch {set message [huddle get_stripped $object error message]}
-        set failure "server rejected resume --yolo: $message"
+        set failure "server rejected launch --yolo: $message"
         return 1
     }
     if {[catch {
@@ -1242,12 +1285,14 @@ proc resume::acknowledge {object} {
         set valid [expr {[huddle type $result] eq "dict" && \
             [huddle type [huddle get $result thread]] eq "dict" && \
             [huddle type $thread] eq "string" && \
-            [huddle get_stripped $thread] eq [dict get $pending threadId] && \
+            [huddle get_stripped $thread] ne "" && \
+            ([dict get $pending threadId] eq "" || \
+             [huddle get_stripped $thread] eq [dict get $pending threadId]) && \
             [huddle type $approval] eq "string" && [huddle get_stripped $approval] eq "never" && \
             [huddle type [huddle get $result sandbox]] eq "dict" && \
             [huddle type $sandbox] eq "string" && [huddle get_stripped $sandbox] eq "dangerFullAccess"}]
     }] || !$valid} {
-        set failure "server did not confirm resume --yolo permissions for the requested thread"
+        set failure "server did not confirm launch --yolo permissions and thread identity"
         return 0
     }
     set pending {}
@@ -1313,8 +1358,10 @@ proc retry::client {json {manual 1}} {
             set previous [dict get $::automatic::live $threadId]
         }
         reset
-        if {$method eq "turn/start" && [dict exists $message id] && \
-            [field $message params threadId] ne "" && [field $message params input] ne ""} {
+        if {[automatic::text $object method] eq "turn/start" && [huddle exists $object id] && \
+            [huddle type $object id] in {string number} && \
+            [automatic::text $object params threadId] ne "" && \
+            [automatic::is $object list params input] && [huddle llength [huddle get $object params input]] > 0} {
             set current [dict create request $object \
                 rpcId [json_dump [huddle get $object id]] \
                 threadId [field $message params threadId] turnId "" status awaiting \
@@ -1412,8 +1459,8 @@ proc retry::update {} {
     if {[field $observed progress] eq "1"} { progress }
     if {[dict exists $observed completion]} {
         set turn [dict get $observed completion]
-        dict set current status [field $turn status]
-        dict set current overloaded [expr {[field $turn error codexErrorInfo] eq "serverOverloaded"}]
+        dict set current status [automatic::text $turn status]
+        dict set current overloaded [transient $turn]
         if {[field $current status] ne "failed" || ![field $current overloaded]} {
             # Discarding unresolved terminal ownership also expires idle history;
             # a late ACK can no longer be reconciled against this tracker.
@@ -1489,7 +1536,7 @@ proc retry::response_id {json} {
     return ""
 }
 
-# Hide internal replay replies and unconfirmed resume success; forward other traffic.
+# Hide internal replay replies and unconfirmed startup success; forward other traffic.
 proc retry::server {json} {
     variable current; variable internal; variable finished
     set id [response_id $json]
@@ -1585,7 +1632,7 @@ proc retry::server {json} {
                 [huddle get_stripped $object method] ne ""}]
             if {!$serverRequest} {
                 if {!$response || $hasMethod} {
-                    set ::resume::failure "malformed acknowledgement for resume --yolo"
+                    set ::resume::failure "malformed acknowledgement for launch --yolo"
                     return 0
                 }
                 set visible [resume::acknowledge $object]
@@ -1610,11 +1657,14 @@ proc retry::server {json} {
     }
     if {$current eq ""} { return $visible }
     if {$response && $id eq [dict get $current rpcId]} {
-        # Historical ownership cannot be established through a rejected ACK.
-        if {[dict exists $message error] || ($goalTracking && \
-            (!$automaticValid || [huddle exists $typed method] || \
-             [automatic::text $typed result turn id] eq "" || \
-             [automatic::text $typed result turn status] ni {inProgress failed completed interrupted}))} {
+        # Native ACKs may omit status; historical ownership still requires it.
+        if {(!$automaticValid && [catch {automatic::decode $json} typed]) || \
+            [huddle exists $typed method] || \
+            ![automatic::is $typed dict result turn] || \
+            [automatic::text $typed result turn id] eq "" || \
+            (($goalTracking || [huddle exists $typed result turn status]) && \
+             [automatic::text $typed result turn status] ni {inProgress failed completed interrupted}) || \
+            [dict exists $message error] || ($goalTracking && !$automaticValid)} {
             reset
         } else {
             set turn [field $message result turn]
@@ -1653,7 +1703,18 @@ proc retry::server {json} {
         if {$freshCompletion || $turnId eq [field $current turnId] || \
             [dict exists $current observations $turnId completion]} {
             items [field $params turn] $json params turn
-            if {$freshCompletion} { observe $turnId completion [field $params turn] }
+            if {$freshCompletion} {
+                if {(!$automaticValid && [catch {automatic::decode $json} typed]) || \
+                    [automatic::text $typed method] ne "turn/completed" || \
+                    ![automatic::is $typed dict params turn] || \
+                    [automatic::text $typed params threadId] ne [field $current threadId] || \
+                    [automatic::text $typed params turn id] ne $turnId} {
+                    automatic::cancel
+                    reset
+                    return $visible
+                }
+                observe $turnId completion [huddle get $typed params turn]
+            }
             update
         }
     } else {
@@ -1720,7 +1781,7 @@ proc transport::retire {} {
 
 proc transport::lost {message} {
     if {$::resume::armed || $::resume::pending ne ""} {
-        resume::reject "$message before resume --yolo permissions were confirmed"
+        resume::reject "$message before launch --yolo permissions were confirmed"
     }
     set ::transport::reattaching 1
     set ::transport::unavailable 1
@@ -2289,10 +2350,16 @@ proc resume_arguments {arguments} {
         if {$command eq "" && ![string match -* $argument]} { set command $argument }
     }
     set ::recovery::yolo [expr {[llength $flags] > 0}]
-    if {$command ne "resume" || ![llength $flags]} { return [list $arguments 0] }
-    if {[llength $conflicts]} { error "resume --yolo conflicts with [join $conflicts {, }]" }
+    # A positional prompt is a fresh interactive launch, not a subcommand.
+    if {![llength $flags] || $command in {
+        agents exec e review fork login logout mcp mcp-server plugin app-server
+        remote-control completion update doctor sandbox debug apply a cloud
+        queue archive delete unarchive migrate-rollouts migrate-nfs-db exec-server
+        features help
+    }} { return [list $arguments 0] }
+    if {[llength $conflicts]} { error "launch --yolo conflicts with [join $conflicts {, }]" }
     foreach index [lreverse $flags] { set arguments [lreplace $arguments $index $index] }
-    return [list $arguments 1]
+    return [list $arguments 1 [expr {$command eq "resume" ? "thread/resume" : "thread/start"}]]
 }
 
 proc backend_options {arguments} {
@@ -2338,10 +2405,11 @@ proc main {arguments} {
     if {[catch {set ::terminal::saved [exec stty -g <@stdin]}]} {
         catch {set ::terminal::saved [exec stty -g < /dev/tty]}
     }
-    lassign [resume_arguments $arguments] arguments yolo
+    lassign [resume_arguments $arguments] arguments yolo activation
     set arguments [cwd_arguments $arguments]
     resume::reset
     set ::resume::armed $yolo
+    if {$yolo} { set ::resume::activation $activation }
     set random [open /dev/urandom rb]
     set token [binary encode hex [read $random 16]]
     set retry::prefix "codex-retry-[binary encode hex [read $random 16]]"

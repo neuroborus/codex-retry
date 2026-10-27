@@ -809,8 +809,8 @@ proc read_control {} {
 }
 
 # Two short native launches share the rejecting metadata backend. The first
-# starts fresh, selects an unloaded saved session and reconnects; the second
-# proves an explicit path with spaces reaches thread/start unchanged.
+# starts fresh with YOLO, selects an unloaded saved session and reconnects;
+# the second proves an explicit path with spaces reaches thread/start unchanged.
 proc cwd_probe_event {socket type text} {
     if {[catch {
         if {$type ne "text"} { return }
@@ -833,14 +833,27 @@ proc cwd_probe_event {socket type text} {
                     error {{"code":-32600,"message":"fixture rejects session creation"}}]
                 return
             }
+            check {[dict get $message params approvalPolicy] eq "never" && \
+                [dict get $message params sandbox] eq "danger-full-access"} \
+                "native session lifecycle was incomplete"
             set result [::huddle::json2huddle [result_for thread/resume \
                 [dict create params [dict create threadId $::threadId]] [huddle create]]]
             huddle set result cwd [huddle string $root]
             huddle set result thread cwd [huddle string $root]
             huddle set result thread turns [huddle list]
+            # Acknowledge the actual requested startup rights, not saved defaults.
+            huddle set result approvalPolicy [huddle string never]
+            huddle set result sandbox [huddle create type [huddle string dangerFullAccess]]
             set result [huddle jsondump $result "" ""]
             set ::probePhase fresh
         } else {
+            if {$method eq "thread/resume"} {
+                foreach key {approvalPolicy sandbox permissions} {
+                    check {![huddle exists $object params $key] || \
+                        [huddle type $object params $key] eq "null"} \
+                        "native session lifecycle was incomplete"
+                }
+            }
             # result_for is an allowlist: every work API fails before execution.
             set result [result_for $method $message $object]
             if {$method eq "config/read"} {
@@ -992,7 +1005,7 @@ proc cwd_probes {} {
             set ::probeDone 0
             set ::probeRequests 0
             set ::probeBytes 0
-            set arguments {}
+            set arguments {--yolo}
             if {$::probeExplicit} { set arguments [list --cd $::explicitRoot] }
             set timer [after 8000 {
                 set ::probeFailure "native session lifecycle was incomplete"
