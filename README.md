@@ -245,6 +245,23 @@ thread switching, account/auth changes, and disconnection cancel a pending retry
 Native read/unread acknowledgements (`thread/readState/update`) only change inbox
 metadata and preserve pending retries and opt-in recovery, including after tool
 progress. They do not authorize recovery or acknowledge a model request.
+Typed `thread/name/set` requests likewise change only the display name.
+
+Native 0.165 inline turn settings can emit `thread/settings/updated` before the
+start acknowledgement. The wrapper preserves a settings application only when
+its typed effective values match the selected thread's activation baseline and
+this client's pending or acknowledged turn request, including native collaboration
+preset resolution. Repeated echoes preserve the timer; they never acknowledge
+work. Unproven, malformed or changed settings and manual settings RPCs still
+cancel recovery.
+
+Native title helpers remain background work only when `thread/start` explicitly
+sets string `threadSource: "thread_title"` and boolean `ephemeral: true`, after
+foreground activation, with correlated request and thread IDs. Their work,
+completion and cleanup preserve foreground ownership, goal provenance, backoff
+and exit advice. Prompts, schemas and terminal text do not identify helpers.
+Other activations and thread switches retain normal cancellation behavior;
+helpers cannot bypass startup permission verification.
 
 Goal usage and lifecycle notifications with status `active` or `blocked` can
 also preserve eligibility. The wrapper requires a known goal snapshot from a

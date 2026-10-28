@@ -2597,12 +2597,15 @@ proc metadata_read {method thread} {
             huddle set params expectedRevision [huddle string fixture-revision]
             huddle set params operation [huddle create type [huddle string read]]
         }
+        thread/name/set {
+            huddle set params name [huddle string "Neutral fixture title"]
+        }
     }
     return [json_dump [huddle create id [huddle string metadata-[incr ::metadataSequence]] \
         method [huddle string $method] params $params]]
 }
 foreach method {thread/queue/list thread/backgroundTerminals/list thread/items/read thread/timeline/list
-    thread/read thread/readState/update thread/list thread/loaded/list thread/search thread/searchOccurrences thread/turns/list
+    thread/read thread/readState/update thread/name/set thread/list thread/loaded/list thread/search thread/searchOccurrences thread/turns/list
     thread/items/list thread/goal/get thread/attachment/list thread/attachmentOwner/list thread/realtime/listVoices
     account/read account/rateLimits/read account/usage/read account/workspaceMessages/read account/gatewayOAuth/read} {
     foreach stage {running queued_stop verify} {
@@ -2625,6 +2628,760 @@ foreach method {thread/queue/list thread/backgroundTerminals/list thread/items/r
         auto_followup
     }
 }
+
+# Native 0.165 inline settings and explicitly marked title helpers share the
+# foreground connection, but neither can acknowledge or replace its model turn.
+set capacitySequence 0
+proc capacity_client {json} {
+    recovery::client $json
+    retry::client $json
+}
+proc capacity_activation {thread} {
+    set result [automatic::decode {{"thread":{"id":"t1","status":{"type":"idle"}},"model":"fixture-model","modelProvider":"openai","cwd":"/fixture","approvalPolicy":"never","approvalsReviewer":"user","sandbox":{"type":"readOnly","networkAccess":false},"activePermissionProfile":null,"disabledPluginIds":[],"reasoningEffort":null,"serviceTier":null,"multiAgentMode":"explicitRequestOnly"}}]
+    huddle set result thread id [huddle string $thread]
+    return $result
+}
+proc capacity_begin {{follow 1} {acknowledge 1} {numeric 0} {baselineOverrides ""} {requestOverrides ""}} {
+    automatic::cancel
+    retry::reset
+    goal::forget 1
+    resume::reset
+    foreach name {pending seen deleted helpers helperRequests} { set ::recovery::$name {} }
+    foreach name {usedIds internal finished} { set ::retry::$name {} }
+    set ::automatic::ids {}
+    set ::automatic::live {}
+    set ::automatic::flags [list auto_reset_limit 0 auto_continue_after_stop $follow]
+    set ::retry::finished {}
+    set ::sent {}
+    set ::transport::reattaching 0
+    set sequence [incr ::capacitySequence]
+    set activation [huddle string capacity-activation-$sequence]
+    capacity_client [json_dump [huddle create id $activation method [huddle string thread/start] params [huddle create]]]
+    set baseline [capacity_activation t1]
+    if {$baselineOverrides ne ""} {
+        foreach key [huddle keys $baselineOverrides] { huddle set baseline $key [huddle get $baselineOverrides $key] }
+    }
+    retry::server [json_dump [huddle create id $activation result $baseline]]
+    set ::capacityId [huddle string capacity-work-$sequence]
+    if {$numeric} { set ::capacityId [huddle number [expr {100000 + $sequence}]] }
+    set ::capacityTurn capacity-turn-$sequence
+    set ::capacityRequest [automatic::decode {{"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"Neutral foreground task","text_elements":[]}],"cwd":"/fixture","runtimeWorkspaceRoots":["/fixture"],"disabledPluginIds":null,"approvalPolicy":"never","approvalsReviewer":"user","sandboxPolicy":null,"permissions":null,"model":"fixture-model","serviceTierForTurn":null,"effort":null,"summary":null,"personality":null,"multiAgentMode":null,"collaborationMode":{"mode":"default","settings":{"model":"fixture-model","reasoning_effort":null,"developer_instructions":null}}}}}]
+    huddle set ::capacityRequest id $::capacityId
+    if {$requestOverrides ne ""} {
+        foreach key [huddle keys $requestOverrides] { huddle set ::capacityRequest params $key [huddle get $requestOverrides $key] }
+    }
+    capacity_client [json_dump $::capacityRequest]
+    set ::capacitySettings [automatic::decode {{"method":"thread/settings/updated","params":{"threadId":"t1","threadSettings":{"disabledPluginIds":[],"cwd":"/fixture","approvalPolicy":"never","approvalsReviewer":"user","sandboxPolicy":{"networkAccess":false,"type":"readOnly"},"activePermissionProfile":null,"model":"fixture-model","modelProvider":"openai","serviceTier":null,"effort":null,"summary":null,"collaborationMode":{"settings":{"developer_instructions":"Native resolved preset","reasoning_effort":null,"model":"fixture-model"},"mode":"default"},"multiAgentMode":"explicitRequestOnly","personality":null}}}}]
+    if {$acknowledge} { reply [json_dump $::capacityId] $::capacityTurn; started $::capacityTurn }
+}
+proc capacity_echo {} {
+    check {[retry::server [json_dump $::capacitySettings]] == 1} "own settings notification was hidden"
+}
+proc capacity_state {} {
+    list $::retry::current $::retry::timer $::retry::delay $::automatic::current \
+        $::automatic::timer $::automatic::selection $::automatic::live \
+        $::goal::snapshot $::goal::pending $::goal::proof $::recovery::target $::recovery::yolo $::timers
+}
+proc capacity_title {id {thread title-thread} {acknowledge 1}} {
+    set request [huddle create id $id method [huddle string thread/start] \
+        params [huddle create threadSource [huddle string thread_title] ephemeral [huddle true]]]
+    capacity_client [json_dump $request]
+    if {$acknowledge} {
+        retry::server [json_dump [huddle create id $id result [huddle create thread \
+            [huddle create id [huddle string $thread] threadSource [huddle string thread_title] ephemeral [huddle true]]]]]
+    }
+    return $request
+}
+proc capacity_title_turn {id {thread title-thread}} {
+    set request [huddle create id $id method [huddle string turn/start] \
+        params [huddle create threadId [huddle string $thread] input \
+            [huddle list [huddle create type [huddle string text] text [huddle string "Neutral helper work"]]]]]
+    capacity_client [json_dump $request]
+    return $request
+}
+proc capacity_followup {} {
+    set follow [automatic::decode [lindex $::sent end]]
+    check {[automatic::text $follow method] eq "turn/start" &&
+        [automatic::text $follow params threadId] eq "t1" &&
+        [huddle llength [huddle get $follow params input]] == 1 &&
+        [automatic::text $follow params input 0 type] eq "text" &&
+        [automatic::text $follow params input 0 text] eq "continue"} "capacity recovery did not submit literal continue"
+    foreach key {cwd approvalPolicy approvalsReviewer sandboxPolicy permissions model collaborationMode} {
+        check {[huddle equal [huddle get $follow params $key] [huddle get $::capacityRequest params $key]]} \
+            "capacity continuation changed settings"
+    }
+}
+
+foreach numeric {0 1} {
+    foreach follow {0 1} {
+        foreach progress {0 1} {
+            foreach ordering {early late completed_before_ack} {
+                capacity_begin $follow [expr {$ordering eq "late"}] $numeric
+                goal_read_fixture
+                if {$ordering ne "late"} {
+                    capacity_echo
+                    check {![field $retry::current accepted] && [dict size $timers] == 0} \
+                        "settings echo acknowledged a foreground request"
+                    started $capacityTurn
+                }
+                if {$progress} { user_event item/started {{"type":"commandExecution","id":"capacity-progress"}} $capacityTurn }
+                if {$ordering eq "completed_before_ack"} { completed $capacityTurn }
+                capacity_echo
+                set preserved [capacity_state]
+                capacity_echo
+                check {[capacity_state] eq $preserved} "repeated own settings changed ownership or goal provenance"
+                if {$ordering ne "late"} {
+                    reply [json_dump [expr {$numeric ? [huddle string [huddle get_stripped $capacityId]] : [huddle number 100001]}]] foreign-turn
+                    check {![field $retry::current accepted] && [dict size $timers] == 0} "a foreign typed ID acknowledged settings"
+                    reply [json_dump $capacityId] $capacityTurn
+                }
+                if {$ordering ne "completed_before_ack"} { completed $capacityTurn }
+                completed $capacityTurn
+                set expected [expr {!$progress || $follow}]
+                check {[dict size $timers] == $expected && $sent eq ""} "own settings lost recovery or bypassed opt-in"
+                if {$expected} {
+                    set preserved [capacity_state]
+                    capacity_echo
+                    check {[capacity_state] eq $preserved} "late settings reset backoff"
+                    check {[lindex $delays end] == 5000} "settings changed first backoff"
+                    fire
+                    if {$progress} {
+                        capacity_followup
+                    } else {
+                        check {[huddle equal [huddle get [automatic::decode [lindex $sent end]] params] \
+                            [huddle get $capacityRequest params]]} "settings changed original-input replay"
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Defaults, effective permissions/profile data and explicit collaboration settings
+# are compared as typed protocol values. New or malformed settings still cancel.
+foreach variant {optional_defaults optional_collaboration explicit_preset inline_change profile} {
+    capacity_begin
+    switch -- $variant {
+        optional_defaults {
+            foreach key {personality summary serviceTier} { set capacitySettings [huddle remove $capacitySettings params threadSettings $key] }
+        }
+        optional_collaboration {
+            huddle set capacityRequest params collaborationMode settings [huddle create model [huddle string fixture-model]]
+            dict set retry::current request $capacityRequest
+            set capacitySettings [huddle remove $capacitySettings params threadSettings collaborationMode settings reasoning_effort]
+            huddle set capacitySettings params threadSettings collaborationMode settings developer_instructions [huddle null]
+        }
+        explicit_preset {
+            huddle set capacityRequest params collaborationMode settings developer_instructions [huddle string "Explicit instructions"]
+            dict set retry::current request $capacityRequest
+            huddle set capacitySettings params threadSettings collaborationMode settings developer_instructions [huddle string "Explicit instructions"]
+        }
+        inline_change {
+            huddle set capacityRequest params collaborationMode settings model [huddle string selected-model]
+            huddle set capacityRequest params collaborationMode settings reasoning_effort [huddle string high]
+            huddle set capacityRequest params sandboxPolicy [huddle create type [huddle string dangerFullAccess]]
+            dict set retry::current request $capacityRequest
+            huddle set capacitySettings params threadSettings model [huddle string selected-model]
+            huddle set capacitySettings params threadSettings effort [huddle string high]
+            huddle set capacitySettings params threadSettings sandboxPolicy [huddle create type [huddle string dangerFullAccess]]
+            huddle set capacitySettings params threadSettings collaborationMode settings model [huddle string selected-model]
+            huddle set capacitySettings params threadSettings collaborationMode settings reasoning_effort [huddle string high]
+        }
+        profile {
+            set profile [huddle create id [huddle string fixture-profile] extends [huddle null]]
+            set settings [dict get $retry::current settings]
+            huddle set settings activePermissionProfile $profile
+            dict set retry::current settings $settings
+            huddle set capacityRequest params permissions [huddle string fixture-profile]
+            dict set retry::current request $capacityRequest
+            huddle set capacitySettings params threadSettings activePermissionProfile $profile
+        }
+    }
+    capacity_echo
+    completed $capacityTurn
+    check {[dict size $timers] == 1} "verified effective settings canceled replay"
+}
+foreach mutation {
+    {model {"foreign-model"}} {modelProvider {"foreign-provider"}} {cwd {"/foreign"}}
+    {approvalPolicy {"on-request"}} {approvalsReviewer {"guardian_subagent"}}
+    {sandboxPolicy {{"type":"dangerFullAccess"}}} {activePermissionProfile {{"id":"foreign-profile"}}}
+    {disabledPluginIds ["foreign"]} {effort {"high"}} {multiAgentMode {"foreign"}}
+    {collaborationMode {{"mode":"plan","settings":{"model":"fixture-model","reasoning_effort":null,"developer_instructions":"Native resolved preset"}}}}
+    {model 4} {collaborationMode null} {unknownSetting null}
+} {
+    capacity_begin
+    lassign $mutation key value
+    huddle set capacitySettings params threadSettings $key [json_decode $value]
+    capacity_echo
+    completed $capacityTurn
+    check {$retry::current eq "" && $automatic::current eq "" && [dict size $timers] == 0} "foreign/malformed settings retained recovery"
+}
+capacity_begin
+capacity_echo
+huddle set capacitySettings params threadSettings collaborationMode settings developer_instructions [huddle string "Changed instructions"]
+capacity_echo
+check {$retry::current eq "" && $automatic::current eq ""} "changed resolved instructions masqueraded as a repeated echo"
+capacity_begin 1 0
+capacity_echo
+reply [json_dump $capacityId] wrong-turn
+started $capacityTurn
+completed $capacityTurn
+check {[dict size $timers] == 0} "settings echo bypassed a mismatched start ACK"
+capacity_begin
+dict unset retry::current settings
+capacity_echo
+check {$retry::current eq "" && $automatic::current eq ""} "settings without activation proof retained ownership"
+capacity_begin 0
+capacity_client {{"id":"manual-rights","method":"thread/settings/update","params":{"threadId":"t1","approvalPolicy":"on-request"}}}
+huddle set capacitySettings params threadSettings approvalPolicy [huddle string on-request]
+huddle set capacitySettings params threadSettings sandboxPolicy [huddle create type [huddle string dangerFullAccess]]
+retry::server [json_dump $capacitySettings]
+set capacityId [huddle string after-manual-rights]
+huddle set capacityRequest id $capacityId
+huddle set capacityRequest params approvalPolicy [huddle string on-request]
+capacity_client [json_dump $capacityRequest]
+capacity_echo
+reply [json_dump $capacityId] fresh-rights-turn
+completed fresh-rights-turn
+check {[dict size $timers] == 1} "new work could not verify its updated native permissions baseline"
+foreach malformed {method thread params} {
+    capacity_begin
+    user_event item/started {{"type":"agentMessage","id":"malformed-settings-progress"}} $capacityTurn
+    switch -- $malformed {
+        method { huddle set capacitySettings method [huddle list [huddle string thread/settings/updated]] }
+        thread { huddle set capacitySettings params threadId [huddle list [huddle string t1]] }
+        params { huddle set capacitySettings params [huddle list] }
+    }
+    retry::server [json_dump $capacitySettings]
+    completed $capacityTurn
+    check {$automatic::current eq "" && $retry::current eq "" && [dict size $timers] == 0} \
+        "malformed settings canceled only one recovery engine"
+}
+
+# Historical completed-goal proof survives both native bookkeeping paths and a
+# delayed start ACK; neither path establishes this proof on its own.
+capacity_begin 1 0
+automatic::cancel
+retry::reset
+goal_read_fixture [goal_fixture complete]
+set capacityId [huddle string capacity-historical-work]
+huddle set capacityRequest id $capacityId
+capacity_client [json_dump $capacityRequest]
+capacity_echo
+set preserved [capacity_state]
+capacity_title [huddle string historical-title]
+check {[capacity_state] eq $preserved} "title activation discarded completed-goal provenance"
+started $capacityTurn
+user_event item/started {{"type":"commandExecution","id":"historical-capacity-work"}} $capacityTurn
+completed $capacityTurn
+capacity_echo
+check {[dict size $timers] == 0} "bookkeeping bypassed historical-goal start acknowledgement"
+reply [json_dump $capacityId] $capacityTurn
+set preserved [capacity_state]
+goal_read_fixture [goal_fixture complete]
+check {[capacity_state] eq $preserved && [dict size $timers] == 1} "bookkeeping expired unchanged historical-goal recovery"
+fire
+capacity_followup
+
+# A helper can run concurrently, even before the foreground ACK. Its success,
+# failure and cleanup preserve the foreground goal, selection, advice and timer.
+foreach follow {0 1} {
+    foreach early {0 1} {
+        foreach outcome {completed failed} {
+            capacity_begin $follow [expr {!$early}]
+            goal_read_fixture
+            capacity_echo
+            set preserved [capacity_state]
+            foreach id {702 {"702"}} thread {title-one title-two} {
+                capacity_title [json_decode $id] $thread
+                capacity_title_turn [huddle string helper-turn-$thread] $thread
+                started helper-$thread $thread
+            }
+            check {[dict size $recovery::helpers] == 2} "typed helper IDs collided during concurrent work"
+            foreach id {{"702"} 702} thread {title-two title-one} {
+                retry::server [json_dump [huddle create id [json_decode $id] result [huddle create thread \
+                    [huddle create id [huddle string $thread] threadSource [huddle string thread_title] ephemeral [huddle true]]]]]
+                completed helper-$thread $outcome serverOverloaded {[]} $thread
+                reply [json::write string helper-turn-$thread] helper-$thread
+                reply [json::write string helper-turn-$thread] helper-$thread
+                foreach status {active idle notLoaded systemError} {
+                    retry::server [format {{"method":"thread/status/changed","params":{"threadId":"%s","status":{"type":"%s"}}}} $thread $status]
+                }
+                capacity_client [format {{"id":"unsubscribe-%s","method":"thread/unsubscribe","params":{"threadId":"%s"}}} $thread $thread]
+                retry::server [format {{"id":"unsubscribe-%s","result":{}}} $thread]
+                retry::server [format {{"method":"thread/deleted","params":{"threadId":"%s"}}} $thread]
+            }
+            check {[capacity_state] eq $preserved} "title helper changed foreground proof, backoff or selection"
+            check {[string first {resume t1} [recovery::advice]] >= 0} "title helper became exit resume target"
+            if {$early} { reply [json_dump $capacityId] $capacityTurn; started $capacityTurn }
+            user_event item/started {{"type":"agentMessage","id":"foreground-output"}} $capacityTurn
+            completed $capacityTurn
+            set preserved [capacity_state]
+            capacity_title [huddle string helper-during-backoff] backoff-title
+            capacity_title_turn [huddle string backoff-title-turn] backoff-title
+            reply {"backoff-title-turn"} title-success
+            completed title-success completed serverOverloaded {[]} backoff-title
+            check {[capacity_state] eq $preserved && [dict size $timers] == $follow} "helper success reset foreground backoff or bypassed opt-in"
+            if {!$follow} { check {$sent eq ""} "helper replayed partial work"; continue }
+            fire
+            capacity_followup
+            set followup [automatic::decode [lindex $sent end]]
+            reply [json_dump [huddle get $followup id]] continued-turn
+            started continued-turn
+            user_event item/started {{"type":"agentMessage","id":"continued-output"}} continued-turn
+            completed continued-turn
+            check {[lindex $delays end] == 10000 && [dict size $timers] == 1} "helper activity reset exponential delay"
+        }
+    }
+}
+
+capacity_begin 0
+capacity_echo
+capacity_title [huddle string no-progress-title]
+completed $capacityTurn
+set preserved [capacity_state]
+capacity_title_turn [huddle string no-progress-title-turn]
+reply {"no-progress-title-turn"} no-progress-helper
+completed no-progress-helper completed serverOverloaded {[]} title-thread
+check {[capacity_state] eq $preserved && [dict size $timers] == 1} "helper success canceled default pre-progress replay"
+fire
+check {[huddle equal [huddle get [automatic::decode [lindex $sent end]] params] \
+    [huddle get $capacityRequest params]]} "helper activity changed original-input replay"
+
+# Only explicit, typed, correlated helper lifecycles are isolated.
+foreach variant {source ephemeral collision no_foreground before_start_ack wrong_thread malformed_ack malformed_method contradictory_ack wrong_turn rejected_start rejected_turn} {
+    capacity_begin
+    capacity_echo
+    set id [huddle string helper-negative-$variant]
+    if {$variant eq "collision"} { set id $capacityId }
+    set helper [huddle create id $id method [huddle string thread/start] \
+        params [huddle create threadSource [huddle string thread_title] ephemeral [huddle true]]]
+    if {$variant ni {source ephemeral no_foreground}} { capacity_client [json_dump $helper] }
+    switch -- $variant {
+        source - ephemeral - no_foreground {
+            if {$variant eq "source"} { huddle set helper params threadSource [huddle string user] }
+            if {$variant eq "ephemeral"} { huddle set helper params ephemeral [huddle string true] }
+            if {$variant eq "no_foreground"} { set recovery::target ""; set automatic::selection {} }
+            capacity_client [json_dump $helper]
+        }
+        before_start_ack { capacity_title_turn [huddle string premature-helper-turn] title-negative }
+        wrong_thread - malformed_ack - contradictory_ack {
+            set thread title-negative
+            if {$variant eq "wrong_thread"} { set thread t1 }
+            set result [huddle create thread [huddle create id [huddle string $thread] \
+                ephemeral [huddle true] threadSource [huddle string thread_title]]]
+            if {$variant eq "malformed_ack"} { huddle set result thread ephemeral [huddle string true] }
+            retry::server [json_dump [huddle create id $id result $result]]
+            if {$variant eq "contradictory_ack"} {
+                huddle set result thread id [huddle string spoofed-helper]
+                retry::server [json_dump [huddle create id $id result $result]]
+            }
+        }
+        malformed_method { retry::server [json_dump [huddle create id $id method [huddle null] result [huddle create]]] }
+        wrong_turn - rejected_turn {
+            retry::server [json_dump [huddle create id $id result [huddle create thread \
+                [huddle create id [huddle string title-negative] ephemeral [huddle true] threadSource [huddle string thread_title]]]]]
+            capacity_title_turn [huddle string negative-title-turn] title-negative
+            if {$variant eq "wrong_turn"} {
+                started title-early title-negative
+                reply {"negative-title-turn"} title-other
+            } else {
+                retry::server {{"id":"negative-title-turn","error":{"code":-1,"message":"helper unavailable"}}}
+            }
+        }
+        rejected_start { retry::server [json_dump [huddle create id $id error [huddle create code [huddle number -1] message [huddle string unavailable]]]] }
+    }
+    completed $capacityTurn
+    set expected [expr {$variant in {rejected_start rejected_turn}}]
+    check {[dict size $timers] == $expected} "unproven helper lifecycle bypassed cancellation or helper rejection canceled foreground"
+}
+capacity_begin
+capacity_title [huddle string duplicate-title] title-duplicate 0
+set failed [catch {retry::server {{"id":"duplicate-title","result":{"thread":{"id":"title-duplicate","id":"spoofed","ephemeral":true,"threadSource":"thread_title"}}}}} message]
+check {$failed && $message eq "duplicate JSON key" && $retry::current eq "" && $automatic::current eq "" &&
+    $recovery::helpers eq "" && $recovery::helperRequests eq ""} "duplicate helper fields escaped typed rejection or retained authority"
+
+# Display names are exact typed metadata. Real user changes still cancel both
+# engines after helper activity and a verified own-settings echo.
+foreach mutation {
+    {{"method":"thread/settings/update","params":{"threadId":"t1","model":"fixture-model"}}}
+    {{"method":"thread/resume","params":{"threadId":"other"}}}
+    {{"method":"turn/steer","params":{"threadId":"t1","input":[]}}}
+    {{"method":"thread/goal/set","params":{"threadId":"t1","objective":"new goal"}}}
+    {{"method":"thread/settings/update","params":{"threadId":"t1","approvalPolicy":"on-request"}}}
+    {{"method":"thread/name/set","params":{"threadId":"t1","name":true}}}
+    {{"method":"thread/name/set","params":{"threadId":"t1","name":"title","model":"foreign"}}}
+} {
+    capacity_begin
+    capacity_echo
+    capacity_title [huddle string cancel-title]
+    completed $capacityTurn
+    capacity_client $mutation
+    check {$retry::current eq "" && $automatic::current eq "" && [dict size $timers] == 0} "manual mutation survived helper isolation"
+}
+capacity_begin
+set resume::armed 1
+check {[catch {resume::client [json_dump [huddle create id [huddle string guarded-title] method [huddle string thread/start] \
+    params [huddle create threadSource [huddle string thread_title] ephemeral [huddle true]]]]}]} \
+    "a title helper consumed guarded startup permissions"
+resume::reset
+automatic::cancel
+retry::reset
+foreach name {helpers helperRequests} { set ::recovery::$name {} }
+
+# Reviewer lifecycle/settings regressions use only public typed handlers.
+foreach numeric {0 1} {
+    foreach boundary {acknowledged unsubscribed changed_id_payload new_helper_turn manual_selection} {
+        capacity_begin 0
+        set titleStart [capacity_title [huddle string reused-title-start]]
+        set id [huddle string 811]
+        if {$numeric} { set id [huddle number 811] }
+        set helper [capacity_title_turn $id]
+        reply [json_dump $id] reused-helper-turn
+        started reused-helper-turn title-thread
+        set preserved [capacity_state]
+        switch -- $boundary {
+            unsubscribed {
+                capacity_client {{"id":"reused-unsubscribe","method":"thread/unsubscribe","params":{"threadId":"title-thread"}}}
+                retry::server {{"id":"reused-unsubscribe","result":{}}}
+            }
+            changed_id_payload { huddle set helper params input 0 text [huddle string "Changed helper work"] }
+            new_helper_turn { huddle set helper id [huddle string new-rejected-helper-turn] }
+            manual_selection {
+                capacity_client {{"id":"manual-after-helper","method":"thread/resume","params":{"threadId":"other"}}}
+            }
+        }
+        if {$boundary in {acknowledged unsubscribed}} {
+            capacity_client [json_dump $titleStart]
+            retry::server {{"id":"reused-title-start","result":{"thread":{"id":"title-thread","threadSource":"thread_title","ephemeral":true}}}}
+        }
+        capacity_client [json_dump $helper]
+        reply [json_dump [huddle get $helper id]] reused-helper-turn
+        completed reused-helper-turn failed serverOverloaded {[]} title-thread
+        capacity_client [json_dump $helper]
+        reply [json_dump [huddle get $helper id]] reused-helper-turn
+        completed reused-helper-turn failed serverOverloaded {[]} title-thread
+        check {[dict size $timers] == 0 && $sent eq ""} "post-ACK helper reuse authorized replay"
+        if {$boundary in {acknowledged unsubscribed}} {
+            check {[capacity_state] eq $preserved} "an exact post-ACK helper repeat changed foreground ownership"
+            completed $capacityTurn
+            fire
+            check {[huddle equal [huddle get [automatic::decode [lindex $sent end]] params] \
+                [huddle get $capacityRequest params]]} "helper repeat displaced foreground replay"
+        } else {
+            check {$retry::current eq "" && $automatic::current eq ""} "a rejected helper request entered foreground tracking"
+        }
+    }
+}
+capacity_begin 0
+capacity_title [huddle string malformed-start-provenance] title-rejected 0
+retry::server {{"id":"malformed-start-provenance","result":{"thread":{"id":"title-rejected","threadSource":"thread_title","ephemeral":"true"}}}}
+set helper [capacity_title_turn [huddle string after-malformed-helper] title-rejected]
+reply [json_dump [huddle get $helper id]] unproven-helper-turn
+completed unproven-helper-turn failed serverOverloaded {[]} title-rejected
+check {$retry::current eq "" && $automatic::current eq "" && [dict size $timers] == 0 && $sent eq ""} \
+    "a rejected helper activation later authorized helper replay"
+capacity_begin 0
+capacity_title [huddle string pending-helper-start] title-unproven 0
+set helper [capacity_title_turn [huddle string before-helper-start-ack] title-unproven]
+reply [json_dump [huddle get $helper id]] before-helper-start-turn
+completed before-helper-start-turn failed serverOverloaded {[]} title-unproven
+check {$retry::current eq "" && $automatic::current eq "" && [dict size $timers] == 0 && $sent eq ""} \
+    "unproven work before a helper start ACK authorized replay"
+
+# Omitted sandbox defaults and explicit defaults describe the same policy.
+foreach minimal {
+    {{"type":"readOnly"}}
+    {{"type":"workspaceWrite"}}
+    {{"type":"externalSandbox"}}
+} effective {
+    {{"type":"readOnly","networkAccess":false}}
+    {{"type":"workspaceWrite","networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false,"writableRoots":[]}}
+    {{"type":"externalSandbox","networkAccess":"restricted"}}
+} {
+    foreach early {0 1} {
+        foreach reverse {0 1} {
+            set requested [json_decode $minimal]
+            set notified [json_decode $effective]
+            if {$reverse} { lassign [list $notified $requested] requested notified }
+            capacity_begin 0 [expr {!$early}] 0 "" [huddle create sandboxPolicy $requested]
+            huddle set capacitySettings params threadSettings sandboxPolicy $notified
+            capacity_echo
+            if {$early} {
+                check {![field $retry::current accepted] && [dict size $timers] == 0} "sandbox defaults granted start authority"
+                reply [json_dump $capacityId] $capacityTurn
+            }
+            completed $capacityTurn
+            check {[dict size $timers] == 1} "equivalent sandbox defaults canceled recovery"
+            fire
+            check {[huddle equal [huddle get [automatic::decode [lindex $sent end]] params] \
+                [huddle get $capacityRequest params]]} "sandbox normalization rewrote original settings"
+        }
+    }
+}
+foreach policy {
+    {{"type":"readOnly","networkAccess":"false"}}
+    {{"type":"readOnly","networkAccess":null}}
+    {{"type":"dangerFullAccess","networkAccess":false}}
+    {{"type":"workspaceWrite","excludeSlashTmp":0}}
+    {{"type":"workspaceWrite","writableRoots":[4]}}
+    {{"type":"externalSandbox","networkAccess":false}}
+    {{"type":"externalSandbox","networkAccess":"unknown"}}
+} {
+    capacity_begin 0
+    huddle set capacitySettings params threadSettings sandboxPolicy [json_decode $policy]
+    capacity_echo
+    completed $capacityTurn
+    check {$retry::current eq "" && [dict size $timers] == 0} "malformed sandbox defaults retained recovery"
+}
+
+# Persistent serviceTier changes the thread; serviceTierForTurn does not.
+foreach early {0 1} {
+    foreach variant {persistent turn_only combined} {
+        set overrides [huddle create serviceTierForTurn [huddle string default]]
+        set tier [huddle null]
+        if {$variant ne "turn_only"} {
+            huddle set overrides serviceTier [huddle string fast]
+            set tier [huddle string fast]
+        }
+        if {$variant eq "persistent"} { set overrides [huddle remove $overrides serviceTierForTurn] }
+        capacity_begin 0 [expr {!$early}] 0 "" $overrides
+        huddle set capacitySettings params threadSettings serviceTier $tier
+        capacity_echo
+        if {$early} {
+            check {![field $retry::current accepted] && [dict size $timers] == 0} "service tier echo granted start authority"
+            reply [json_dump $capacityId] $capacityTurn
+        }
+        completed $capacityTurn
+        check {[dict size $timers] == 1} "matching persistent/turn-only service tiers canceled recovery"
+        fire
+        check {[huddle equal [huddle get [automatic::decode [lindex $sent end]] params] \
+            [huddle get $capacityRequest params]]} "service tier recovery changed request settings"
+    }
+}
+capacity_begin 0 1 0 "" [huddle create serviceTier [huddle string fast] serviceTierForTurn [huddle string default]]
+huddle set capacitySettings params threadSettings serviceTier [huddle string default]
+capacity_echo
+check {$retry::current eq "" && [dict size $timers] == 0} "turn-only service tier was mistaken for a persistent echo"
+
+# Granular approval policies are typed variants with two default-false fields.
+set granular [json_decode {{"granular":{"sandbox_approval":true,"rules":false,"mcp_elicitations":true}}}]
+set explicitGranular $granular
+huddle set explicitGranular granular request_permissions [huddle false]
+huddle set explicitGranular granular skill_approval [huddle false]
+foreach early {0 1} {
+    foreach origin {activation inline} {
+        set baseline [huddle create]
+        set overrides [huddle create approvalPolicy [huddle null]]
+        if {$origin eq "activation"} {
+            huddle set baseline approvalPolicy $granular
+        } else { huddle set overrides approvalPolicy $granular }
+        capacity_begin 0 [expr {!$early}] 0 $baseline $overrides
+        huddle set capacitySettings params threadSettings approvalPolicy $explicitGranular
+        capacity_echo
+        if {$early} {
+            check {![field $retry::current accepted] && [dict size $timers] == 0} "granular policy echo granted start authority"
+            reply [json_dump $capacityId] $capacityTurn
+        }
+        completed $capacityTurn
+        check {[dict size $timers] == 1} "unchanged granular policy canceled recovery"
+        fire
+        check {[huddle equal [huddle get [automatic::decode [lindex $sent end]] params] \
+            [huddle get $capacityRequest params]]} "granular policy normalization rewrote the request"
+    }
+}
+capacity_begin 0 1 0 [huddle create approvalPolicy $granular] [huddle create approvalPolicy [huddle null]]
+huddle set capacitySettings params threadSettings approvalPolicy $explicitGranular
+huddle set capacitySettings params threadSettings approvalPolicy granular rules [huddle true]
+capacity_echo
+check {$retry::current eq "" && [dict size $timers] == 0} "a changed granular approval policy preserved ownership"
+set optionalGranular $explicitGranular
+huddle set optionalGranular granular request_permissions [huddle true]
+huddle set optionalGranular granular skill_approval [huddle true]
+capacity_begin 0 1 0 "" [huddle create approvalPolicy $optionalGranular]
+huddle set capacitySettings params threadSettings approvalPolicy $optionalGranular
+capacity_echo
+completed $capacityTurn
+check {[dict size $timers] == 1} "explicit granular approval flags were replaced by defaults"
+capacity_begin 0 1 0 [huddle create approvalPolicy $optionalGranular] [huddle create approvalPolicy [huddle null]]
+huddle set capacitySettings params threadSettings approvalPolicy $explicitGranular
+capacity_echo
+check {$retry::current eq "" && [dict size $timers] == 0} "changed optional granular approval flags were mistaken for defaults"
+foreach policy {
+    {"unknown"}
+    {{"granular":[]}}
+    {{"granular":{"sandbox_approval":true,"mcp_elicitations":true}}}
+    {{"granular":{"sandbox_approval":"true","rules":false,"mcp_elicitations":true}}}
+    {{"granular":{"sandbox_approval":true,"rules":false,"mcp_elicitations":true,"request_permissions":null}}}
+    {{"granular":{"sandbox_approval":true,"rules":false,"mcp_elicitations":true,"skill_approval":0}}}
+    {{"granular":{"sandbox_approval":true,"rules":false,"mcp_elicitations":true,"unknown":false}}}
+    {{"granular":{"sandbox_approval":true,"rules":false,"mcp_elicitations":true},"other":{}}}
+} {
+    foreach origin {activation inline notification} {
+        set baseline [huddle create]
+        set overrides [huddle create]
+        if {$origin eq "activation"} { huddle set baseline approvalPolicy [json_decode $policy] }
+        if {$origin eq "inline"} { huddle set overrides approvalPolicy [json_decode $policy] }
+        capacity_begin 0 1 0 $baseline $overrides
+        if {$origin eq "notification"} { huddle set capacitySettings params threadSettings approvalPolicy [json_decode $policy] }
+        capacity_echo
+        completed $capacityTurn
+        check {$retry::current eq "" && [dict size $timers] == 0} "a malformed granular policy retained recovery"
+    }
+}
+automatic::cancel
+retry::reset
+foreach name {helpers helperRequests} { set ::recovery::$name {} }
+
+# A rejected reply's thread ID is not helper classification. Fresh manual
+# activation supersedes stale classification while old helper RPC IDs stay inert.
+foreach follow {0 1} {
+    foreach history {malformed contradictory closed pending verified} {
+        capacity_begin $follow
+        set titleThread title-original
+        if {$history eq "verified"} { set titleThread other }
+        capacity_title [huddle string resume-helper-start] $titleThread [expr {$history ni {malformed pending}}]
+        set unverified [automatic::decode {{"id":"resume-helper-start","result":{"thread":{"id":"other","threadSource":"thread_title","ephemeral":"true"}}}}]
+        switch -- $history {
+            malformed - contradictory { retry::server [json_dump $unverified] }
+            closed {
+                capacity_client {{"id":"resume-helper-unsubscribe","method":"thread/unsubscribe","params":{"threadId":"title-original"}}}
+                retry::server {{"id":"resume-helper-unsubscribe","result":{}}}
+                retry::server [json_dump $unverified]
+            }
+            verified {
+                capacity_title_turn [huddle string resume-old-title-turn] other
+                reply {"resume-old-title-turn"} old-title-turn
+                completed old-title-turn completed serverOverloaded {[]} other
+            }
+        }
+        capacity_client {{"id":"fresh-manual-resume","method":"thread/resume","params":{"threadId":"other"}}}
+        set activation [capacity_activation other]
+        huddle set activation thread ephemeral [huddle false]
+        huddle set activation thread threadSource [huddle string user]
+        retry::server [json_dump [huddle create id [huddle string fresh-manual-resume] result $activation]]
+        set goal [goal_fixture]
+        huddle set goal threadId [huddle string other]
+        capacity_client {{"id":"other-goal-read","method":"thread/goal/get","params":{"threadId":"other"}}}
+        retry::server [json_dump [huddle create id [huddle string other-goal-read] result [huddle create goal $goal]]]
+        huddle set capacityRequest id [huddle string other-foreground-request]
+        huddle set capacityRequest params threadId [huddle string other]
+        capacity_client [json_dump $capacityRequest]
+        huddle set capacitySettings params threadId [huddle string other]
+        capacity_echo
+        check {[field $retry::current accepted] eq "0" && [dict size $timers] == 0} \
+            "manual resume lost foreground tracking or settings granted start authority"
+        reply {"other-foreground-request"} other-foreground-turn
+        started other-foreground-turn other
+        set preserved [capacity_state]
+        retry::server [json_dump $unverified]
+        retry::server [json_dump $unverified]
+        if {$history eq "verified"} { reply {"resume-old-title-turn"} old-title-turn }
+        check {[capacity_state] eq $preserved} "a late helper reply changed freshly selected foreground ownership"
+        if {$follow} {
+            user_event item/started {{"type":"commandExecution","id":"other-foreground-progress"}} other-foreground-turn other
+        }
+        completed other-foreground-turn failed serverOverloaded {[]} other
+        check {[dict size $timers] == 1 && $sent eq "" && $recovery::target eq "other"} \
+            "stale helper provenance suppressed recovery in a freshly resumed thread"
+        fire
+        set work [automatic::decode [lindex $sent end]]
+        check {[automatic::text $work params threadId] eq "other"} "manual resume recovered in the wrong thread"
+        if {$follow} {
+            check {[automatic::text $work params input 0 text] eq "continue"} "manual resume replayed progressed work"
+        } else {
+            check {[huddle equal [huddle get $work params] [huddle get $capacityRequest params]]} \
+                "manual resume changed original-input replay"
+        }
+        reply [json_dump [huddle get $work id]] other-recovery-turn
+        started other-recovery-turn other
+        if {$follow} {
+            user_event item/started {{"type":"commandExecution","id":"other-recovery-progress"}} other-recovery-turn other
+        }
+        completed other-recovery-turn failed serverOverloaded {[]} other
+        check {[dict size $timers] == 1} "resumed foreground lost its recovery chain"
+        if {$follow} {
+            huddle set capacitySettings params threadSettings model [huddle string changed-model]
+            retry::server [json_dump $capacitySettings]
+        } else {
+            huddle set goal status [huddle string paused]
+            retry::server [json_dump [huddle create method [huddle string thread/goal/updated] params \
+                [huddle create threadId [huddle string other] turnId [huddle string other-recovery-turn] goal $goal]]]
+        }
+        check {$retry::current eq "" && $automatic::current eq "" && [dict size $timers] == 0} \
+            "stale helper classification swallowed foreground settings or goal changes"
+    }
+}
+automatic::cancel
+retry::reset
+foreach name {helpers helperRequests} { set ::recovery::$name {} }
+
+# A valid helper start can be acknowledged on either side of a manual switch.
+# Its later work must preserve the new foreground, including an existing timer.
+foreach ordering {before_switch after_switch} {
+    foreach stage {awaiting running backoff} {
+        foreach follow {0 1} {
+            foreach progress {0 1} {
+                capacity_begin $follow
+                capacity_title [huddle string switch-helper-start] switch-title 0
+                set helperAck {{"id":"switch-helper-start","result":{"thread":{"id":"switch-title","threadSource":"thread_title","ephemeral":true}}}}
+                if {$ordering eq "before_switch"} { retry::server $helperAck }
+                capacity_client {{"id":"switch-foreground-resume","method":"thread/resume","params":{"threadId":"other"}}}
+                retry::server [json_dump [huddle create id [huddle string switch-foreground-resume] \
+                    result [capacity_activation other]]]
+                set goal [goal_fixture]
+                huddle set goal threadId [huddle string other]
+                capacity_client {{"id":"switch-goal-read","method":"thread/goal/get","params":{"threadId":"other"}}}
+                retry::server [json_dump [huddle create id [huddle string switch-goal-read] result [huddle create goal $goal]]]
+                huddle set capacityRequest id [huddle string switch-foreground-work]
+                huddle set capacityRequest params threadId [huddle string other]
+                capacity_client [json_dump $capacityRequest]
+                huddle set capacitySettings params threadId [huddle string other]
+                capacity_echo
+                if {$stage ne "awaiting"} { reply {"switch-foreground-work"} switch-main-turn }
+                started switch-main-turn other
+                if {$progress} {
+                    user_event item/started {{"type":"commandExecution","id":"switch-main-progress"}} switch-main-turn other
+                }
+                if {$stage eq "backoff"} { completed switch-main-turn failed serverOverloaded {[]} other }
+                set preserved [capacity_state]
+                if {$ordering eq "after_switch"} { retry::server $helperAck }
+                capacity_title_turn [huddle string switch-helper-turn] switch-title
+                started switch-title-turn switch-title
+                reply {"switch-helper-turn"} switch-title-turn
+                completed switch-title-turn completed serverOverloaded {[]} switch-title
+                retry::server {{"method":"thread/status/changed","params":{"threadId":"switch-title","status":{"type":"idle"}}}}
+                capacity_client {{"id":"switch-helper-unsubscribe","method":"thread/unsubscribe","params":{"threadId":"switch-title"}}}
+                retry::server {{"id":"switch-helper-unsubscribe","result":{}}}
+                check {[capacity_state] eq $preserved} "delayed helper lifecycle changed the new foreground or its backoff"
+                if {$stage eq "awaiting"} {
+                    check {[field $retry::current accepted] eq "0" && [dict size $timers] == 0} \
+                        "delayed helper activity acknowledged the new foreground"
+                    reply {"switch-foreground-work"} switch-main-turn
+                }
+                if {$stage ne "backoff"} { completed switch-main-turn failed serverOverloaded {[]} other }
+                set eligible [expr {!$progress || $follow}]
+                check {[dict size $timers] == $eligible && $sent eq "" && $recovery::target eq "other"} \
+                    "delayed title helper canceled recovery or bypassed its opt-in after a switch"
+                if {$eligible} {
+                    check {[lindex $delays end] == 5000} "switched helper changed foreground recovery delay"
+                    fire
+                    set work [automatic::decode [lindex $sent end]]
+                    check {[automatic::text $work params threadId] eq "other"} "switched helper became the recovery target"
+                    if {$progress} {
+                        check {[automatic::text $work params input 0 text] eq "continue"} "switched helper caused partial-work replay"
+                    } else {
+                        check {[huddle equal [huddle get $work params] [huddle get $capacityRequest params]]} \
+                            "switched helper changed the original foreground request"
+                    }
+                }
+            }
+        }
+    }
+}
+automatic::cancel
+retry::reset
+foreach name {helpers helperRequests} { set ::recovery::$name {} }
 
 # Native inbox acknowledgements must preserve overload recovery after tool work,
 # including acknowledgement ordering, backoff, and rejected metadata revisions.
@@ -4330,6 +5087,7 @@ set retry::finished [dict create [list t1 reused-turn] 1]
 set retry::internal [dict create $staleId 1]
 set recovery::seen [dict create 31 1]
 set before [llength $sent]
+capacity_title [huddle string disconnect-title] disconnect-title-thread
 transport::lost {shared app-server proxy disconnected}
 check {[info exists listener] && $recovery::target eq "t1" && !$recovery::yolo} \
     "transport loss destroyed the endpoint or verified session advice"
@@ -4337,7 +5095,8 @@ check {![info exists client] && ![info exists backend] && [dict size $timers] ==
     $retry::current eq "" && $automatic::current eq "" && $retry::finished eq "" && \
     $retry::internal eq "" && $retry::usedIds eq "" && $automatic::ids eq "" && \
     $automatic::live eq "" && $automatic::selection eq "" && $recovery::seen eq "" && \
-    $recovery::pending eq ""} "transport retirement retained connection ownership"
+    $recovery::pending eq "" && $recovery::helpers eq "" && $recovery::helperRequests eq ""} \
+    "transport retirement retained connection ownership"
 
 # A metadata-only picker can arrive before the new main client. Its replies and
 # even an old callback with a reused channel name cannot select the session.

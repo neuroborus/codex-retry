@@ -117,6 +117,169 @@ proc automatic::selected {object thread args} {
     variable selection
     set selection [dict create threadId $thread model [text $object {*}$args model] \
         provider [text $object {*}$args modelProvider]]
+    if {![catch {settings [huddle get $object {*}$args] [expr {$args eq "result"}]} value]} {
+        dict set selection settings $value
+    }
+}
+
+# Compare effective settings, not serialized key order or native preset text.
+# Activation replies use sandbox/reasoningEffort; notifications use the turn names.
+proc automatic::collaboration {value} {
+    if {![is $value dict] || [lsort [huddle keys $value]] ne {mode settings} ||
+        [text $value mode] ni {default plan} || ![is $value dict settings] ||
+        [text $value settings model] eq ""} { error "invalid collaboration mode" }
+    foreach key [huddle keys [huddle get $value settings]] {
+        if {$key ni {model reasoning_effort developer_instructions}} { error "unknown collaboration setting" }
+    }
+    foreach key {reasoning_effort developer_instructions} {
+        if {![huddle exists $value settings $key]} { huddle set value settings $key [huddle null] }
+        if {[huddle type $value settings $key] ni {string null}} { error "invalid collaboration setting" }
+    }
+    return $value
+}
+
+proc automatic::sandbox {value} {
+    if {![is $value dict]} { error "invalid sandbox" }
+    set defaults {}
+    switch -- [text $value type] {
+        dangerFullAccess {}
+        readOnly { set defaults [list networkAccess [huddle false]] }
+        externalSandbox { set defaults [list networkAccess [huddle string restricted]] }
+        workspaceWrite {
+            set defaults [list networkAccess [huddle false] excludeTmpdirEnvVar [huddle false] \
+                excludeSlashTmp [huddle false] writableRoots [huddle list]]
+        }
+        default { error "invalid sandbox type" }
+    }
+    foreach key [huddle keys $value] {
+        if {$key ne "type" && ![dict exists $defaults $key]} { error "unknown sandbox setting" }
+    }
+    dict for {key fallback} $defaults {
+        if {![huddle exists $value $key]} { huddle set value $key $fallback }
+        if {[huddle type $value $key] ne [huddle type $fallback]} { error "invalid sandbox setting" }
+        if {$key eq "writableRoots"} {
+            set roots [huddle get $value $key]
+            for {set i 0} {$i < [huddle llength $roots]} {incr i} {
+                if {![is $roots string $i]} { error "invalid sandbox root" }
+            }
+        } elseif {[huddle type $fallback] eq "string" &&
+            [text $value $key] ni {restricted enabled}} { error "invalid sandbox network access" }
+    }
+    return $value
+}
+
+proc automatic::approval_policy {value} {
+    if {[huddle type $value] eq "string" && [huddle get_stripped $value] in {untrusted on-request never}} {
+        return $value
+    }
+    if {![is $value dict] || [huddle keys $value] ne "granular" || ![is $value dict granular]} {
+        error "invalid approval policy"
+    }
+    foreach key [huddle keys [huddle get $value granular]] {
+        if {$key ni {sandbox_approval rules mcp_elicitations request_permissions skill_approval}} {
+            error "unknown granular approval setting"
+        }
+    }
+    foreach key {request_permissions skill_approval} {
+        if {![huddle exists $value granular $key]} { huddle set value granular $key [huddle false] }
+    }
+    foreach key {sandbox_approval rules mcp_elicitations request_permissions skill_approval} {
+        if {![is $value boolean granular $key]} { error "invalid granular approval setting" }
+    }
+    return $value
+}
+
+proc automatic::settings {value {activation 0}} {
+    set result [huddle create]
+    set fields {disabledPluginIds cwd approvalPolicy approvalsReviewer sandboxPolicy activePermissionProfile
+        model modelProvider serviceTier effort summary collaborationMode multiAgentMode personality}
+    if {!$activation} {
+        foreach key [huddle keys $value] {
+            if {$key ni $fields} { error "unknown thread setting" }
+        }
+    }
+    foreach key $fields {
+        set source $key
+        if {$activation && $key eq "sandboxPolicy"} { set source sandbox }
+        if {$activation && $key eq "effort"} { set source reasoningEffort }
+        set item [huddle null]
+        if {$key eq "disabledPluginIds"} { set item [huddle list] }
+        if {[huddle exists $value $source]} { set item [huddle get $value $source] }
+        set type [huddle type $item]
+        switch -- $key {
+            disabledPluginIds {
+                if {$type ne "list"} { error "invalid plugins" }
+                for {set i 0} {$i < [huddle llength $item]} {incr i} {
+                    if {![is $item string $i]} { error "invalid plugin" }
+                }
+            }
+            sandboxPolicy { set item [sandbox $item] }
+            approvalPolicy { set item [approval_policy $item] }
+            activePermissionProfile {
+                if {$type ne "null" && ($type ne "dict" || [text $item id] eq "")} { error "invalid profile" }
+            }
+            collaborationMode {
+                if {$type ne "null"} { set item [collaboration $item] }
+            }
+            default {
+                if {$type ni {string null}} { error "invalid scalar setting" }
+                if {$key in {cwd approvalsReviewer model modelProvider} &&
+                    ($type ne "string" || [huddle get_stripped $item] eq "")} { error "missing effective setting" }
+            }
+        }
+        huddle set result $key $item
+    }
+    return $result
+}
+
+proc automatic::settings_echo {object} {
+    set current $::retry::current
+    if {[text $object method] ne "thread/settings/updated" || ![is $object dict params] ||
+        [lsort [huddle keys [huddle get $object params]]] ne {threadId threadSettings} ||
+        $current eq "" || [field $current settings] eq "" ||
+        [text $object params threadId] ne [field $current threadId] ||
+        [field $::automatic::selection threadId] ne [field $current threadId] ||
+        ![is $object dict params threadSettings]} { return 0 }
+    if {[catch {
+        set actual [settings [huddle get $object params threadSettings]]
+        set expected [dict get $current settings]
+        set params [huddle get [dict get $current request] params]
+        foreach key {disabledPluginIds cwd approvalPolicy approvalsReviewer sandboxPolicy model serviceTier effort summary} {
+            if {[huddle exists $params $key] && ![is $params null $key]} {
+                huddle set expected $key [huddle get $params $key]
+            }
+        }
+        # A named profile can be verified only against the effective activation.
+        if {[huddle exists $params permissions] && ![is $params null permissions] &&
+            (![is $params string permissions] || [text $params permissions] eq "" ||
+             [text $params permissions] ne [text $expected activePermissionProfile id])} { error "unproven profile" }
+        if {[huddle exists $params collaborationMode] && ![is $params null collaborationMode]} {
+            set mode [collaboration [huddle get $params collaborationMode]]
+            huddle set expected model [huddle get $mode settings model]
+            huddle set expected effort [huddle get $mode settings reasoning_effort]
+            # Null requests native preset resolution. Pin its first typed result
+            # for this request so subsequent changes cannot masquerade as echoes.
+            if {[is $mode null settings developer_instructions]} {
+                if {![huddle exists $actual collaborationMode settings developer_instructions]} { error "unresolved preset" }
+                huddle set mode settings developer_instructions \
+                    [huddle get $actual collaborationMode settings developer_instructions]
+            }
+            huddle set expected collaborationMode $mode
+        }
+        set expected [settings $expected]
+        if {![huddle equal $actual $expected] ||
+            ([dict exists $current settingsEcho] && ![huddle equal $actual [dict get $current settingsEcho]])} {
+            error "changed settings"
+        }
+    }]} { return 0 }
+    dict set ::retry::current settingsEcho $actual
+    return 1
+}
+
+proc automatic::display_name {object} {
+    if {[text $object method] ne "thread/name/set" || ![is $object dict params] ||
+        [text $object params threadId] eq "" || ![is $object string params name]} { return 0 }
+    expr {[lsort [huddle keys [huddle get $object params]]] eq {name threadId}}
 }
 
 # Activation can attach to work already running in another client. An empty
@@ -994,12 +1157,214 @@ namespace eval recovery {
     variable deleted {}
     variable seen {}
     variable yolo 0
+    variable helpers {}
+    variable helperRequests {}
     variable launcher [file normalize [info script]]
+}
+
+# Only the native title helper's explicit markers and correlated reply establish
+# a background thread. These records never supply foreground retry authority.
+proc recovery::helper_client {object} {
+    variable helpers; variable helperRequests
+    set method [automatic::text $object method]
+    if {![huddle exists $object id] || [huddle type $object id] ni {string number} ||
+        ![automatic::is $object dict params]} { return 0 }
+    set id [json_dump [huddle get $object id]]
+    if {[dict exists $helperRequests $id]} {
+        if {[dict exists $helperRequests $id request] &&
+            [huddle equal $object [dict get $helperRequests $id request]]} { return 1 }
+        goal::cancel
+        dict set helperRequests $id rejected 1
+        return 1
+    }
+    set thread [automatic::text $object params threadId]
+    set start [expr {$method eq "thread/start" &&
+        [automatic::text $object params threadSource] eq "thread_title" &&
+        [automatic::is $object boolean params ephemeral] &&
+        [huddle get_stripped $object params ephemeral] eq "true"}]
+    set unproven 0
+    if {!$start && ![dict exists $helpers $thread] && $method eq "turn/start" &&
+        $thread ne "" && $thread ne [field $::automatic::selection threadId]} {
+        dict for {pending request} $helperRequests {
+            if {[dict get $request method] eq "thread/start" &&
+                ([dict exists $request rejectedThreads $thread] ||
+                 (![dict exists $request response] && [field $request closed] ne "1" &&
+                  [field $request rejected] ne "1"))} { set unproven 1; break }
+        }
+    }
+    if {!$start && !$unproven && (![dict exists $helpers $thread] ||
+        $method ni {turn/start thread/unsubscribe thread/delete})} { return 0 }
+    if {$unproven} {
+        # A foreign turn tied to an unresolved or rejected title start cannot
+        # establish helper correlation or a new foreground selection.
+        set ::recovery::target ""
+        set ::automatic::selection {}
+    }
+    set rejected [expr {$unproven || $::resume::armed || $::resume::pending ne "" || $::recovery::pending ne "" ||
+        $::recovery::target eq "" ||
+        [field $::automatic::selection threadId] ne $::recovery::target ||
+        [dict exists $::retry::usedIds $id] || [dict exists $::recovery::seen $id]}]
+    if {$method eq "turn/start" &&
+        ([field $helpers $thread closed] eq "1" || [field $helpers $thread pending] ne "" ||
+         [field $helpers $thread turnId] ne "" ||
+         ![automatic::is $object list params input] || [huddle llength [huddle get $object params input]] == 0)} {
+        set rejected 1
+    }
+    dict set helperRequests $id [dict create request $object method $method threadId $thread]
+    dict set ::retry::usedIds $id 1
+    if {$rejected} {
+        goal::cancel
+        dict set helperRequests $id rejected 1
+        return 1
+    }
+    if {$method eq "turn/start"} { dict set helpers $thread pending $id }
+    return 1
+}
+
+proc recovery::helper_forget {thread} {
+    variable helpers; variable helperRequests
+    if {![dict exists $helpers $thread] || $thread in [list $::recovery::target \
+        [field $::automatic::selection threadId] [field $::retry::current threadId]]} { return }
+    # Retain request/ID provenance until disconnect so even late repeats cannot
+    # enter foreground tracking. Release reply snapshots at helper cleanup.
+    dict set helpers $thread [dict create closed 1 pending "" turnId ""]
+    dict for {id request} $helperRequests {
+        if {[dict get $request threadId] eq $thread} {
+            dict set request closed 1
+            dict unset request response
+            dict set helperRequests $id $request
+        }
+    }
+}
+
+proc recovery::helper_reject {id object} {
+    variable helperRequests
+    dict set helperRequests $id rejected 1
+    set thread [automatic::text $object result thread id]
+    if {[dict get $helperRequests $id method] eq "thread/start" && $thread ne ""} {
+        # An unverified reply can deny replay, never classify a helper thread.
+        dict set helperRequests $id rejectedThreads $thread 1
+    }
+}
+
+proc recovery::helper_server {object} {
+    variable helpers; variable helperRequests
+    set method [automatic::text $object method]
+    set id ""
+    if {[huddle exists $object id]} { set id [json_dump [huddle get $object id]] }
+    if {[dict exists $helperRequests $id] && [huddle exists $object method] &&
+        (![automatic::is $object string method] || $method eq "")} {
+        goal::cancel
+        helper_reject $id $object
+        return 1
+    }
+    if {![huddle exists $object method] && [dict exists $helperRequests $id]} {
+        set request [dict get $helperRequests $id]
+        if {[field $request rejected] eq "1" || [field $request closed] eq "1"} {
+            helper_reject $id $object
+            return 1
+        }
+        if {[dict get $request method] eq "thread/start" &&
+            [dict exists $request foregroundThreads [automatic::text $object result thread id]]} {
+            helper_reject $id $object
+            return 1
+        }
+        if {[dict exists $request response]} {
+            if {![huddle equal $object [dict get $request response]]} {
+                goal::cancel
+                helper_reject $id $object
+            }
+            return 1
+        }
+        set thread [dict get $request threadId]
+        set kind [dict get $request method]
+        if {![huddle exists $object result] && [automatic::is $object dict error] &&
+            [automatic::is $object number error code] && [automatic::is $object string error message]} {
+            if {$kind eq "turn/start"} {
+                if {[field $helpers $thread turnId] ne ""} { goal::cancel }
+                helper_forget $thread
+            }
+            dict set helperRequests $id closed 1
+            return 1
+        }
+        set valid [expr {![huddle exists $object error] && [automatic::is $object dict result]}]
+        if {$valid && $kind eq "thread/start"} {
+            set thread [automatic::text $object result thread id]
+            set valid [expr {$thread ne "" && $thread ne $::recovery::target &&
+                $thread ne [field $::retry::current threadId] && ![dict exists $helpers $thread] &&
+                ![dict exists $::recovery::deleted $thread] &&
+                [automatic::text $object result thread threadSource] eq "thread_title" &&
+                [automatic::is $object boolean result thread ephemeral] &&
+                [huddle get_stripped $object result thread ephemeral] eq "true"}]
+            if {$valid} { dict set helpers $thread [dict create pending "" turnId ""] }
+        } elseif {$valid && $kind eq "turn/start"} {
+            set turn [automatic::text $object result turn id]
+            set valid [expr {[dict exists $helpers $thread] &&
+                [field $helpers $thread pending] eq $id && $turn ne "" &&
+                [automatic::text $object result turn status] in {inProgress completed failed interrupted} &&
+                ([field $helpers $thread turnId] eq "" || [field $helpers $thread turnId] eq $turn)}]
+            if {$valid} {
+                dict set helpers $thread pending ""
+                dict set helpers $thread turnId $turn
+            }
+        } elseif {$valid} { helper_forget $thread }
+        if {!$valid} {
+            goal::cancel
+            helper_reject $id $object
+            helper_forget [dict get $request threadId]
+        } elseif {$kind in {thread/start turn/start}} {
+            # Requests deduplicate post-ACK repeats; replies detect contradictory
+            # ACKs until unsubscribe/delete releases the reply snapshot.
+            dict set request threadId $thread
+            dict set request response $object
+            dict set helperRequests $id $request
+        }
+        return 1
+    }
+    set thread [automatic::text $object params threadId]
+    if {$thread eq "" && [automatic::is $object dict params] && [huddle exists $object params threadId]} {
+        set candidate [json_value [huddle get $object params threadId]]
+        if {[dict exists $helpers $candidate]} { goal::cancel; helper_forget $candidate; return 1 }
+    }
+    if {![dict exists $helpers $thread]} { return 0 }
+    if {[field $helpers $thread closed] eq "1"} { return 1 }
+    if {[huddle exists $object params turnId] && ![automatic::is $object null params turnId]} {
+        set turn [automatic::text $object params turnId]
+        if {$turn eq "" ||
+            ([field $helpers $thread turnId] eq "" && [field $helpers $thread pending] eq "") ||
+            ([field $helpers $thread turnId] ne "" && [field $helpers $thread turnId] ne $turn)} {
+            goal::cancel
+            helper_forget $thread
+            return 1
+        }
+        dict set helpers $thread turnId $turn
+    }
+    if {$method in {thread/deleted thread/closed thread/archived}} {
+        helper_forget $thread
+    } elseif {$method in {turn/started turn/completed}} {
+        set turn [automatic::text $object params turn id]
+        set status [automatic::text $object params turn status]
+        if {$turn eq "" || ($method eq "turn/started" && $status ne "inProgress") ||
+            ($method eq "turn/completed" && $status ni {completed failed interrupted}) ||
+            ([field $helpers $thread turnId] ne "" && [field $helpers $thread turnId] ne $turn) ||
+            ([field $helpers $thread turnId] eq "" && [field $helpers $thread pending] eq "")} {
+            goal::cancel
+            helper_forget $thread
+        } else { dict set helpers $thread turnId $turn }
+    } elseif {$method eq "thread/status/changed"} {
+        if {[automatic::text $object params status type] ni {active idle notLoaded systemError}} {
+            goal::cancel
+            helper_forget $thread
+        }
+    } elseif {$method eq "" || ![automatic::is $object string method]} { return 0 }
+    # Other scoped helper events cannot affect foreground settings or goals.
+    return 1
 }
 
 proc recovery::client {json {object ""}} {
     variable target; variable pending; variable deleted; variable seen; variable yolo
     if {$object eq ""} { set object [automatic::decode $json] }
+    if {[helper_client $object]} { return }
     if {[huddle type $object] ne "dict" || ![huddle exists $object method] || \
         [huddle type $object method] ne "string"} { return }
     set message [json_value $object]
@@ -1056,9 +1421,15 @@ proc recovery::client {json {object ""}} {
 # Automatic selection and activity snapshots require strict envelope validation.
 proc recovery::server {object message {automaticValid 0}} {
     variable target; variable pending; variable deleted; variable yolo
+    variable helpers; variable helperRequests
     if {[field $message method] eq "thread/settings/updated" && \
         [field $message params threadId] eq $target} {
-        if {$automaticValid} { automatic::selected $object $target params threadSettings }
+        if {[automatic::text $object method] ne "thread/settings/updated" ||
+            [automatic::text $object params threadId] ne $target ||
+            ![automatic::is $object dict params threadSettings]} {
+            set ::automatic::selection {}
+            set yolo 0
+        } elseif {$automaticValid} { automatic::selected $object $target params threadSettings }
         if {![huddle exists $object params threadSettings approvalPolicy] || \
             [huddle type $object params threadSettings approvalPolicy] ne "string" || \
             [huddle get_stripped $object params threadSettings approvalPolicy] ne "never" || \
@@ -1091,6 +1462,20 @@ proc recovery::server {object message {automaticValid 0}} {
         set target ""
         set yolo 0
         return
+    }
+    # Correlated foreground activation supersedes thread labels, not reserved
+    # helper RPC IDs. Late helper replies must not relabel the selected thread.
+    dict unset helpers $id
+    dict for {rpc request} $helperRequests {
+        if {[dict get $request threadId] eq $id || [dict exists $request rejectedThreads $id]} {
+            dict set helperRequests $rpc closed 1
+            dict unset helperRequests $rpc response
+        } elseif {[dict get $request method] eq "thread/start" && ![dict exists $request response] &&
+            [field $request closed] ne "1" && [field $request rejected] ne "1"} {
+            # Keep pending background correlation; only the new foreground ID
+            # is protected from being relabeled by this request's late reply.
+            dict set helperRequests $rpc foregroundThreads $id 1
+        }
     }
     set target $id
     if {$automaticValid} { automatic::selected $object $id result }
@@ -1289,6 +1674,11 @@ proc resume::client {json {object ""}} {
     set message [json_value $object]
     set method [field $message method]
     if {$method eq ""} { return $json }
+    if {$method eq "thread/start" && [automatic::text $object params threadSource] eq "thread_title" &&
+        [automatic::is $object boolean params ephemeral] &&
+        [huddle get_stripped $object params ephemeral] eq "true"} {
+        reject "title helper requested before launch --yolo permissions were confirmed"
+    }
     if {$armed && $method eq $activation} {
         set armed 0
         if {[catch {
@@ -1376,6 +1766,12 @@ proc retry::client {json {manual 1}} {
     set object [automatic::decode $json]
     set message [json_value $object]
     set method [field $message method]
+    if {$manual && [recovery::helper_client $object]} { return }
+    if {$method eq "thread/name/set"} {
+        if {[huddle exists $object id]} { dict set usedIds [json_dump [huddle get $object id]] 1 }
+        if {![automatic::display_name $object]} { goal::cancel }
+        return
+    }
     set goalMetadata 0
     if {$method in {thread/goal/get thread/goal/set}} {
         set goalMetadata [goal::client $object]
@@ -1420,6 +1816,10 @@ proc retry::client {json {manual 1}} {
                 rpcId [json_dump [huddle get $object id]] \
                 threadId [field $message params threadId] turnId "" status awaiting \
                 accepted 0 progress $busy overloaded 0 previous $previous observations {}]
+            if {$threadId eq [field $::automatic::selection threadId] &&
+                [field $::automatic::selection settings] ne ""} {
+                dict set current settings [dict get $::automatic::selection settings]
+            }
         }
     }
 }
@@ -1580,6 +1980,7 @@ proc retry::unrelated {node} {
     return [expr {$payload && $id ne "" && $id ne [field $::resume::pending rpcId] && \
         $id ne [field $::recovery::pending rpcId] && ![dict exists $::retry::internal $id] && \
         $id ne [field $::goal::pending rpcId] && \
+        ![dict exists $::recovery::helperRequests $id] && \
         $id ne [field $::automatic::current rpcId] && ![dict exists $::automatic::ids $id] && \
         ($::retry::current eq "" || $id ne [field $::retry::current rpcId])}]
 }
@@ -1590,6 +1991,8 @@ proc retry::server {json} {
     if {[catch {automatic::decode $json retry::unrelated} object options]} {
         goal::reconcile
         set ::automatic::selection {}
+        set ::recovery::helpers {}
+        set ::recovery::helperRequests {}
         automatic::cancel
         reset
         return -options $options $object
@@ -1600,6 +2003,17 @@ proc retry::server {json} {
     set id ""
     if {[huddle exists $object id]} { set id [json_dump [huddle get $object id]] }
     set method [field $message method]
+    if {[recovery::helper_server $object]} { return 1 }
+    if {$method eq "thread/settings/updated"} {
+        if {[automatic::settings_echo $object]} {
+            recovery::server $object $message 1
+            return 1
+        }
+        set thread [automatic::text $object params threadId]
+        if {$thread eq "" || $thread in [list [field $current threadId] [field $::automatic::current threadId]]} {
+            goal::cancel
+        }
+    }
     set goalMetadata 0
     set goalTracking [expr {$::goal::pending ne "" || \
         ($::goal::snapshot ne "" && [automatic::text $::goal::snapshot status] eq "complete")}]
@@ -1650,6 +2064,7 @@ proc retry::server {json} {
     set automaticValid 0
     # Historical goals need activation/activity guards with both flags off too.
     if {$::automatic::current ne "" || $::automatic::ids ne "" || $::automatic::live ne "" || \
+        $method eq "thread/settings/updated" || \
         ($id ne "" && $id eq [field $::recovery::pending rpcId]) || \
         $goalTracking || \
         $::transport::reattaching || \
@@ -1796,7 +2211,7 @@ proc transport::retire {} {
     goal::forget 1
     foreach name {usedIds internal finished} { set ::retry::$name {} }
     foreach name {ids selection live} { set ::automatic::$name {} }
-    foreach name {pending seen deleted} { set ::recovery::$name {} }
+    foreach name {pending seen deleted helpers helperRequests} { set ::recovery::$name {} }
     foreach name {client backend} {
         if {[info exists ::$name]} {
             set $name [set ::$name]
