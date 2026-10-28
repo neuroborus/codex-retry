@@ -26,7 +26,9 @@ documentation in English.
   work. Error notifications, reconnect banners and elapsed time grant no action;
   proxy/TUI disconnection still cancels recovery. Deploy source changes only in
   new wrapper processes; never intervene in an existing live session.
-- Keep Tcllib responsible for JSON and WebSocket framing. Avoid frameworks,
+- Use the public tDOM 0.9.3+ API for strict typed JSON decoding, rejecting
+  duplicate decoded member names and deleting temporary DOMs. Keep Tcllib for
+  WebSocket framing, Huddle containers and JSON writing. Avoid frameworks,
   persistent state, and configuration layers unless requested behavior requires them.
 - Keep project skills under `.agents/skills/`. `.claude/skills` points there;
   `CLAUDE.md` points to this file. Edit only the canonical files.

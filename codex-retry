@@ -1,6 +1,10 @@
 #!/usr/bin/env expect
 
-package require huddle::json
+if {[catch {package require tdom 0.9.3}]} {
+    puts stderr "codex-retry: tDOM 0.9.3 or newer is required; install tdom (Debian/Ubuntu: sudo apt install expect tcllib tdom)"
+    exit 1
+}
+package require huddle
 package require json
 package require json::write
 json::write indented 0
@@ -148,31 +152,90 @@ proc automatic::read_only {method} {
         account/usage/read account/workspaceMessages/read account/gatewayOAuth/read}}
 }
 
-# Tcllib parses JSON. Counting its retained members against the string-free
-# source rejects duplicate keys, which its dictionaries otherwise overwrite.
-proc automatic::members {object} {
-    set count 0
+# tDOM 0.9.3 exposes JSON types through public nodes, including scalar roots.
+proc json_node {node {convert 1}} {
+    set type [$node jsonType]
+    if {!$convert && $type in {NONE STRING NUMBER TRUE FALSE NULL}} { return "" }
+    switch -- $type {
+        OBJECT {
+            set seen {}
+            set fields {}
+            foreach child [$node childNodes] {
+                set key [$child nodeName]
+                if {[dict exists $seen $key]} { error "duplicate JSON key" }
+                dict set seen $key 1
+                set value [json_node $child $convert]
+                if {$convert} { lappend fields $key $value }
+            }
+            if {!$convert} { return "" }
+            # compile treats arbitrary member names as literal dictionary keys.
+            return [huddle compile {dict * huddle} $fields]
+        }
+        ARRAY {
+            set items {}
+            foreach child [$node childNodes] {
+                set value [json_node $child $convert]
+                if {$convert} { lappend items $value }
+            }
+            if {!$convert} { return "" }
+            return [huddle list {*}$items]
+        }
+        NONE {
+            # Scalar object properties have one typed text child in tDOM 0.9.3.
+            set children [$node childNodes]
+            if {[llength $children] != 1} { error "ambiguous JSON value" }
+            return [json_node [lindex $children 0]]
+        }
+        STRING { return [huddle string [$node nodeValue]] }
+        NUMBER { return [huddle number [$node nodeValue]] }
+        TRUE { return [huddle true] }
+        FALSE { return [huddle false] }
+        NULL { return [huddle null] }
+        default { error "unknown JSON node type" }
+    }
+}
+proc json_decode {json {filter ""}} {
+    # Tcl strings encode literal NUL specially; only escaped NUL is valid JSON.
+    if {[string first "\u0000" $json] >= 0} { error "invalid JSON character" }
+    set document [dom parse -json -jsonroot root -- $json]
+    try {
+        set root [$document documentElement]
+        if {$filter ne "" && [$filter $root]} {
+            # Unobserved payloads still require recursive duplicate rejection.
+            json_node $root 0
+            return ""
+        }
+        return [json_node $root]
+    } finally { $document delete }
+}
+proc automatic::decode {json {filter ""}} {
+    set object [json_decode $json $filter]
+    if {$filter ne "" && $object eq ""} { return "" }
+    if {[huddle type $object] ne "dict"} { error "expected one object" }
+    return $object
+}
+
+# Preserve the existing untyped routing view without parsing the JSON again.
+# Huddle's generic strip cannot handle empty objects and maps null to empty text.
+proc json_value {object} {
     switch -- [huddle type $object] {
         dict {
-            foreach key [huddle keys $object] { incr count [expr {1 + [members [huddle get $object $key]]}] }
+            set result {}
+            foreach key [huddle keys $object] {
+                dict set result $key [json_value [huddle get $object $key]]
+            }
+            return $result
         }
         list {
-            for {set i 0} {$i < [huddle llength $object]} {incr i} { incr count [members [huddle get $object $i]] }
+            set result {}
+            for {set i 0} {$i < [huddle llength $object]} {incr i} {
+                lappend result [json_value [huddle get $object $i]]
+            }
+            return $result
         }
+        null { return null }
+        default { return [huddle get_stripped $object] }
     }
-    return $count
-}
-proc automatic::decode {json} {
-    if {![json::validate $json]} { error "invalid JSON" }
-    # Tcllib's lexical validator permits raw controls and extra whitespace.
-    regsub -all {"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4}))*"} $json 0 outside
-    if {[regexp {["\\\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\uffff]} $outside]} { error "invalid JSON characters" }
-    # Wrapping forces the parser to consume the entire document, not a prefix.
-    set wrapper [::huddle::json2huddle "\[$json\]"]
-    if {[huddle llength $wrapper] != 1 || ![is $wrapper dict 0]} { error "expected one object" }
-    set object [huddle get $wrapper 0]
-    if {[regexp -all {:} $outside] != [members $object]} { error "duplicate JSON keys" }
-    return $object
 }
 
 # One selected goal and one outstanding native metadata request. Retry resets
@@ -934,12 +997,12 @@ namespace eval recovery {
     variable launcher [file normalize [info script]]
 }
 
-proc recovery::client {json} {
+proc recovery::client {json {object ""}} {
     variable target; variable pending; variable deleted; variable seen; variable yolo
-    set object [::huddle::json2huddle $json]
+    if {$object eq ""} { set object [automatic::decode $json] }
     if {[huddle type $object] ne "dict" || ![huddle exists $object method] || \
         [huddle type $object method] ne "string"} { return }
-    set message [json::json2dict $json]
+    set message [json_value $object]
     set method [field $message method]
     set params [field $message params]
     if {$method in {thread/start thread/resume thread/fork}} {
@@ -1003,7 +1066,7 @@ proc recovery::server {object message {automaticValid 0}} {
             [huddle type $object params threadSettings sandboxPolicy type] ne "string" || \
             [huddle get_stripped $object params threadSettings sandboxPolicy type] ne "dangerFullAccess"} { set yolo 0 }
     }
-    # Reuse Tcllib's dictionary; Huddle is needed only for typed field access.
+    # Reuse the routing dictionary; Huddle retains typed field access.
     if {[field $message method] in {thread/deleted thread/archived}} {
         set id [field $message params threadId]
         dict set deleted $id 1
@@ -1218,16 +1281,16 @@ proc resume::reject {message} {
 }
 
 # Only the intended startup activation is overridden. Later settings stay native-owned.
-proc resume::client {json} {
+proc resume::client {json {object ""}} {
     variable armed; variable activation; variable pending; variable failure
     if {$failure ne ""} { error $failure }
     if {!$armed && $pending eq ""} { return $json }
-    set message [json::json2dict $json]
+    if {$object eq ""} { set object [automatic::decode $json] }
+    set message [json_value $object]
     set method [field $message method]
     if {$method eq ""} { return $json }
     if {$armed && $method eq $activation} {
         set armed 0
-        set object [::huddle::json2huddle $json]
         if {[catch {
             set id [huddle get $object id]
             # A fresh start's identity comes only from its server reply.
@@ -1310,25 +1373,16 @@ proc retry::reset {} {
 
 proc retry::client {json {manual 1}} {
     variable current; variable usedIds
-    set object [::huddle::json2huddle $json]
-    set message [json::json2dict $json]
+    set object [automatic::decode $json]
+    set message [json_value $object]
     set method [field $message method]
     set goalMetadata 0
     if {$method in {thread/goal/get thread/goal/set}} {
-        if {[catch {automatic::decode $json} goalObject]} {
-            goal::forget 1
-        } else { set goalMetadata [goal::client $goalObject] }
+        set goalMetadata [goal::client $object]
     } else { goal::client $object $manual }
     # Canceling an automatic chain may clear current before steering is recorded.
     set prior $current
-    if {$manual && !$goalMetadata} {
-        if {[dict get $::automatic::flags auto_reset_limit] || \
-            [dict get $::automatic::flags auto_continue_after_stop]} {
-            if {[catch {automatic::decode $json} typed]} {
-                automatic::cancel
-            } else { automatic::client $typed }
-        } else { automatic::client $object }
-    }
+    if {$manual && !$goalMetadata} { automatic::client $object }
     if {([string match "account/*" $method] && ![automatic::read_only $method]) || \
         $method in {modelProvider/auth/set modelProvider/auth/clear}} { reset }
     if {$method ne "" && [dict exists $message id]} {
@@ -1431,12 +1485,11 @@ proc retry::user_item {turnId item} {
     }
 }
 
-proc retry::items {turn json args} {
+proc retry::items {turn object args} {
     set index -1
     foreach item [field $turn items] {
         incr index
         if {[field $item type] eq "userMessage"} {
-            if {![info exists object]} { set object [::huddle::json2huddle $json] }
             user_item [field $turn id] [huddle get $object {*}$args items $index]
         } else {
             observe [field $turn id] progress 1
@@ -1503,61 +1556,56 @@ proc retry::fire {} {
     backend_send [json_dump $request]
 }
 
-# Recognize App Server's two-field replies without decoding large catalogs.
-# Strings are opaque; check container boundaries so later envelope fields
-# (including method or a duplicate ID) always use the full Tcllib parser.
-proc retry::response_id {json} {
-    if {![regexp {^[ \t\r\n]*\{[ \t\r\n]*"id"[ \t\r\n]*:[ \t\r\n]*("(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4}))*"|-?(?:0|[1-9][0-9]*))[ \t\r\n]*,[ \t\r\n]*"(?:result|error)"[ \t\r\n]*:[ \t\r\n]*} \
-        [string range $json 0 255] header encodedId]} { return "" }
-    if {[catch {set id [json_dump [::huddle::json2huddle $encodedId]]}]} { return "" }
-    set payload [string range $json [string length $header] end]
-    if {[string index $payload 0] ni {\{ \[}} { return "" }
-    regsub -all {"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4}))*"} $payload 0 structure
-    if {[regexp {["\\]} $structure]} { return "" }
-    set closing ""
-    set delimiters [regexp -all -inline {[][{}]} $structure]
-    set remaining [llength $delimiters]
-    foreach character $delimiters {
-        incr remaining -1
-        switch -- $character {
-            \{ { append closing \} }
-            \[ { append closing \] }
-            default {
-                if {$character ne [string index $closing end]} { return "" }
-                set closing [string range $closing 0 end-1]
-                if {$closing eq ""} {
-                    # Only the response's final brace may follow the payload.
-                    if {$remaining == 1 && [regexp {(?:\}|\])[ \t\r\n]*\}[ \t\r\n]*$} $structure]} { return $id }
-                    return ""
-                }
+# Keep unrelated catalogs out of Huddle conversion after tDOM validates the
+# complete document. Inspect only a two-field response through public DOM nodes.
+proc retry::unrelated {node} {
+    if {[$node jsonType] ne "OBJECT" || [llength [$node childNodes]] != 2} { return 0 }
+    set id ""
+    set payload 0
+    foreach child [$node childNodes] {
+        switch -- [$child nodeName] {
+            id {
+                if {[$child jsonType] ne "NONE"} { return 0 }
+                set value [json_node $child]
+                if {[huddle type $value] ni {string number}} { return 0 }
+                set id [json_dump $value]
             }
+            result - error {
+                if {[$child jsonType] ni {OBJECT ARRAY}} { return 0 }
+                set payload 1
+            }
+            default { return 0 }
         }
     }
-    return ""
+    return [expr {$payload && $id ne "" && $id ne [field $::resume::pending rpcId] && \
+        $id ne [field $::recovery::pending rpcId] && ![dict exists $::retry::internal $id] && \
+        $id ne [field $::goal::pending rpcId] && \
+        $id ne [field $::automatic::current rpcId] && ![dict exists $::automatic::ids $id] && \
+        ($::retry::current eq "" || $id ne [field $::retry::current rpcId])}]
 }
 
 # Hide internal replay replies and unconfirmed startup success; forward other traffic.
 proc retry::server {json} {
     variable current; variable internal; variable finished
-    set id [response_id $json]
-    if {$id ne "" && $id ne [field $::resume::pending rpcId] && \
-        $id ne [field $::recovery::pending rpcId] && ![dict exists $internal $id] && \
-        $id ne [field $::goal::pending rpcId] && \
-        $id ne [field $::automatic::current rpcId] && ![dict exists $::automatic::ids $id] && \
-        ($current eq "" || $id ne [field $current rpcId])} { return 1 }
-    set message [json::json2dict $json]
-    if {[dict exists $message id]} {
-        set id [json_dump [huddle get [::huddle::json2huddle $json] id]]
+    if {[catch {automatic::decode $json retry::unrelated} object options]} {
+        goal::reconcile
+        set ::automatic::selection {}
+        automatic::cancel
+        reset
+        return -options $options $object
     }
+    if {$object eq ""} { return 1 }
+    set typed $object
+    set message [json_value $object]
+    set id ""
+    if {[huddle exists $object id]} { set id [json_dump [huddle get $object id]] }
     set method [field $message method]
     set goalMetadata 0
     set goalTracking [expr {$::goal::pending ne "" || \
         ($::goal::snapshot ne "" && [automatic::text $::goal::snapshot status] eq "complete")}]
     if {$method eq "thread/goal/updated" || \
         ($id ne "" && $id eq [field $::goal::pending rpcId])} {
-        if {[catch {automatic::decode $json} goalObject]} {
-            goal::cancel
-        } else { set goalMetadata [goal::server $goalObject] }
+        set goalMetadata [goal::server $object]
     }
     if {$method in {account/updated account/gatewayOAuth/changed} || \
         ([field $message params threadId] ne "" && \
@@ -1591,9 +1639,8 @@ proc retry::server {json} {
     }
     # Legacy compaction is turn progress, just like a contextCompaction item.
     # Require unambiguous IDs even when optional recovery is disabled.
-    if {$method eq "thread/compacted" && ([catch {automatic::decode $json} compacted] || \
-        [automatic::text $compacted params threadId] eq "" || \
-        [automatic::text $compacted params turnId] eq "")} {
+    if {$method eq "thread/compacted" && ([automatic::text $object params threadId] eq "" || \
+        [automatic::text $object params turnId] eq "")} {
         automatic::cancel
         reset
         return 1
@@ -1607,23 +1654,12 @@ proc retry::server {json} {
         $goalTracking || \
         $::transport::reattaching || \
         [dict get $::automatic::flags auto_reset_limit] || [dict get $::automatic::flags auto_continue_after_stop]} {
-        if {[catch {automatic::decode $json} typed]} {
-            goal::reconcile
-            set ::automatic::selection {}
-            if {$::automatic::current ne "" && \
-                [field $::automatic::current phase] ni {running overload}} {
-                automatic::stop "ambiguous protocol data canceled automatic recovery"
-            } else { automatic::cancel }
-            set automaticVisible [expr {![dict exists $::automatic::ids $id]}]
-        } else {
-            set automaticValid 1
-            set automaticVisible [automatic::server $typed $goalMetadata]
-        }
+        set automaticValid 1
+        set automaticVisible [automatic::server $typed $goalMetadata]
     }
     set response [expr {$method eq "" && [dict exists $message id] && \
         ([dict exists $message result] || [dict exists $message error])}]
     if {[dict exists $message id] && ($method eq "" || $::resume::pending ne "")} {
-        set object [::huddle::json2huddle $json]
         set id [json_dump [huddle get $object id]]
         if {$id eq [field $::resume::pending rpcId]} {
             # Only a non-empty JSON string identifies a colliding server request.
@@ -1643,7 +1679,7 @@ proc retry::server {json} {
     }
     if {($response && $id eq [field $::recovery::pending rpcId]) || \
         $method in {thread/deleted thread/archived thread/settings/updated}} {
-        recovery::server [::huddle::json2huddle $json] $message $automaticValid
+        recovery::server $object $message $automaticValid
     }
     set visible [expr {$automaticVisible && (!$response || ![dict exists $internal $id])}]
     if {$response} { dict unset internal $id }
@@ -1658,8 +1694,7 @@ proc retry::server {json} {
     if {$current eq ""} { return $visible }
     if {$response && $id eq [dict get $current rpcId]} {
         # Native ACKs may omit status; historical ownership still requires it.
-        if {(!$automaticValid && [catch {automatic::decode $json} typed]) || \
-            [huddle exists $typed method] || \
+        if {[huddle exists $typed method] || \
             ![automatic::is $typed dict result turn] || \
             [automatic::text $typed result turn id] eq "" || \
             (($goalTracking || [huddle exists $typed result turn status]) && \
@@ -1675,7 +1710,7 @@ proc retry::server {json} {
             dict set current accepted 1
             dict set current turnId $turnId
             if {[field $current status] eq "awaiting"} { dict set current status inProgress }
-            items $turn $json result turn
+            items $turn $object result turn
             update
         }
         return $visible
@@ -1696,16 +1731,15 @@ proc retry::server {json} {
         } elseif {$turnId ne [field $current turnId]} {
             reset
         }
-        if {$current ne ""} { items [field $params turn] $json params turn; update }
+        if {$current ne ""} { items [field $params turn] $object params turn; update }
     } elseif {$method eq "turn/completed" && $turnId ne ""} {
         if {$freshCompletion && [field $current status] eq "failed" && \
             $turnId ne [field $current turnId]} { reset; return $visible }
         if {$freshCompletion || $turnId eq [field $current turnId] || \
             [dict exists $current observations $turnId completion]} {
-            items [field $params turn] $json params turn
+            items [field $params turn] $object params turn
             if {$freshCompletion} {
-                if {(!$automaticValid && [catch {automatic::decode $json} typed]) || \
-                    [automatic::text $typed method] ne "turn/completed" || \
+                if {[automatic::text $typed method] ne "turn/completed" || \
                     ![automatic::is $typed dict params turn] || \
                     [automatic::text $typed params threadId] ne [field $current threadId] || \
                     [automatic::text $typed params turn id] ne $turnId} {
@@ -1744,7 +1778,7 @@ proc retry::server {json} {
                 rawResponseItem/completed rawResponse/completed mcpServer/elicitation/request
             })} {
             if {$method in {item/started item/completed} && [field $params item type] eq "userMessage"} {
-                user_item $turnId [huddle get [::huddle::json2huddle $json] params item]
+                user_item $turnId [huddle get $object params item]
             } else {
                 observe $turnId progress 1
             }
@@ -1790,7 +1824,6 @@ proc transport::lost {message} {
 }
 
 proc backend_send {json} {
-    set json [json_dump [::huddle::json2huddle $json]]
     if {[catch {websocket::send $::backend text $json} sent] || $sent < 0} {
         transport::lost "shared app-server proxy send failed"
     }
@@ -1824,7 +1857,7 @@ proc backend_event {channel type json {generation ""}} {
     } message]} { bgerror $message }
 }
 
-proc connection {socket type message {generation ""}} {
+proc connection {socket type message {generation ""} {object ""}} {
     if {$generation ne "" && ($generation != $::transport::generation || \
         ($type ne "connect" && (![info exists ::client] || $socket ne $::client)))} { return }
     # Tcllib logs callback exceptions; make proxy failures terminate visibly.
@@ -1834,9 +1867,13 @@ proc connection {socket type message {generation ""}} {
                 set ::client $socket
             }
             text {
-                set message [cwd_client $message]
-                set message [resume::client $message]
-                recovery::client $message
+                if {$object eq ""} { set object [automatic::decode $message] }
+                foreach transform {cwd_client resume::client} {
+                    set updated [$transform $message $object]
+                    if {$updated ne $message} { set object [automatic::decode $updated] }
+                    set message $updated
+                }
+                recovery::client $message $object
                 retry::client $message
                 backend_send $message
             }
@@ -1893,8 +1930,8 @@ proc auxiliary::event {ticket socket type message} {
             text {
                 # A reconnecting picker may arrive first. Only a real activation
                 # promotes its already initialized bridge to the primary role.
+                set object [automatic::decode $message]
                 if {![info exists ::client] && ![info exists ::backend]} {
-                    set object [automatic::decode $message]
                     if {[huddle exists $object id]} {
                         dict set ids($socket) [json_dump [huddle get $object id]] 1
                     }
@@ -1907,11 +1944,10 @@ proc auxiliary::event {ticket socket type message} {
                         set ::retry::usedIds $ids($socket)
                         unset ids($socket)
                         unset backends($::backend) clients($socket) tickets($socket)
-                        connection $socket text $message $ticket
+                        connection $socket text $message $ticket $object
                         return
                     }
                 }
-                set message [json_dump [::huddle::json2huddle $message]]
                 if {[websocket::send $clients($socket) text $message] < 0} { close $socket }
             }
             close - disconnect - error - timeout - binary { close $socket }
@@ -1930,8 +1966,7 @@ proc auxiliary::backend {ticket channel type message} {
     if {[catch {
         switch -- $type {
             text {
-                # Keep large picker replies on the primary envelope fast path.
-                if {[retry::response_id $message] eq ""} { ::huddle::json2huddle $message }
+                automatic::decode $message retry::unrelated
                 if {[websocket::send $socket text $message] < 0} { close $socket }
             }
             close - disconnect - error - timeout - binary { close $socket }
@@ -2303,9 +2338,9 @@ proc detached_value {argument} {
 
 # This launch-only default outlives transport reconnections of the same TUI.
 set ::implicitCwd ""
-proc cwd_client {json} {
+proc cwd_client {json {object ""}} {
     if {$::implicitCwd eq ""} { return $json }
-    set object [::huddle::json2huddle $json]
+    if {$object eq ""} { set object [automatic::decode $json] }
     if {[automatic::text $object method] in {thread/resume thread/fork} && \
         [automatic::is $object string params cwd] && \
         [huddle get_stripped $object params cwd] eq $::implicitCwd} {

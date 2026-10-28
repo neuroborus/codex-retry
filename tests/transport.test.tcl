@@ -4,7 +4,7 @@
 set root [file normalize [file join [file dirname [info script]] ..]]
 set wrapper [file join $root codex-retry]
 if {[llength $argv]} { set wrapper [file normalize [lindex $argv 0]] }
-set cases {large eof oversized fragmented-oversized retry reset manual pending picker-first unavailable eof-term eof-hup eof-input-eof guard}
+set cases {large eof oversized fragmented-oversized retry reset manual pending picker-first unavailable eof-term eof-hup eof-input-eof guard latency}
 # Preserve case attribution when the caller can retain only the exit status.
 set caseStatuses {}
 foreach case $cases { dict set caseStatuses $case [expr {48 + [dict size $caseStatuses]}] }
@@ -39,6 +39,14 @@ try {
             return [format {{"id":%d,"result":{"history":"BEGIN-%s-éλ-END"}}} \
                 $id [string repeat h 17825792]]
         }
+        proc latency {direction} {
+            # Escapes, Unicode, number spelling, unknown fields and envelope order
+            # must survive unchanged in both directions, without a fake JSON decoder.
+            set envelope {"method" : "fixture/metadata"}
+            if {$direction eq "request"} { set envelope {"id" : 41, "method" : "fixture/echo"} }
+            return [format { { "params" : {"text":"%s","number":5.03e2,"large":9007199254740993123456789,"unknown":[]}, %s } } \
+                [string repeat {Neutral \" \\ \u0000 \u00e9 λ. } 100000] $envelope]
+        }
         proc oversized {socket fragmented} {
             # A valid data-frame header alone must reject before reading a body.
             # The fragmented case tests accumulated bytes, not just frame size.
@@ -63,6 +71,11 @@ try {
             }
             proc request {socket type message} {
                 if {$type ne "text"} { return }
+                if {$::env(TRANSPORT_CASE) eq "latency" && [string length $message] > 2000000} {
+                    if {$message ne [latency request]} { exit 87 }
+                    websocket::send $socket text {{"id":41,"result":{}}}
+                    return
+                }
                 set object [json::json2dict $message]
                 set method [dict get $object method]
                 if {$method eq "initialized"} { return }
@@ -84,6 +97,7 @@ try {
                         }
                         websocket::send $socket text [format {{"id":%d,"result":{"thread":{"id":"transport-session"},"approvalPolicy":"on-request","sandbox":{"type":"readOnly"}}}} $id]
                     }
+                    fixture/latency { websocket::send $socket text [latency notification] }
                     fixture/history {
                         set history [history $id]
                         if {$id == 21} {
@@ -146,12 +160,34 @@ try {
                 after 10 [list pending_eof $socket]
             }
         }
+        set latencyInbound 0
+        set latencyOutbound 0
+        set latencyKeys 0
+        set latencySent 0
+        proc latency_next {} {
+            if {$::latencyInbound && $::latencyKeys == 1 && !$::latencySent} {
+                set ::latencySent 1
+                websocket::send $::main text [latency request]
+            }
+            if {$::latencyOutbound && $::latencyKeys == 2} {
+                puts INPUT_READY
+                flush stdout
+            }
+        }
         proc receive {role ticket socket type message} {
             if {![dict exists $::connections $role] || [dict get $::connections $role] != $ticket} { return }
             if {$type eq "connect"} {
                 set ::$role $socket
                 rpc $socket 0 initialize
             } elseif {$type eq "text"} {
+                if {$::env(TRANSPORT_CASE) eq "latency" && [string length $message] > 2000000} {
+                    if {$message ne [latency notification]} { exit 88 }
+                    puts LATENCY_DELIVERED
+                    flush stdout
+                    set ::latencyInbound 1
+                    latency_next
+                    return
+                }
                 if {[string length $message] > 16777216} {
                     set id [expr {$role eq "main" ? 11 : 21}]
                     set expected [encoding convertto utf-8 [history $id]]
@@ -186,6 +222,8 @@ try {
                             rpc $::picker 22 fixture/eof
                         } else { puts INPUT_READY }
                         flush stdout
+                    } elseif {$::env(TRANSPORT_CASE) eq "latency"} {
+                        rpc $socket 40 fixture/latency
                     } elseif {$::env(TRANSPORT_CASE) eq "large"} {
                         rpc $socket 11 fixture/history
                     } elseif {$::env(TRANSPORT_CASE) in {retry reset}} {
@@ -204,6 +242,11 @@ try {
                             "fixture/$::env(TRANSPORT_CASE)" : "fixture/eof"}]
                         rpc $socket 12 $method
                     }
+                } elseif {$id == 41} {
+                    puts LATENCY_FORWARDED
+                    flush stdout
+                    set ::latencyOutbound 1
+                    latency_next
                 } elseif {$id == 8} { rpc $socket 12 fixture/eof
                 } elseif {$id == 21} { connect main
                 } elseif {$id == 30} {
@@ -240,7 +283,13 @@ try {
             }
         }
         proc input {} {
-            if {[read stdin 1] eq "q"} {
+            set key [read stdin 1]
+            if {$::env(TRANSPORT_CASE) eq "latency" && $key eq "k"} {
+                puts "KEY_ECHO:[incr ::latencyKeys]"
+                flush stdout
+                latency_next
+            }
+            if {$key eq "q"} {
                 if {$::env(TRANSPORT_CASE) eq "unavailable"} { exit 7 }
                 rpc $::main 30 fixture/ping
             }
@@ -258,6 +307,22 @@ try {
         # No production size, framing or lifecycle behavior is replaced.
         set observe {
             package require websocket
+            if {$env(TRANSPORT_CASE) eq "latency"} {
+                # Announce callback entry before the real proxy handles the
+                # message, so keys arrive during parsing in either implementation.
+                set ::jsonProbes 0
+                proc measure_json {command socket type message args} {
+                    if {$type eq "text" && [string length $message] > 2000000} {
+                        puts "JSON_BUSY:[incr ::jsonProbes]"
+                        flush stdout
+                    }
+                    $command $socket $type $message {*}$args
+                }
+                foreach command {backend_event connection} {
+                    rename $command measured_$command
+                    interp alias {} $command {} measure_json measured_$command
+                }
+            }
             rename websocket::close websocket::native_close
             proc websocket::close {socket {code 1000} {reason ""}} {
                 if {$code == 1009} {
@@ -297,12 +362,29 @@ try {
         set slave $spawn_out(slave,name)
         set output ""
         set sent 0
+        set probeTimes {}
+        set probeEchoes {}
         set started [clock milliseconds]
         set failed [catch {
             expect {
                 -re {(?s).+} {
                     append output $expect_out(0,string)
                     if {[string length $output] > 8192} { error "transport leaked payloads or diagnostics" }
+                    if {$env(TRANSPORT_CASE) eq "latency"} {
+                        foreach probe {1 2} {
+                            if {![dict exists $probeTimes $probe] && [string first "JSON_BUSY:$probe" $output] >= 0} {
+                                dict set probeTimes $probe [clock milliseconds]
+                                send -- k
+                            }
+                            if {![dict exists $probeEchoes $probe] && [string first "KEY_ECHO:$probe" $output] >= 0} {
+                                if {![dict exists $probeTimes $probe] || \
+                                    [clock milliseconds] - [dict get $probeTimes $probe] >= 1000} {
+                                    error "large JSON blocked keyboard echo for at least one second"
+                                }
+                                dict set probeEchoes $probe 1
+                            }
+                        }
+                    }
                     if {!$sent && [string first INPUT_READY $output] >= 0} {
                         switch $env(TRANSPORT_CASE) {
                             eof-term { exec kill -TERM $owner }
@@ -339,7 +421,14 @@ try {
             } elseif {![regexp {To resume this session, run:\r*\n[^\r\n]* resume transport-session} $output]} {
                 error "missing confirmed-session resume advice"
             }
-            if {$env(TRANSPORT_CASE) eq "large"} {
+            if {$env(TRANSPORT_CASE) eq "latency"} {
+                if {[dict size $probeTimes] != 2 || [dict size $probeEchoes] != 2} {
+                    error "keyboard echo was not measured in both JSON directions"
+                }
+                foreach marker {LATENCY_DELIVERED LATENCY_FORWARDED POST_TRANSFER_OK} {
+                    if {[string first $marker $output] < 0} { error "missing latency marker: $marker" }
+                }
+            } elseif {$env(TRANSPORT_CASE) eq "large"} {
                 foreach marker {DELIVERED:main:17825840: DELIVERED:picker:17825840: AUXILIARY_ISOLATED POST_TRANSFER_OK} {
                     if {[string first $marker $output] < 0} { error "missing transport marker: $marker" }
                 }
@@ -377,7 +466,7 @@ try {
                     incr turns
                     if {$generation != 1 || $env(TRANSPORT_CASE) ni {retry reset}} { error "unsolicited work after reconnection" }
                 } elseif {$method eq "account/rateLimits/read"} { incr reads
-                } elseif {$method ni {initialize thread/resume thread/list thread/settings/update fixture/history
+                } elseif {$method ni {initialize thread/resume thread/list thread/settings/update fixture/history fixture/latency
                     fixture/eof fixture/ping fixture/oversized fixture/fragmented-oversized}} {
                     error "unsolicited account or model request"
                 }

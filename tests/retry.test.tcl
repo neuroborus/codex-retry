@@ -1,5 +1,7 @@
 #!/usr/bin/env tclsh
 
+package require huddle::json
+package require json
 source [file join [file dirname [info script]] .. codex-retry]
 set proxyFixture [file normalize [file join [file dirname [info script]] proxy-fixture.tcl]]
 # Every fake child inherits an empty wrapper configuration, never the user's.
@@ -23,6 +25,123 @@ try {
 proc check {condition message} {
     if {![uplevel 1 [list expr $condition]]} { error $message }
 }
+
+# Dependency failure must happen before server or TUI effects, with no fallback.
+set dependencyProbe {
+    rename package native_package
+    proc package {command args} {
+        if {$command eq "require" && [lindex $args 0] eq "tdom"} { error "fixture: tDOM unavailable" }
+        native_package $command {*}$args
+    }
+    proc exec {args} { puts stderr UNEXPECTED_PROCESS; exit 92 }
+    proc spawn {args} { puts stderr UNEXPECTED_PROCESS; exit 92 }
+    set argv0 dependency-probe
+}
+append dependencyProbe [list source [file normalize [file join [file dirname [info script]] .. codex-retry]]] "\n"
+set failed [catch {exec [info nameofexecutable] << $dependencyProbe 2>@1} message options]
+check {$failed && [lindex [dict get $options -errorcode] 0] eq "CHILDSTATUS" && \
+    [lindex [dict get $options -errorcode] 2] == 1 && \
+    [string first "tDOM 0.9.3 or newer is required" $message] >= 0 && \
+    [string first UNEXPECTED_PROCESS $message] < 0} "missing tDOM did not stop startup clearly before process effects"
+unset dependencyProbe failed message options
+
+# Native initialization guards observe the original JSON callback interface.
+set callbackProbe "set argv0 callback-probe\n[list source [file normalize [file join [file dirname [info script]] .. codex-retry]]]\n"
+append callbackProbe {
+    proc backend_send {json} { lappend ::forwarded $json }
+    proc bgerror {message} { error $message }
+    rename retry::client retry::observed_client
+    proc retry::client {json} {
+        set message [json::json2dict $json]
+        if {[field $message method] ni {initialize initialized}} { error "metadata handshake only" }
+        retry::observed_client $json
+    }
+    set initialize { {"id":0,"method":"initialize","params":{}} }
+    set initialized {{"method":"initialized"}}
+    set forwarded {}
+    connection fixture text $initialize
+    connection fixture text $initialized
+    if {$forwarded ne [list $initialize $initialized]} { error "metadata JSON changed" }
+    puts CALLBACK_COMPATIBLE
+}
+set failed [catch {exec [info nameofexecutable] << $callbackProbe 2>@1} message]
+check {!$failed && $message eq "CALLBACK_COMPATIBLE"} "native initialization callback compatibility failed: $message"
+unset callbackProbe failed message
+
+# Duplicate protocol members are fatal before routing or recovery can act.
+proc reject_duplicate {script} {
+    set failed [catch {uplevel 1 $script} message]
+    check {$failed && $message eq "duplicate JSON key"} "duplicate protocol JSON was not rejected"
+}
+
+# Public tDOM conversion retains every JSON kind without guessing from text.
+set domCommands [lsort [info commands ::dom*]]
+foreach json {
+    null true false 0 -0 503.0 5.03e2 9007199254740993123456789
+    {""} {"503"} {"true"} {"null"} {[]} {{}}
+    {[1,"1",true,"true",null,"null",{},[]]}
+    {{"types":{"object":{},"array":[],"number":503,"decimal":503.0,"exponent":5.03e2,"string":"503","boolean":true,"null":null}}}
+    {{"unicode":"éλ","escaped":"\u00e9\u03bb","pair":"\uD83D\uDE00","nul":"\u0000","key\u0000tail":"kept","controls":"\"\\\/\b\f\n\r\t"}}
+    {{"nested":[{"a":[null,false,{"b":"x"}]}],"interpolation":"$HOME [pid] `literal`"}}
+} {
+    set value [json_decode $json]
+    check {[huddle equal $value [::huddle::json2huddle $json]]} "tDOM changed a typed JSON value"
+    check {[json_value $value] eq [json::json2dict $json]} "untyped routing view changed"
+    check {[lsort [info commands ::dom*]] eq $domCommands} "successful decoding leaked DOM commands"
+}
+foreach number {0 -0 503 503.0 5.03e2 1E+09 -1.25e-07 9007199254740993123456789} {
+    set value [json_decode $number]
+    check {[huddle type $value] eq "number" && [json_dump $value] eq $number} "numeric spelling changed"
+    check {![huddle equal $value [huddle string $number]]} "numeric and string identities merged"
+}
+set value [automatic::decode {{"":"","\u0061":"éλ","pair":"\ud83d\ude00","raw":"😀","key\u0000tail":"\u0000","\u007b":"brace","HUDDLE {s key}":"literal"}}]
+check {[huddle get_stripped $value a] eq "éλ" && \
+    [huddle get_stripped $value pair] eq [huddle get_stripped $value raw]} "escaped Unicode changed"
+check {[huddle get_stripped $value "key\u0000tail"] eq "\u0000" && \
+    [huddle get_stripped $value ""] eq "" && \
+    [huddle get_stripped $value "\{"] eq "brace" && \
+    [huddle get_stripped $value {HUDDLE {s key}}] eq "literal"} "member names or NUL changed"
+foreach json [list {} {null true} {{} {}} {{} trailing} {{} /* comment */} \
+    {/* comment */ {}} {{"x":1,}} {[1,]} {{"n":01}} {{"n":+1}} {{"n":NaN}} \
+    {{"n":1.}} {{"n":1e}} {{"s":"\v"}} {{"s":"\uZZZZ"}} {{"s":"unterminated}} \
+    {{"a":1,"a":2}} {{"a":1,"\u0061":2}} {{"nested":{"x":1,"x":2}}} \
+    {{"x":[{"k":1,"k":2}]}} {{"key\u0000tail":1,"key\u0000tail":2}} \
+    "\{\"x\":\"raw\ncontrol\"\}" "\{\"x\":\"raw\u0000control\"\}" \
+    "\{\u00a0\"x\":1\}" "\{\}\u0000trailing"] {
+    check {[catch {json_decode $json}]} "invalid or duplicate JSON was accepted"
+    check {[lsort [info commands ::dom*]] eq $domCommands} "rejected JSON leaked DOM commands"
+}
+for {set code 0} {$code < 32} {incr code} {
+    set json [format {{"raw":"%c"}} $code]
+    check {[catch {json_decode $json}]} "unescaped JSON control character was accepted"
+    check {[lsort [info commands ::dom*]] eq $domCommands} "raw control rejection leaked DOM commands"
+}
+foreach json {null true false 1 {"object"} {[]} {[{}]}} {
+    check {[catch {automatic::decode $json}]} "protocol accepted a non-object root"
+}
+# Force a conversion exception independently of parser and duplicate failures.
+rename json_node original_json_node
+try {
+    proc json_node {node} { error "injected conversion failure" }
+    check {[catch {json_decode {{"valid":true}}} message] && \
+        $message eq "injected conversion failure"} "conversion exception was lost"
+} finally {
+    rename json_node {}
+    rename original_json_node json_node
+}
+check {[lsort [info commands ::dom*]] eq $domCommands} "conversion exception leaked DOM commands"
+unset domCommands value number json message code
+
+# Large JSON strings must not stall the terminal's shared event loop.
+set latencyText [string repeat "Neutral fixture output. \" \u00e9 \u03bb\n" 60000]
+set latencyJson [json::write object method [json::write string fixture/metadata] \
+    params [json::write object text [json::write string $latencyText]]]
+set latencyStart [clock milliseconds]
+set latencyObject [automatic::decode $latencyJson]
+set latencyElapsed [expr {[clock milliseconds] - $latencyStart}]
+check {[huddle get_stripped $latencyObject params text] eq $latencyText} "large typed JSON changed content"
+check {$latencyElapsed < 1000} "large JSON parsing blocked terminal input for at least one second"
+unset latencyText latencyJson latencyStart latencyObject latencyElapsed
 
 # Controlled timers and an offline app-server transport.
 rename after real_after
@@ -663,7 +782,7 @@ foreach follow {0 1} {
         {{"message":"Neutral failure.","codexErrorInfo":{"responseStreamDisconnected":null,"responseStreamDisconnected":{}}}}
     } {
         auto_begin 0 $follow
-        stream_completed $autoTurn $error
+        reject_duplicate {stream_completed $autoTurn $error}
         check {[dict size $timers] == 0 && $sent eq ""} "duplicate JSON keys authorized stream recovery"
     }
 }
@@ -730,7 +849,6 @@ foreach acknowledgement {
     {"result":{"turn":{"id":"@TURN@","status":1,"items":[]}}}
     {"result":{"turn":{"id":"@TURN@","status":{},"items":[]}}}
     {"result":{"turn":{"id":"@TURN@","status":"inProgress","items":[]}},"method":null}
-    {"result":{"turn":{"id":"wrong","id":"@TURN@","status":"inProgress","items":[]}}}
 } {
     auto_begin 0 0 0
     set fields [string map [list @TURN@ $autoTurn] $acknowledgement]
@@ -738,6 +856,10 @@ foreach acknowledgement {
     stream_completed $autoTurn $streamError
     check {[dict size $timers] == 0 && $sent eq ""} "ambiguous ACK authorized default stream replay"
 }
+auto_begin 0 0 0
+reject_duplicate {retry::server [format {{"id":%s,"result":{"turn":{"id":"wrong","id":"%s","status":"inProgress","items":[]}}}} $autoId $autoTurn]}
+stream_completed $autoTurn $streamError
+check {[dict size $timers] == 0 && $sent eq ""} "duplicate ACK authorized stream replay"
 foreach {path value} {
     method {["turn/start"]}
     id {[7]}
@@ -842,11 +964,11 @@ foreach code {{["cyberPolicy"]} {null} {{"cyberPolicy":{}}}} {
     check {[dict size $timers] == 0} "a malformed error code triggered recovery"
 }
 auto_begin 1 1 0
-retry::server [format {{"id":"unrelated","result":{"turn":{"id":"%s","status":"inProgress","items":[]}},"id":%s}} $autoTurn $autoId]
+reject_duplicate {retry::server [format {{"id":"unrelated","result":{"turn":{"id":"%s","status":"inProgress","items":[]}},"id":%s}} $autoTurn $autoId]}
 completed $autoTurn failed cyberPolicy
 check {[dict size $timers] == 0} "an ambiguous duplicate envelope acknowledged work"
 auto_until read
-auto_reply [string map [list {"availableCount":1} {"availableCount":0,"availableCount":1}] $exhausted]
+reject_duplicate {auto_reply [string map [list {"availableCount":1} {"availableCount":0,"availableCount":1}] $exhausted]}
 check {[dict size $timers] == 0 && [llength $sent] == 1} "duplicate credit fields consumed a reset"
 foreach item {
     {{"type":"userMessage","id":"foreign","content":[{"type":"text","text":"different input"}]}}
@@ -1171,10 +1293,10 @@ foreach source {activation settings} {
         auto_begin 1 0
         completed $autoTurn completed
         if {$source eq "activation"} {
-            auto_activation {"modelProvider":"other-provider","modelProvider":"openai"} 1
+            reject_duplicate {auto_activation {"modelProvider":"other-provider","modelProvider":"openai"} 1}
         } else {
             auto_activation {"modelProvider":"openai"}
-            retry::server {{"method":"thread/settings/updated","params":{"threadId":"t1","threadSettings":{"modelProvider":"other-provider","modelProvider":"openai"}}}}
+            reject_duplicate {retry::server {{"method":"thread/settings/updated","params":{"threadId":"t1","threadSettings":{"modelProvider":"other-provider","modelProvider":"openai"}}}}}
         }
         check {$automatic::selection eq ""} "rejected protocol data established automatic provenance"
         check {![dict exists $automatic::live t1]} "rejected activation data seeded a live-turn snapshot"
@@ -2034,10 +2156,10 @@ foreach reset {0 1} {
                     missing_status { retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","items":[]}}}} $autoId $candidate] }
                     invalid_status { retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"unknown","items":[]}}}} $autoId $candidate] }
                     duplicate_error {
-                        retry::server [format {{"id":%s,"error":{"code":-32602,"message":"synthetic rejection"},"error":{"code":-32602,"message":"synthetic rejection"}}} $autoId]
+                        reject_duplicate {retry::server [format {{"id":%s,"error":{"code":-32602,"message":"synthetic rejection"},"error":{"code":-32602,"message":"synthetic rejection"}}} $autoId]}
                     }
                     duplicate_result {
-                        retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}},"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}} $autoId $candidate $candidate]
+                        reject_duplicate {retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}},"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}} $autoId $candidate $candidate]}
                     }
                     reset { retry::reset }
                 }
@@ -2070,7 +2192,7 @@ foreach reset {0 1} {
                 switch -- $outcome {
                     matching { reply $autoId $candidate }
                     duplicate_result {
-                        retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}},"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}} $autoId $candidate $candidate]
+                        reject_duplicate {retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}},"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}} $autoId $candidate $candidate]}
                     }
                     invalid_status { retry::server [format {{"id":%s,"result":{"turn":{"id":"%s","status":"unknown","items":[]}}}} $autoId $candidate] }
                     method_null { retry::server [format {{"id":%s,"method":null,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}} $autoId $candidate] }
@@ -2698,22 +2820,23 @@ foreach follow {0 1} {
         check {$automatic::current eq "" && $retry::current eq "" && \
             [dict size $timers] == 0 && $sent eq ""} "foreign compaction allowed recovery"
     }
-    foreach params {
-        {"turnId":"@TURN@"}
-        {"threadId":null,"turnId":"@TURN@"}
-        {"threadId":"","turnId":"@TURN@"}
-        {"threadId":["t1"],"turnId":"@TURN@"}
-        {"threadId":"t1"}
-        {"threadId":"t1","turnId":null}
-        {"threadId":"t1","turnId":""}
-        {"threadId":"t1","turnId":1}
-        {"threadId":"t1","turnId":["@TURN@"]}
-        {"threadId":"other","threadId":"t1","turnId":"@TURN@"}
-        {"threadId":"t1","turnId":"foreign","turnId":"@TURN@"}
+    foreach {duplicate params} {
+        0 {"turnId":"@TURN@"}
+        0 {"threadId":null,"turnId":"@TURN@"}
+        0 {"threadId":"","turnId":"@TURN@"}
+        0 {"threadId":["t1"],"turnId":"@TURN@"}
+        0 {"threadId":"t1"}
+        0 {"threadId":"t1","turnId":null}
+        0 {"threadId":"t1","turnId":""}
+        0 {"threadId":"t1","turnId":1}
+        0 {"threadId":"t1","turnId":["@TURN@"]}
+        1 {"threadId":"other","threadId":"t1","turnId":"@TURN@"}
+        1 {"threadId":"t1","turnId":"foreign","turnId":"@TURN@"}
     } {
         auto_begin 0 $follow
-        retry::server [format {{"method":"thread/compacted","params":{%s}}} \
+        set event [format {{"method":"thread/compacted","params":{%s}}} \
             [string map [list @TURN@ $autoTurn] $params]]
+        if {$duplicate} { reject_duplicate {retry::server $event} } else { retry::server $event }
         completed $autoTurn
         check {$automatic::current eq "" && $retry::current eq "" && \
             [dict size $timers] == 0 && $sent eq ""} "ambiguous compaction allowed recovery"
@@ -2961,6 +3084,9 @@ foreach active {0 1 2 3} {
     set recovery::pending {}
 }
 unset catalog catalogItem
+foreach invalid {{{"id":99,"result":{"nested":[{"a":1,"\u0061":2}]}}} {{"id":99,"result":{}} trailing} {{"id":99,"result":{/* comment */}}}} {
+    check {[catch {retry::server $invalid}]} "unrelated response bypassed strict JSON validation"
+}
 
 begin
 check {[retry::server {{"id":99,"result":{}}}] == 1} "empty JSON objects broke protocol forwarding"
@@ -3047,11 +3173,24 @@ completed long-id-turn
 reply $longId long-id-turn
 check {[dict size $timers] == 1} "a request ID beyond the bounded header lost its acknowledgement"
 
+foreach number {503.0 5.03e2 9007199254740993123456789} {
+    retry::reset
+    retry::client [format {{"id":%s,"method":"turn/start","params":{"threadId":"t1","input":[{"type":"text","text":"neutral"}]}}} $number]
+    set lexicalTurn lexical-id-$number
+    completed $lexicalTurn
+    reply [json::write string $number] $lexicalTurn
+    check {[dict size $timers] == 0} "a string acknowledged a numeric request ID"
+    reply $number $lexicalTurn
+    check {[dict size $timers] == 1} "numeric ID spelling lost its matching acknowledgement"
+}
+
 # A later ID must be interpreted by the full parser, even if the header matches.
 begin 0
 completed turn1
-retry::server {{"id":7,"result":{"turn":{"id":"turn1","items":[]}},"id":99}}
-check {![field $retry::current accepted] && [dict size $timers] == 0} "an ambiguous header acknowledged the wrong request"
+reject_duplicate {retry::server {{"id":7,"result":{"turn":{"id":"turn1","items":[]}},"id":99}}}
+check {$retry::current eq "" && [dict size $timers] == 0} "an ambiguous header acknowledged the wrong request"
+begin 0
+completed turn1
 reply 7 turn1
 check {[dict size $timers] == 1} "an ambiguous header consumed the matching acknowledgement"
 
@@ -3080,7 +3219,6 @@ foreach methodKey {{"method"} {"\u006dethod"}} {
 foreach layout {
     {"result":{},"id":%s}
     {"id":%s,"result":{},"jsonrpc":"2.0"}
-    {"id":99,"result":{},"id":%s}
 } {
     begin
     completed turn1
@@ -3094,7 +3232,10 @@ completed turn1
 fire
 set id [json_dump [huddle get [dict get $retry::current request] id]]
 retry::reset
-check {[retry::server [format {{"id":%s,"result":{},"id":99}} $id]] == 1} "a duplicate header ID hid an unrelated reply"
+foreach layout {{"id":%s,"result":{},"id":99} {"id":99,"result":{},"id":%s}} {
+    reject_duplicate {retry::server [format "\{$layout\}" $id]}
+    check {[dict exists $retry::internal $id]} "a duplicate header ID consumed the internal reply marker"
+}
 check {[reply $id turn2] == 0} "a duplicate header ID consumed the internal reply marker"
 check {[catch {retry::server {{"id":,"result":{}}}}]} "a malformed response header bypassed JSON parsing"
 
@@ -3868,7 +4009,8 @@ foreach methodKey {{"method"} {"\u006dethod"}} {
         check {[retry::server $event] == 1 && $resume::pending ne "" && $resume::failure eq ""} "a valid server request with a colliding resume ID was rejected"
     }
 }
-check {[retry::server {{"id":31,"result":{"thread":{"id":"t1"},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}},"id":99}}] == 1 && $resume::pending ne ""} "a duplicate header ID confirmed the wrong resume"
+reject_duplicate {retry::server {{"id":31,"result":{"thread":{"id":"t1"},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}},"id":99}}}
+check {$resume::pending ne "" && $resume::failure eq ""} "a duplicate header ID confirmed the wrong resume"
 check {[resume::client {{"id":32,"method":"thread/read","params":{"threadId":"other"}}}] eq {{"id":32,"method":"thread/read","params":{"threadId":"other"}}}} "unrelated read traffic was intercepted"
 check {[retry::server $resumeReply] == 1 && $resume::pending eq ""} "effective YOLO permissions were not confirmed"
 check {[resume::client $resumeRequest] eq $resumeRequest} "YOLO was reapplied on a later resume"
@@ -3954,6 +4096,13 @@ foreach activation {thread/resume thread/start} {
     }
 }
 check {[llength $proxyFailures] == 60} "guarded work did not fail visibly"
+resume::reset
+foreach invalid {{[]} {{"id":99,"method":"thread/list","params":{"a":1,"\u0061":2}}} {{"id":99,"result":{"nested":[{"a":1,"a":2}]}}} {{"id":99,"result":{}} trailing}} {
+    set before [llength $sent]
+    set failures [llength $proxyFailures]
+    connection fixture text $invalid
+    check {[llength $sent] == $before && [llength $proxyFailures] == $failures + 1} "invalid primary JSON was forwarded"
+}
 foreach activation {thread/resume thread/start} {
     set activationRequest [expr {$activation eq "thread/start" ? $startRequest : $resumeRequest}]
     set otherActivation [expr {$activation eq "thread/start" ? $resumeRequest : $startRequest}]
@@ -4095,7 +4244,7 @@ set routed {}
 set closedBridges {}
 set client primary-fixture
 set backend primary-bridge
-foreach socket {picker1 picker2} channel {bridge1 bridge2} {
+foreach socket {picker1 picker2 picker3 picker4} channel {bridge1 bridge2 bridge3 bridge4} {
     set auxiliary::clients($socket) $channel
     set auxiliary::backends($channel) $socket
     set ticket [incr transport::sequence]
@@ -4103,24 +4252,27 @@ foreach socket {picker1 picker2} channel {bridge1 bridge2} {
     foreach message [list $resumeRequest $request \
         { {"id":7,"method":"thread/list","params":{"searchTerm":"synthetic"}} }] {
         auxiliary::event $ticket $socket text $message
+        check {[lindex [lindex $routed end] 1] eq $message} "picker request JSON was rewritten"
     }
     foreach message [list $resumeReply \
         { {"id":7,"error":{"code":-1,"message":"metadata failure"}} } \
         { {"method":"thread/closed","params":{"threadId":"t1"}} }] {
         auxiliary::backend $ticket $channel text $message
+        check {[lindex [lindex $routed end] 1] eq $message} "picker reply JSON was rewritten"
     }
     check {[lindex [lindex $routed end] 0] eq $socket} "auxiliary backend reply used another client"
-    if {$socket eq "picker1"} {
-        auxiliary::backend $ticket $channel timeout ""
-    } else {
-        auxiliary::event $ticket $socket text "invalid JSON"
+    switch -- $socket {
+        picker1 { auxiliary::backend $ticket $channel timeout "" }
+        picker2 { auxiliary::event $ticket $socket text "invalid JSON" }
+        picker3 { auxiliary::backend $ticket $channel text {{"id":99,"result":{"a":1,"\u0061":2}}} }
+        picker4 { auxiliary::event $ticket $socket text {{"id":99,"method":"thread/list","params":{"a":1,"a":2}}} }
     }
     set before $routed
     auxiliary::backend $ticket $channel text $resumeReply
     auxiliary::event $ticket $socket text $request
     check {$routed eq $before} "retired auxiliary callback forwarded data"
 }
-check {[llength $routed] == 12 && $closedBridges eq {bridge1 bridge2}} "auxiliary routing or local failure cleanup changed"
+check {[llength $routed] == 24 && $closedBridges eq {bridge1 bridge2 bridge3 bridge4}} "auxiliary routing or local failure cleanup changed"
 check {[list $timers $retry::current $retry::delay $automatic::current \
     $automatic::selection $automatic::live $resume::armed $resume::pending $recovery::target $recovery::yolo] eq $protected} \
     "picker metadata, failure or closure changed primary ownership"
@@ -4419,6 +4571,7 @@ if {$failed} { error $message }
 check {$ready == 1} "fake backend startup timed out"
 check {$frameReady == 1} "fake backend frame timed out"
 check {[huddle equal [::huddle::json2huddle $frame] [::huddle::json2huddle $request]]} "proxy WebSocket framing changed JSON data or types"
+check {$frame eq "\n$request\n"} "unchanged proxy JSON lost its original whitespace"
 check {[clock milliseconds] - $before < 3000} "backend cleanup was not bounded"
 check {[catch {exec kill -0 $child}]} "backend survived cleanup"
 cleanup
@@ -5955,7 +6108,7 @@ check {!$failed} "fake backend diagnostic isolation failed: $message"
             if {!$unitFailure} {
                 set unitFailure 19
                 set code [dict get $options -errorcode]
-                if {[lindex $code 0] eq "CHILDSTATUS" && [lindex $code 2] >= 48 && [lindex $code 2] <= 61} {
+                if {[lindex $code 0] eq "CHILDSTATUS" && [lindex $code 2] >= 48 && [lindex $code 2] <= 62} {
                     set unitFailure [lindex $code 2]
                 }
             }

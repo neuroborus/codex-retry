@@ -4,9 +4,11 @@ A Tcl/Expect wrapper that keeps the native Codex TUI and retries confirmed
 model overload and narrowly verified transient model-transport failures through
 the [App Server protocol](https://learn.chatgpt.com/docs/app-server).
 
-Requires `codex`, `expect`, and Tcllib, with the shared-server commands available
-in Codex CLI 0.164.0.
-On Debian/Ubuntu, install the Tcl dependencies with `sudo apt install expect tcllib`.
+Requires `codex`, `expect`, Tcllib, and tDOM 0.9.3 or newer, with the shared-server
+commands available in Codex CLI 0.164.0.
+On Debian/Ubuntu, install the Tcl dependencies with `sudo apt install expect tcllib tdom`.
+tDOM must be available through the normal Tcl package paths. A missing or older
+package stops startup before the wrapper starts the server or TUI.
 Run the wrapper with interactive Codex arguments:
 
 ```sh
@@ -43,9 +45,28 @@ forwards a Ctrl+C keystroke to the TUI. Before the TUI starts, `SIGINT` cancels
 startup; `SIGTERM` and `SIGHUP` still close the wrapper.
 If wrapper input closes, it disconnects and drains the TUI's final output before
 reaping the child and restoring the terminal.
-Large unrelated startup replies use their request ID and envelope boundaries
-for routing without decoding the payload, keeping keyboard forwarding responsive.
-Other response layouts use the full JSON parser.
+JSON decoding uses tDOM's public `dom parse -json -jsonroot`, `documentElement`,
+`jsonType`, `childNodes`, `nodeName` and `nodeValue` APIs, available in 0.9.3;
+newer conversion helpers are not required. The adapter preserves Huddle types
+and number spellings, rejects duplicate decoded member names at every depth,
+requires a complete document, and deletes each temporary DOM even on rejection.
+Tcllib still provides WebSocket framing, Huddle containers and JSON writing.
+Unrelated two-field replies skip Huddle conversion after complete-document
+parsing and recursive duplicate checks through the same typed nodes.
+Validated messages pass through with their original JSON unless the wrapper
+changes them, such as the launch permission or directory adjustments.
+
+Local synthetic characterization on Ubuntu tDOM 0.9.3 measured a
+1.85-million-character document at about 3.2 ms for parsing and Huddle conversion,
+compared with about 1919 ms for the previous strict decoder. An escaped-string
+fixture measured about 1.5 ms versus 655 ms, and 5000 objects took about 86 ms
+including conversion. These are local measurements, not portable timing promises
+or a profile proving the cause of every live input stall. Parsing and conversion
+still run synchronously; large or deeply nested documents can occupy the event
+loop. Offline fake-Codex PTY checks cover keyboard echo during multi-megabyte
+traffic, exact forwarding and cleanup.
+Dependency and source changes apply to new wrapper processes. Installing tDOM
+does not update interpreters or sessions that are already running.
 WebSocket messages are bounded to 128 MiB, matching the native Codex
 remote client, so large session histories can pass through the wrapper.
 A primary backend disconnect cancels all pending retries and automatic recovery,
