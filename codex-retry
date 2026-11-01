@@ -2578,7 +2578,73 @@ proc cleanup {} {
     diagnostics::finish
 }
 
-proc close_backend {channel} {
+# A launcher may delegate its pipe to a child. Record identities before signaling
+# either process, so cleanup cannot follow a reused PID or an unrelated sibling.
+namespace eval owned {}
+proc owned::identity {child} {
+    if {![string is integer -strict $child] || $child <= 1 ||
+        [catch {open /proc/$child/stat r} channel]} { return {} }
+    set failed [catch {read $channel} stat]
+    catch {close $channel}
+    if {$failed || ![regexp {^\d+ \(.*\) (.*)$} $stat -> fields]} { return {} }
+    return [list $child [lindex $fields 19] [lindex $fields 1] [lindex $fields 0] [lindex $fields 3]]
+}
+proc owned::live {record} {
+    if {[llength $record] != 5} { return 0 }
+    set now [identity [lindex $record 0]]
+    expr {[llength $now] == 5 && [lrange $now 0 1] eq [lrange $record 0 1] &&
+        [lindex $now 4] eq [lindex $record 4] && [lindex $now 3] ne "Z"}
+}
+proc owned::tree {records} {
+    set result {}
+    while {[llength $records]} {
+        set record [lindex $records 0]
+        set records [lrange $records 1 end]
+        set parent [lindex $record 0]
+        if {[dict exists $result $parent] || ![live $record]} { continue }
+        dict set result $parent $record
+        if {[catch {glob -nocomplain /proc/$parent/task/*/children} paths]} { continue }
+        foreach path $paths {
+            if {[catch {open $path r} channel]} { continue }
+            set failed [catch {read $channel} pids]
+            catch {close $channel}
+            if {$failed} { continue }
+            foreach child $pids {
+                set identity [identity $child]
+                # Detached daemons have a separate session and are not our pipe.
+                if {[lindex $identity 2] eq $parent && [lindex $identity 4] eq [lindex $record 4] &&
+                    [live $record]} { lappend records $identity }
+            }
+        }
+    }
+    return [lreverse [dict values $result]]
+}
+proc owned::kill {records} {
+    foreach record [tree $records] {
+        if {[live $record]} { catch {exec kill -KILL [lindex $record 0]} }
+    }
+}
+proc owned::watchdog {deadline children} {
+    set script "namespace eval owned {}\n"
+    foreach name {identity live tree kill} {
+        append script [list proc owned::$name [info args owned::$name] [info body owned::$name]] \n
+    }
+    append script [list apply {{deadline records} {
+        set ::owned::watched $records
+        trap {owned::kill $::owned::watched; exit} SIGTERM
+        # Retain observed identities if a launcher exits before its writer.
+        while {[set remaining [expr {$deadline - [clock milliseconds]}]] > 0} {
+            set ::owned::watched [owned::tree $::owned::watched]
+            after [expr {min(25, $remaining)}]
+        }
+        owned::kill $::owned::watched
+        puts deadline
+        exit
+    }} $deadline [lmap child $children {owned::identity $child}]]
+    return $script
+}
+
+proc close_backend {channel {descendants 0}} {
     if {[info exists ::upgrades($channel)]} {
         after cancel [dict get $::upgrades($channel) timer]
         unset ::upgrades($channel)
@@ -2586,6 +2652,7 @@ proc close_backend {channel} {
     if {[catch {pid $channel} children]} { return }
     catch {fileevent $channel readable ""}
     catch {websocket::configure $channel -keepalive 0}
+    if {$descendants} { owned::kill [lmap child $children {owned::identity $child}] }
     terminate $children
     fconfigure $channel -blocking 1
     catch {websocket::close $channel}
@@ -2838,7 +2905,140 @@ proc backend_options {arguments} {
     return $options
 }
 
+# This one-shot client never enters the TUI's recovery or connection state.
+namespace eval mcp_reload {
+    variable timeout 10000
+    variable done 0
+    variable message ""
+    variable phase initialize
+    variable deadline 0
+    variable backend ""
+}
+
+proc mcp_reload::fail {reason args} {
+    variable done; variable message
+    if {!$done} { set message $reason; set done -1 }
+}
+
+proc mcp_reload::send {object} {
+    variable backend
+    if {[catch {websocket::send $backend text [json_dump $object]} sent] || $sent < 0} {
+        error "proxy send failed"
+    }
+}
+
+proc mcp_reload::event {channel type data} {
+    variable done; variable phase; variable deadline
+    if {$done} { return }
+    if {[clock milliseconds] >= $deadline} { fail "transport deadline expired"; return }
+    try {
+        switch -- $type {
+            connect {
+                send [huddle create id [huddle number 1] method [huddle string initialize] params \
+                    [huddle create clientInfo [huddle create name [huddle string codex-retry-mcp] \
+                        version [huddle string 1]] capabilities [huddle create]]]
+            }
+            text {
+                if {[catch {automatic::decode $data} object]} { error "invalid App Server JSON" }
+                if {[huddle exists $object jsonrpc] && [automatic::text $object jsonrpc] ne "2.0"} {
+                    error "invalid RPC version"
+                }
+                set hasId [huddle exists $object id]
+                if {$hasId && !([automatic::is $object string id] || \
+                    ([automatic::is $object number id] &&
+                     [regexp {^-?(0|[1-9][0-9]*)$} [huddle get_stripped $object id]]))} {
+                    error "invalid RPC ID"
+                }
+                set result [huddle exists $object result]
+                set rejected [huddle exists $object error]
+                if {[huddle exists $object method]} {
+                    if {[automatic::text $object method] eq "" || $result || $rejected || \
+                        ([huddle exists $object params] && [huddle type $object params] ni {dict list null})} {
+                        error "invalid RPC notification or request"
+                    }
+                    return
+                }
+                if {!$hasId || $result == $rejected || [huddle exists $object params]} {
+                    error "invalid RPC response"
+                }
+                if {$rejected && (![automatic::is $object dict error] || \
+                    ![automatic::is $object number error code] || \
+                    ![regexp {^-?(0|[1-9][0-9]*)$} [huddle get_stripped $object error code]] || \
+                    ![automatic::is $object string error message])} { error "invalid RPC error" }
+                set id [json_dump [huddle get $object id]]
+                if {$phase eq "initialize" && $id eq "2"} { error "reload reply preceded initialization" }
+                if {$id ne [expr {$phase eq "initialize" ? "1" : "2"}]} { return }
+                if {[clock milliseconds] >= $deadline} { error "transport deadline expired" }
+                if {$rejected} { error "$phase rejected by App Server (RPC [huddle get_stripped $object error code])" }
+                if {![automatic::is $object dict result]} { error "invalid $phase acknowledgement" }
+                if {$phase eq "initialize"} {
+                    if {[automatic::text $object result userAgent] eq ""} { error "invalid initialize acknowledgement" }
+                    set phase reload
+                    send [huddle create method [huddle string initialized]]
+                    send [huddle create id [huddle number 2] method [huddle string config/mcpServer/reload] \
+                        params [huddle null]]
+                } else {
+                    if {[llength [huddle keys [huddle get $object result]]]} { error "invalid reload acknowledgement" }
+                    set done 1
+                }
+            }
+            close - disconnect - timeout - error - binary { error "proxy disconnected or failed" }
+        }
+    } on error {reason} { fail $reason }
+}
+
+proc mcp_reload::ready {channel ready} {
+    if {$::mcp_reload::done} { return }
+    if {!$ready || [catch {websocket::takeover $channel mcp_reload::event 0}]} {
+        fail "WebSocket attachment failed or timed out"
+    }
+}
+
+proc mcp_reload::run {} {
+    variable timeout; variable done; variable message; variable phase; variable deadline; variable backend
+    set done 0; set message ""; set phase initialize
+    set backend ""; set watchdog ""; set signals {}
+    set deadline [expr {[clock milliseconds] + $timeout}]
+    try {
+        package require websocket
+        set ::websocket::WS(maxlength) [expr {128 << 20}]
+        foreach level [logger::levels] { ${::websocket::log}::logproc $level message {return} }
+        foreach signal {SIGINT SIGTERM SIGHUP} {
+            dict set signals $signal [trap $signal]
+            trap [list mcp_reload::fail "interrupted by $signal"] $signal
+        }
+        set credential [array get ::env CODEX_RETRY_TOKEN]
+        unset -nocomplain ::env(CODEX_RETRY_TOKEN)
+        try {
+            set backend [terminal::pipe [list | codex app-server proxy 2>@stderr] r+]
+            # Tcllib reads complete frames synchronously. An owned watchdog also
+            # bounds a peer that sends half a frame and then stops producing bytes.
+            set guard [owned::watchdog $deadline [pid $backend]]
+            set watchdog [terminal::pipe [list | [info nameofexecutable] -c $guard 2>@stderr] r]
+        } finally { array set ::env $credential }
+        fconfigure $watchdog -blocking 0
+        fileevent $watchdog readable [list mcp_reload::fail "transport deadline expired"]
+        backend_upgrade $backend mcp_reload::ready [expr {max(1, $deadline - [clock milliseconds])}]
+        if {!$done} { vwait ::mcp_reload::done }
+    } on error {reason} {
+        fail $reason
+    } finally {
+        # Retire callbacks before closing either of this client's owned children.
+        if {!$done} { fail "transport failed" }
+        if {$watchdog ne ""} { close_backend $watchdog }
+        if {$backend ne ""} { close_backend $backend 1; set backend "" }
+        dict for {signal previous} $signals { trap $previous $signal }
+    }
+    if {$done != 1} { puts stderr "codex-retry reload-mcp: $message"; return 1 }
+    puts "MCP configuration reread; refresh queued for loaded threads (server-wide)."
+    return 0
+}
+
 proc main {arguments} {
+    if {[lindex $arguments 0] eq "reload-mcp"} {
+        if {[llength $arguments] != 1} { puts stderr "usage: codex-retry reload-mcp"; return 2 }
+        return [mcp_reload::run]
+    }
     global spawn_out tuiSpawn
     automatic::configure
     package require websocket

@@ -10,6 +10,7 @@ set configChannel [file tempfile configScratch]
 set unitFailure 0
 set unitPhase 10
 set transportJob ""
+set mcpJob ""
 proc transport_output {channel} {
     puts -nonewline [read $channel]
     if {[eof $channel]} { fileevent $channel readable "" }
@@ -5285,6 +5286,9 @@ set unitPhase 14
 set transportJob [open [list | tclsh [file join [file dirname [info script]] transport.test.tcl] 2>@1] r]
 fconfigure $transportJob -blocking 0
 fileevent $transportJob readable [list transport_output $transportJob]
+set mcpJob [open [list | tclsh [file join [file dirname [info script]] mcp-reload.test.tcl] 2>@1] r]
+fconfigure $mcpJob -blocking 0
+fileevent $mcpJob readable [list transport_output $mcpJob]
 
 # A fake backend echoes one frame and ignores graceful termination.
 rename after {}
@@ -6850,6 +6854,18 @@ check {!$failed} "fake backend diagnostic isolation failed: $message"
     puts stderr [dict get $options -errorinfo]
     set unitFailure $unitPhase
 } finally {
+    if {$mcpJob ne ""} {
+        set failed [catch {
+            fileevent $mcpJob readable ""
+            fconfigure $mcpJob -blocking 1
+            puts -nonewline [read $mcpJob]
+        } message]
+        if {$failed} { puts stderr "MCP reload output: $message"; if {!$unitFailure} { set unitFailure 20 } }
+        if {[catch {close $mcpJob} message]} {
+            puts stderr "MCP reload regressions: $message"
+            if {!$unitFailure} { set unitFailure 20 }
+        }
+    }
     if {$transportJob ne ""} {
         # Drain and reap even after a parent assertion fails, before removing
         # the child's scratch root. Blocking close preserves its exit status.

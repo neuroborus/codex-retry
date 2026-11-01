@@ -9,6 +9,31 @@ commands available in Codex CLI 0.164.0.
 On Debian/Ubuntu, install the Tcl dependencies with `sudo apt install expect tcllib tdom`.
 tDOM must be available through the normal Tcl package paths. A missing or older
 package stops startup before the wrapper starts the server or TUI.
+
+To reread MCP configuration from an existing conversation, an agent can run this
+exact command through its command tool; it needs no terminal:
+
+```sh
+codex-retry reload-mcp
+```
+
+No extra arguments are accepted. This explicit service command requires native
+`config/mcpServer/reload` support. It opens its own proxy connection, initializes
+it, and waits for the matching acknowledgement. Success means configuration was
+reread and refresh was **queued for all loaded threads on that server**. There is
+no thread selector, and the acknowledgement does not mean every server or tool
+is ready. Use `/mcp` or `/mcp verbose` in the session to inspect availability.
+History and existing TUI processes remain in place; this submits no model input.
+RPC errors, unsupported methods, malformed responses, disconnects and a fixed
+internal transport deadline return nonzero. Cleanup closes only this command's
+owned processes, leaving the shared server and other clients running.
+
+The helper runs only `codex app-server proxy`, preserving native environment-based
+server selection; it does not explicitly start or restart a daemon. With CLI
+0.166.0, a proxy pointed at a missing private socket failed without starting a
+server. Default socket selection and any native startup behavior belong to the
+installed CLI; an attachment failure is reported rather than retried.
+
 Run the wrapper with interactive Codex arguments:
 
 ```sh
@@ -22,8 +47,9 @@ Run the wrapper with interactive Codex arguments:
 ./codex-retry resume SESSION_ID --dangerously-bypass-approvals-and-sandbox
 ```
 
-The wrapper runs the idempotent `codex app-server daemon start`, then attaches
-with an owned `codex app-server proxy` byte tunnel. Tcllib speaks WebSocket
+For interactive launches, the wrapper runs the idempotent
+`codex app-server daemon start`, then attaches with an owned
+`codex app-server proxy` byte tunnel. Tcllib speaks WebSocket
 through that pipe to the control socket. Codex selects the shared
 control socket, so sessions already loaded by ordinary Codex keep their ID and
 history. A cold launch starts that same shared server. Startup or attachment
@@ -131,9 +157,9 @@ wrapper clears only its matching automatic default from resume/fork requests,
 so saved session directories still apply. Explicit directory overrides retain
 native behavior.
 
-The wrapper forwards your arguments to the native Codex TUI, preserving quoted
-values, ordering, and argument boundaries, with that launch default and the
-explicit YOLO exception below.
+For interactive launches, the wrapper forwards your arguments to the native
+Codex TUI, preserving quoted values, ordering, and argument boundaries, with that
+launch default and the explicit YOLO exception below.
 This includes options such as
 `--model` (`-m`), `--cd` (`-C`), `--profile` (`-p`), `--ask-for-approval` (`-a`),
 `--sandbox` (`-s`), `--image` (`-i`), and `--no-alt-screen`. The installed Codex
