@@ -538,7 +538,7 @@ if [ "$#" -ne 2 ] || [ "$1" != app-server ] || [ "$2" != proxy ]; then exit 91; 
         set category 0
         foreach diagnostic {
             {WebSocket attachment failed or timed out}
-            {transport deadline expired}
+            {no correlated reply within}
             {proxy disconnected or failed}
             {invalid App Server JSON}
             {initialize rejected by App Server}

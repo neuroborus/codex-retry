@@ -2624,23 +2624,29 @@ proc owned::kill {records} {
         if {[live $record]} { catch {exec kill -KILL [lindex $record 0]} }
     }
 }
-proc owned::watchdog {deadline children} {
+# With a window, each stdin line renews the deadline; stdin EOF kills the owned tree.
+proc owned::watchdog {deadline children {window 0}} {
     set script "namespace eval owned {}\n"
     foreach name {identity live tree kill} {
         append script [list proc owned::$name [info args owned::$name] [info body owned::$name]] \n
     }
-    append script [list apply {{deadline records} {
+    append script [list apply {{deadline records window} {
         set ::owned::watched $records
         trap {owned::kill $::owned::watched; exit} SIGTERM
+        if {$window} { fconfigure stdin -blocking 0 }
         # Retain observed identities if a launcher exits before its writer.
         while {[set remaining [expr {$deadline - [clock milliseconds]}]] > 0} {
             set ::owned::watched [owned::tree $::owned::watched]
             after [expr {min(25, $remaining)}]
+            if {!$window} { continue }
+            while {[gets stdin line] >= 0} { set deadline [expr {[clock milliseconds] + $window}] }
+            if {[eof stdin]} { owned::kill $::owned::watched; exit }
         }
+        # Report first, so the owner attributes the resulting disconnect.
+        catch {puts deadline; flush stdout}
         owned::kill $::owned::watched
-        puts deadline
         exit
-    }} $deadline [lmap child $children {owned::identity $child}]]
+    }} $deadline [lmap child $children {owned::identity $child}] $window]
     return $script
 }
 
@@ -2906,12 +2912,16 @@ proc backend_options {arguments} {
 }
 
 # This one-shot client never enters the TUI's recovery or connection state.
+# The timeout bounds each owned request separately, not the whole operation.
 namespace eval mcp_reload {
     variable timeout 10000
     variable done 0
     variable message ""
     variable phase initialize
-    variable deadline 0
+    variable stage connection
+    variable method "WebSocket upgrade"
+    variable until 0
+    variable watchdog ""
     variable backend ""
     variable force 0
     variable sequence 1
@@ -2923,6 +2933,37 @@ namespace eval mcp_reload {
 proc mcp_reload::fail {reason args} {
     variable done; variable message
     if {!$done} { set message $reason; set done -1; set ::mcp_reload::reply ""; set ::mcp_reload::wake 1 }
+}
+
+# Only a sent request or its correlated reply renews the owned watchdog.
+proc mcp_reload::renew {} {
+    variable watchdog
+    if {$watchdog ne ""} { catch {puts $watchdog renew; flush $watchdog} }
+}
+proc mcp_reload::await {name request} {
+    variable stage; variable method; variable until; variable timeout
+    set stage $name; set method $request
+    set until [expr {[clock milliseconds] + $timeout}]
+    renew
+}
+proc mcp_reload::settle {} {
+    variable until
+    set until 0
+    renew
+}
+proc mcp_reload::expired {} {
+    variable until
+    expr {$until && [clock milliseconds] >= $until}
+}
+# Fixed phase and method names only; never IDs, names, values or paths.
+proc mcp_reload::timed_out {} {
+    variable timeout; variable stage; variable method
+    format "no correlated reply within %g seconds during %s (%s)" [expr {$timeout / 1000.0}] $stage $method
+}
+proc mcp_reload::guard {channel} {
+    if {[gets $channel line] < 0 && ![eof $channel]} { return }
+    fileevent $channel readable ""
+    fail [expr {$line eq "deadline" ? [timed_out] : "transport watchdog stopped"}]
 }
 
 proc mcp_reload::send {object} {
@@ -2938,10 +2979,10 @@ proc mcp_reload::require {condition message} {
     if {!$condition} { return -code error -errorcode {MCP_RELOAD SAFE} $message }
 }
 proc mcp_reload::rpc {method params} {
-    variable sequence; variable reply; variable phase; variable done
+    variable sequence; variable reply; variable phase; variable done; variable stage
     require [expr {!$done}] "force transport stopped"
-    require [expr {[clock milliseconds] < $::mcp_reload::deadline}] "transport deadline expired"
     set phase $method; set reply ""
+    await $stage $method
     send [huddle create id [huddle string codex-retry-mcp-force-[incr sequence]] method [huddle string $method] params $params]
     if {!$done && $reply eq ""} { vwait ::mcp_reload::reply }
     require [expr {!$done && $reply ne ""}] "force transport stopped"
@@ -3156,17 +3197,22 @@ proc mcp_reload::catalog {thread name {readiness 1}} {
     return 1
 }
 proc mcp_reload::force_run {} {
-    variable done; variable publication; variable wake
+    variable done; variable publication; variable wake; variable stage
     if {$done} { return }
     try {
+        set stage preflight
         set captured [threads]
         require [expr {[llength $captured] > 0}] "no loaded threads to verify; configuration unchanged"
         set config [rpc config/read [huddle create includeLayers [huddle true] cwd [huddle null]]]
         set selected [select $config]
-        set directories {}
+        set directories {}; set layered {}
         foreach id $captured {
-            dict set directories $id [thread $id]
-            set local [rpc config/read [huddle create includeLayers [huddle true] cwd [huddle string [dict get $directories $id]]]]
+            dict set directories $id [set cwd [thread $id]]
+            # Threads sharing a directory resolve the same layers; each is still checked.
+            if {![dict exists $layered $cwd]} {
+                dict set layered $cwd [rpc config/read [huddle create includeLayers [huddle true] cwd [huddle string $cwd]]]
+            }
+            set local [dict get $layered $cwd]
             set scope [select $local]
             require [expr {$scope eq $selected}] "captured thread has unsupported configuration layers"
             foreach name [dict get $selected names] {
@@ -3186,6 +3232,7 @@ proc mcp_reload::force_run {} {
                 value [huddle string $generation] mergeStrategy [huddle string upsert]]
         }
         set publication uncertain
+        set stage publication
         set written [rpc config/batchWrite [huddle create edits $edits filePath [huddle string [dict get $selected file]] \
             expectedVersion [huddle string [dict get $selected version]] reloadUserConfig [huddle false]]]
         if {[automatic::text $written status] in {ok okOverridden} &&
@@ -3195,9 +3242,11 @@ proc mcp_reload::force_run {} {
         require [expr {$publication eq "published" && [automatic::text $written status] eq "ok" &&
             [automatic::text $written version] ne [dict get $selected version] && [nullable $written overriddenMetadata]}] \
             "configuration write was invalid, rejected or overridden"
+        set stage refresh
         set refreshed [rpc config/mcpServer/reload [huddle null]]
         require [expr {![llength [huddle keys $refreshed]]}] "invalid reload acknowledgement"
         # Confirm the published effective config before accepting connected catalogs.
+        set stage readiness
         set current [rpc config/read [huddle create includeLayers [huddle true] cwd [huddle null]]]
         set effective [select $current]
         require [expr {[dict get $effective file] eq [dict get $selected file] &&
@@ -3224,6 +3273,7 @@ proc mcp_reload::force_run {} {
             require [expr {!$done}] "force transport stopped"
         }
         require [expr {![llength $pending]}] "native thread runtimeStatus remained unavailable, configuration-mismatched or pending; readiness cannot be verified"
+        set stage verification
         set loaded [threads]
         foreach id $captured {
             require [expr {$id in $loaded}] "captured thread disappeared during refresh"
@@ -3237,7 +3287,6 @@ proc mcp_reload::force_run {} {
             require [expr {[automatic::text $final config mcp_servers $name env CODEX_RETRY_MCP_GENERATION] eq $generation}] \
                 "generation changed during readiness verification"
         }
-        require [expr {[clock milliseconds] < $::mcp_reload::deadline}] "transport deadline expired"
         set done 1
     } on error {reason options} {
         if {[dict get $options -errorcode] ne {MCP_RELOAD SAFE}} { set reason "force operation failed" }
@@ -3246,12 +3295,14 @@ proc mcp_reload::force_run {} {
 }
 
 proc mcp_reload::event {channel type data} {
-    variable done; variable phase; variable deadline
+    variable done; variable phase
     if {$done} { return }
-    if {[clock milliseconds] >= $deadline} { fail "transport deadline expired"; return }
+    # Late traffic, or a disconnect caused by the watchdog, reports the expired request.
+    if {[expired]} { fail [timed_out]; return }
     try {
         switch -- $type {
             connect {
+                await initialization initialize
                 send [huddle create id [huddle number 1] method [huddle string initialize] params \
                     [huddle create clientInfo [huddle create name [huddle string codex-retry-mcp] \
                         version [huddle string 1]] capabilities [huddle create]]]
@@ -3292,22 +3343,23 @@ proc mcp_reload::event {channel type data} {
                 if {$::mcp_reload::force && $phase ne "initialize"} {
                     if {$ownedForce && ($forceSequence < 2 || $forceSequence > $::mcp_reload::sequence)} { error "force reply preceded its request" }
                     if {$forceId ne "codex-retry-mcp-force-$::mcp_reload::sequence"} { return }
-                    if {[clock milliseconds] >= $deadline} { error "transport deadline expired" }
                     if {$rejected} { error "$phase rejected by App Server (RPC [huddle get_stripped $object error code])" }
                     if {![automatic::is $object dict result]} { error "invalid force response" }
                     if {$::mcp_reload::reply ne ""} { error "duplicate force reply" }
+                    settle
                     set ::mcp_reload::reply [huddle get $object result]
                     return
                 }
                 if {$id ne [expr {$phase eq "initialize" ? "1" : "2"}]} { return }
-                if {[clock milliseconds] >= $deadline} { error "transport deadline expired" }
                 if {$rejected} { error "$phase rejected by App Server (RPC [huddle get_stripped $object error code])" }
                 if {![automatic::is $object dict result]} { error "invalid $phase acknowledgement" }
+                settle
                 if {$phase eq "initialize"} {
                     if {[automatic::text $object result userAgent] eq ""} { error "invalid initialize acknowledgement" }
                     set phase reload
                     send [huddle create method [huddle string initialized]]
                     if {$::mcp_reload::force} { after 0 mcp_reload::force_run; return }
+                    await refresh config/mcpServer/reload
                     send [huddle create id [huddle number 2] method [huddle string config/mcpServer/reload] \
                         params [huddle null]]
                 } else {
@@ -3322,18 +3374,19 @@ proc mcp_reload::event {channel type data} {
 
 proc mcp_reload::ready {channel ready} {
     if {$::mcp_reload::done} { return }
+    if {$ready} { settle }
     if {!$ready || [catch {websocket::takeover $channel mcp_reload::event 0}]} {
-        fail "WebSocket attachment failed or timed out"
+        fail [expr {[expired] ? [timed_out] : "WebSocket attachment failed or timed out"}]
     }
 }
 
 proc mcp_reload::run {{forceMode 0}} {
-    variable timeout; variable done; variable message; variable phase; variable deadline; variable backend
+    variable timeout; variable done; variable message; variable phase; variable backend; variable watchdog
     set done 0; set message ""; set phase initialize
     set ::mcp_reload::force $forceMode; set ::mcp_reload::sequence 1; set ::mcp_reload::reply ""
     set ::mcp_reload::publication none
     set backend ""; set watchdog ""; set signals {}
-    set deadline [expr {[clock milliseconds] + $timeout}]
+    await connection "WebSocket upgrade"
     try {
         package require websocket
         set ::websocket::WS(maxlength) [expr {128 << 20}]
@@ -3347,21 +3400,23 @@ proc mcp_reload::run {{forceMode 0}} {
         try {
             set backend [terminal::pipe [list | codex app-server proxy 2>@stderr] r+]
             # Tcllib reads complete frames synchronously. An owned watchdog also
-            # bounds a peer that sends half a frame and then stops producing bytes.
-            set guard [owned::watchdog $deadline [pid $backend]]
-            set watchdog [terminal::pipe [list | [info nameofexecutable] -c $guard 2>@stderr] r]
+            # bounds a peer that sends half a frame and then stops producing bytes;
+            # a blocked reader cannot renew it.
+            set guard [owned::watchdog $::mcp_reload::until [pid $backend] $timeout]
+            set watchdog [terminal::pipe [list | [info nameofexecutable] -c $guard 2>@stderr] r+]
         } finally { array set ::env $credential }
         fconfigure $watchdog -blocking 0
-        fileevent $watchdog readable [list mcp_reload::fail "transport deadline expired"]
-        backend_upgrade $backend mcp_reload::ready [expr {max(1, $deadline - [clock milliseconds])}]
+        fileevent $watchdog readable [list mcp_reload::guard $watchdog]
+        backend_upgrade $backend mcp_reload::ready $timeout
         if {!$done} { vwait ::mcp_reload::done }
     } on error {reason} {
         fail $reason
     } finally {
         # Retire callbacks before closing either of this client's owned children.
         if {!$done} { fail "transport failed" }
-        if {$watchdog ne ""} { close_backend $watchdog }
+        if {$watchdog ne ""} { set guard $watchdog; set watchdog ""; close_backend $guard }
         if {$backend ne ""} { close_backend $backend 1; set backend "" }
+        set ::mcp_reload::until 0
         dict for {signal previous} $signals { trap $previous $signal }
     }
     if {$done != 1} {

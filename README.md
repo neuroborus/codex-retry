@@ -33,9 +33,10 @@ reread and refresh was **queued for all loaded threads on that server**. There i
 no thread selector, and the acknowledgement does not mean every server or tool
 is ready. Use `/mcp` or `/mcp verbose` in the session to inspect availability.
 History and existing TUI processes remain in place; this submits no model input.
-RPC errors, unsupported methods, malformed responses, disconnects and a fixed
-internal transport deadline return nonzero. Cleanup closes only this command's
-owned processes, leaving the shared server and other clients running.
+RPC errors, unsupported methods, malformed responses, disconnects and a request
+left without its matching reply past a fixed internal bound return nonzero.
+Cleanup closes only this command's owned processes, leaving the shared server
+and other clients running.
 
 Ordinary reload never reads or writes configuration through the config API and
 never requires, adds, rotates, or removes a generation marker. Native Codex may
@@ -72,14 +73,21 @@ Thread-scoped native runtime status must be `connected`, with initialized server
 metadata and a successful tool catalog; RPC acceptance, a cached catalog alone,
 or elapsed time does not establish readiness. Native runtime status may be
 unavailable while configuration refresh is pending. Pending status gets at most
-20 observations separated by 100 ms, within the existing transport deadline;
-pagination is also bounded.
+20 observations separated by 100 ms; pagination is also bounded.
 Missing status, failed/cancelled initialization, authentication requirements,
-thread disappearance, malformed metadata, disconnection, or deadline exhaustion
-return nonzero. Newly loaded threads are outside the captured verification scope,
-although they are subject to the global refresh. A readiness receipt describes
-native connection/catalog verification, not proof of an arbitrary binary's
-identity. The private regression independently checks its fake server's version.
+thread disappearance, malformed metadata, disconnection, or a request without
+its reply return nonzero. Newly loaded threads are outside the captured
+verification scope, although they are subject to the global refresh. A
+readiness receipt describes native connection/catalog verification, not proof
+of an arbitrary binary's identity. The private regression independently checks
+its fake server's version.
+
+Force completes only when every captured thread/server pair is verified. There
+is no overall time limit: each request must get its own matching reply within
+the fixed internal bound, so a large healthy setup can take longer in total.
+Silence, notifications, replies to other requests, or a partially received frame
+never extend that bound; the command then fails and names only the stalled phase
+and method, never identifiers, server or thread names, values or paths.
 
 If a generation write was published, or its outcome became uncertain before a
 later failure, the diagnostic says so and readiness remains unverified. The

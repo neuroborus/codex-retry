@@ -94,6 +94,34 @@ proc collect {jobs} {
             ($expected != 0 && [string first "catalogs verified" $output] >= 0)} {
             lappend failures "$mode: unsafe failure diagnostic"
         }
+        # Failures name only a fixed phase and method: no IDs, names or paths.
+        if {$expected == 1} {
+            foreach private [list codex-retry-mcp-force- thread-one thread-two thread-three secondary tertiary $::scratch] {
+                if {[string first $private $output] >= 0} { lappend failures "$mode: diagnostic exposed private data" }
+            }
+        }
+        set late "no correlated reply within 0.5 seconds during"
+        set published "; generation published; readiness not verified"
+        set diagnostics [dict create \
+            deadline-init "$late initialization (initialize)" \
+            partial-frame "$late initialization (initialize)" \
+            string-init-id "$late initialization (initialize)" \
+            deadline-reload "$late refresh (config/mcpServer/reload)" \
+            descendant-partial-frame "$late refresh (config/mcpServer/reload)" \
+            string-reload-id "$late refresh (config/mcpServer/reload)" \
+            upgrade-deadline "$late connection (WebSocket upgrade)" \
+            upgrade-eof "WebSocket attachment failed or timed out" \
+            signal "interrupted by SIGTERM" \
+            force-id-type "$late preflight (config/read)" \
+            force-stall "$late preflight (mcpServerStatus/list)" \
+            force-stall-future "force reply preceded its request" \
+            force-future-id "force reply preceded its request" \
+            force-slow-signal "interrupted by SIGTERM$published" \
+            force-no-runtime "native thread runtimeStatus remained unavailable, configuration-mismatched or pending; readiness cannot be verified$published"]
+        if {[dict exists $diagnostics $mode] &&
+            [string first "codex-retry reload-mcp: [dict get $diagnostics $mode]\n" $output] < 0} {
+            lappend failures "$mode: unexpected diagnostic: $output"
+        }
         if {[string match force-* $mode] && $expected == 0 && ![file exists [file join $directory write.sent]]} {
             lappend failures "$mode: force did not publish a generation"
         }
@@ -101,11 +129,11 @@ proc collect {jobs} {
             force-layer force-shape force-readonly force-name force-inherited force-thread-config force-cursor force-future-id
             force-id-type force-status-cursor force-inactive-thread force-nonlocal force-effective-command
             force-effective-timeout force-effective-tools force-tools-shape force-tool-approval force-tool-limit
-            force-inherited-object} &&
+            force-inherited-object force-stall force-stall-future} &&
             [file exists [file join $directory write.sent]]} { lappend failures "$mode: unsafe configuration write" }
         if {$mode in {force-overridden force-override-metadata force-bad-file force-bad-version force-bad-status force-conflict
             force-reload-error force-reload-shape force-no-runtime force-failed force-cancelled force-tools-error
-            force-no-info force-churn force-cwd-churn force-race force-disconnect} &&
+            force-no-info force-churn force-cwd-churn force-race force-disconnect force-slow-signal} &&
             ![regexp {generation (published|publication uncertain)} $output]} { lappend failures "$mode: publication outcome was hidden" }
         if {$mode eq "descendant-partial-frame"} {
             foreach name {launcher.pids writer.pids watchdog.pids partial.sent} {
@@ -167,10 +195,15 @@ try {
             set writer [exec expect $argv0 {*}$argv <@stdin >@stdout 2>@stderr &]
             vwait forever
         }
-        after 4000 {exit 93}
+        # Long responsive force runs need more than the ordinary failsafe.
+        after [expr {[string match force-* $mode] ? 8000 : 4000}] {exit 93}
         if {$mode eq "upgrade-eof"} { exit 0 }
         if {$mode eq "upgrade-deadline"} { vwait forever }
         set phase initialize
+        set started [clock milliseconds]
+        # Several threads and servers; slow modes answer every request late.
+        set grid [expr {$mode in {force-slow force-slow-pending force-slow-signal force-stall force-stall-future}}]
+        set slow [expr {$mode in {force-slow force-slow-pending force-slow-signal}}]
         if {[string match force-* $mode]} {
             source $wrapper
             set configFile [file join $env(RELOAD_DIR) config.toml]
@@ -207,7 +240,12 @@ try {
                 http [huddle create url https://example.invalid]]
             set targetNames {neutral}
             if {$mode eq "force-multiple"} { huddle set servers secondary $server; lappend targetNames secondary }
+            if {$grid} {
+                huddle set servers secondary $server; huddle set servers tertiary $server
+                lappend targetNames secondary tertiary
+            }
             set nextId 2; set writes 0; set statusCalls 0; set loadedCalls 0
+            set cwdReads {}; set postWriteReads 0; set readinessCalls 0; set verified {}; set signalled 0
             proc config {params} {
                 set source [huddle create type user file $::configFile]
                 if {$::mode eq "force-profile"} { huddle set source profile [huddle string selected] }
@@ -268,6 +306,7 @@ try {
                         incr ::loadedCalls
                         set ids [huddle list thread-one]
                         set cursor [huddle null]
+                        if {$::grid} { set ids [huddle list thread-one thread-two thread-three] }
                         if {$::mode eq "force-no-threads" || ($::mode eq "force-churn" && $::writes)} { set ids [huddle list] }
                         if {$::mode eq "force-pagination"} {
                             if {[huddle exists $params cursor]} {
@@ -281,6 +320,13 @@ try {
                     config/read {
                         if {![automatic::is $params boolean includeLayers] || ![huddle get_stripped $params includeLayers]} { exit 73 }
                         if {$::mode eq "force-readonly"} { file attributes $::configFile -permissions 0400 }
+                        # Each distinct thread directory is resolved once per run.
+                        if {![automatic::is $params null cwd]} {
+                            if {[dict exists $::cwdReads [automatic::text $params cwd]]} { exit 85 }
+                            dict set ::cwdReads [automatic::text $params cwd] 1
+                        }
+                        if {$::writes && [incr ::postWriteReads] == 2 && $::slow &&
+                            ([dict size $::verified] != 9 || [clock milliseconds] - $::started < 600)} { exit 86 }
                         set result [config $params]
                         if {$::mode eq "force-race" && $::writes} { huddle set result layers 0 version [huddle string concurrent] }
                         if {$::mode eq "force-future-id"} {
@@ -294,12 +340,16 @@ try {
                     }
                     thread/read {
                         if {![automatic::is $params boolean includeTurns] || [huddle get_stripped $params includeTurns]} { exit 74 }
+                        set cwd $::env(RELOAD_DIR)
+                        if {[automatic::text $params threadId] eq "thread-three"} { set cwd [file join $cwd other] }
                         set result [huddle create thread [huddle create id [huddle get $params threadId] \
-                            cwd $::env(RELOAD_DIR) status [huddle create type idle]]]
+                            cwd [huddle string $cwd] status [huddle create type idle]]]
                         if {$::mode eq "force-inactive-thread"} { huddle set result thread status type [huddle string notLoaded] }
                         if {$::mode eq "force-cwd-churn" && $::writes} { huddle set result thread cwd [huddle string /different-private-directory] }
                     }
                     config/batchWrite {
+                        # Every captured pair was checked; each directory was read once.
+                        if {$::grid && ([dict size $::cwdReads] != 2 || $::statusCalls != 9)} { exit 87 }
                         incr ::writes
                         if {$::writes != 1 || [automatic::text $params filePath] ne $::configFile ||
                             [automatic::text $params expectedVersion] ne "original-version" ||
@@ -352,13 +402,25 @@ try {
                         if {$::mode eq "force-reload-shape"} { huddle set result queued [huddle true] }
                     }
                     mcpServerStatus/list {
-                        if {[automatic::text $params threadId] ni {thread-one thread-two} ||
+                        if {[automatic::text $params threadId] ni {thread-one thread-two thread-three} ||
                             [automatic::text $params serverName] ni $::targetNames ||
                             [automatic::text $params detail] ne "toolsAndAuthOnly"} { exit 79 }
                         incr ::statusCalls
+                        if {$::mode in {force-stall force-stall-future} && $::statusCalls == 5} {
+                            # Mid-preflight silence for this request, amid unrelated traffic.
+                            after 40 [list chatter $socket [expr {$::nextId - 2}] [expr {$::mode eq "force-stall-future"}]]
+                            return
+                        }
                         set status [huddle string connected]
                         if {$::mode eq "force-recover" && !$::writes} { set status [huddle string failed] }
                         if {$::mode eq "force-recover-pending" && !$::writes} { set status [huddle string starting] }
+                        if {$::writes} {
+                            if {$::mode eq "force-slow-pending" && [incr ::readinessCalls] <= 18} { set status [huddle string starting] }
+                            if {$::mode eq "force-slow-signal" && !$::signalled} { set ::signalled 1; exec kill -TERM $::owner }
+                            if {[automatic::text $status] eq "connected"} {
+                                dict set ::verified [list [automatic::text $params threadId] [automatic::text $params serverName]] 1
+                            }
+                        }
                         set info [huddle create name neutral version neutral-version]
                         set toolsError [huddle null]
                         if {$::writes} {
@@ -385,7 +447,29 @@ try {
                     default { exit 80 }
                 }
                 if {$::mode eq "force-unrelated"} { reply $socket {"2"} {{}}; reply $socket 1000 {[]} }
+                if {$::slow} {
+                    after 30 [list catch [list reply $socket [json_dump $id] [json_dump $result]]]
+                    return
+                }
                 reply $socket [json_dump $id] [json_dump $result]
+            }
+            # Notifications, server requests, unrelated IDs, raw frames and stale
+            # owned replies; optionally one future owned ID.
+            proc chatter {socket stale future} {
+                if {[catch {
+                    websocket::send $socket ping neutral
+                    foreach message [list {{"method":"fixture/notice","params":{}}} \
+                        {{"id":"fixture-request","method":"fixture/request","params":{}}} \
+                        {{"id":"unrelated","result":{}}} {{"id":1000,"result":{}}} \
+                        {{"id":1000,"error":{"code":-32601,"message":"unrelated"}}} \
+                        [format {{"id":"codex-retry-mcp-force-%d","result":{}}} $stale]] {
+                        websocket::send $socket text $message
+                    }
+                    if {$future} {
+                        websocket::send $socket text [format {{"id":"codex-retry-mcp-force-%d","result":{}}} $::nextId]
+                    }
+                }]} { return }
+                after 40 [list chatter $socket $stale $future]
             }
         }
         proc reply {socket id result} {
@@ -417,6 +501,7 @@ try {
                             close $log
                         }
                     }
+                    set ::owner $owner
                     set input [open /proc/$owner/task/$owner/children r]
                     set children [read $input]
                     close $input
@@ -516,13 +601,15 @@ try {
         force-inherited force-thread-config force-inactive-thread force-cursor force-future-id force-id-type force-conflict
         force-overridden force-override-metadata force-bad-file
         force-bad-version force-bad-status force-reload-error force-reload-shape force-no-runtime force-failed
-        force-cancelled force-tools-error force-no-info force-churn force-cwd-churn force-race force-disconnect} {
+        force-cancelled force-tools-error force-no-info force-churn force-cwd-churn force-race force-disconnect
+        force-slow force-slow-pending force-slow-signal force-stall force-stall-future} {
         set directory [file join $scratch $mode]
         file mkdir $directory
         set env(RELOAD_DIR) $directory
         set env(RELOAD_CASE) $mode
         set expected [expr {$mode in {ok unrelated ordinary-marker force-create force-defaults force-tools force-legacy-timeout force-rotate
-            force-multiple force-recover force-recover-pending force-unrelated force-pagination force-status-pagination force-pending} ? 0 : 1}]
+            force-multiple force-recover force-recover-pending force-unrelated force-pagination force-status-pagination force-pending
+            force-slow force-slow-pending} ? 0 : 1}]
         set arguments reload-mcp
         if {[string match force-* $mode]} { lappend arguments --force }
         if {$mode eq "ordinary-marker"} {
@@ -538,8 +625,9 @@ try {
             force-extra { lappend arguments extra; set expected 2 }
         }
         set command [list $wrapper {*}$arguments]
-        if {$mode in {deadline-init deadline-reload partial-frame descendant-partial-frame upgrade-deadline string-init-id string-reload-id force-no-runtime force-id-type}} {
-            # Controlled internal timer, without adding a public configuration knob.
+        if {$mode in {deadline-init deadline-reload partial-frame descendant-partial-frame upgrade-deadline string-init-id string-reload-id
+            force-no-runtime force-id-type force-slow force-slow-pending force-slow-signal force-stall force-stall-future}} {
+            # Controlled internal per-request window, without a public configuration knob.
             set driver "set argv0 reload-deadline\n[list source $wrapper]\nset ::mcp_reload::timeout 500\nexit \[main [list $arguments]\]"
             set command [list expect -c $driver]
         }
@@ -565,4 +653,4 @@ try {
     array set env $environment
     file delete -force $scratch
 }
-puts "PASS: headless MCP reload frames, typed replies, rejection, deadlines, arguments, receipt and owned cleanup"
+puts "PASS: headless MCP reload frames, typed replies, rejection, per-request deadlines, long responsive runs, arguments, receipt and owned cleanup"
