@@ -2913,17 +2913,335 @@ namespace eval mcp_reload {
     variable phase initialize
     variable deadline 0
     variable backend ""
+    variable force 0
+    variable sequence 1
+    variable reply ""
+    variable publication none
+    variable wake 0
 }
 
 proc mcp_reload::fail {reason args} {
     variable done; variable message
-    if {!$done} { set message $reason; set done -1 }
+    if {!$done} { set message $reason; set done -1; set ::mcp_reload::reply ""; set ::mcp_reload::wake 1 }
 }
 
 proc mcp_reload::send {object} {
     variable backend
     if {[catch {websocket::send $backend text [json_dump $object]} sent] || $sent < 0} {
         error "proxy send failed"
+    }
+}
+
+# Force uses the same connection and watchdog; no configuration RPC reaches the
+# ordinary acknowledgement-only path. Only fixed diagnostics leave these helpers.
+proc mcp_reload::require {condition message} {
+    if {!$condition} { return -code error -errorcode {MCP_RELOAD SAFE} $message }
+}
+proc mcp_reload::rpc {method params} {
+    variable sequence; variable reply; variable phase; variable done
+    require [expr {!$done}] "force transport stopped"
+    require [expr {[clock milliseconds] < $::mcp_reload::deadline}] "transport deadline expired"
+    set phase $method; set reply ""
+    send [huddle create id [huddle string codex-retry-mcp-force-[incr sequence]] method [huddle string $method] params $params]
+    if {!$done && $reply eq ""} { vwait ::mcp_reload::reply }
+    require [expr {!$done && $reply ne ""}] "force transport stopped"
+    return $reply
+}
+proc mcp_reload::nullable {object args} {
+    expr {![huddle exists $object {*}$args] || [automatic::is $object null {*}$args]}
+}
+proc mcp_reload::page {method params} {
+    set result [huddle list]; set cursors {}; set cursor ""
+    for {set page 0} {$page < 256} {incr page} {
+        if {$cursor ne ""} { huddle set params cursor [huddle string $cursor] }
+        set response [rpc $method $params]
+        require [automatic::is $response list data] "invalid paginated metadata"
+        for {set i 0} {$i < [huddle llength [huddle get $response data]]} {incr i} {
+            huddle append result [huddle get $response data $i]
+        }
+        if {[nullable $response nextCursor]} { return $result }
+        set cursor [automatic::text $response nextCursor]
+        require [expr {$cursor ne "" && $cursor ni $cursors}] "invalid or repeated metadata cursor"
+        lappend cursors $cursor
+    }
+    require 0 "metadata pagination bound exceeded"
+}
+proc mcp_reload::threads {} {
+    set result {}
+    set data [page thread/loaded/list [huddle create]]
+    for {set i 0} {$i < [huddle llength $data]} {incr i} {
+        set id [automatic::text $data $i]
+        require [expr {$id ne "" && $id ni $result}] "invalid or changing loaded-thread set"
+        lappend result $id
+    }
+    return $result
+}
+proc mcp_reload::thread {id} {
+    set result [rpc thread/read [huddle create threadId [huddle string $id] includeTurns [huddle false]]]
+    require [expr {[automatic::text $result thread id] eq $id &&
+        [automatic::text $result thread status type] in {idle active systemError}}] \
+        "captured thread disappeared or its loaded status is unavailable"
+    set cwd [automatic::text $result thread cwd]
+    require [expr {$cwd ne "" && [file pathtype $cwd] eq "absolute"}] "captured thread directory is unavailable"
+    return $cwd
+}
+proc mcp_reload::definition {server} {
+    require [automatic::is $server dict] "unsafe STDIO definition"
+    # config/read serializes native defaults and legacy timeout units differently
+    # from the raw user layer. Untouched native settings need no wrapper whitelist.
+    foreach key [huddle keys $server] {
+        if {[automatic::is $server null $key]} { set server [huddle remove $server $key] }
+    }
+    foreach {key value} [list args [huddle list] enabled [huddle true] environment_id [huddle string local]] {
+        if {![huddle exists $server $key]} { huddle set server $key $value }
+    }
+    require [expr {[automatic::text $server command] ne "" && [automatic::text $server environment_id] eq "local" &&
+        [automatic::is $server boolean enabled] && [huddle get_stripped $server enabled]}] "STDIO server is not enabled and local"
+    if {[huddle exists $server name]} {
+        require [automatic::is $server string name] "unsafe legacy STDIO name"
+        set server [huddle remove $server name]
+    }
+    if {[huddle exists $server required]} {
+        require [automatic::is $server boolean required] "unsafe STDIO requirement"
+        if {![huddle get_stripped $server required]} { set server [huddle remove $server required] }
+    }
+    if {[huddle exists $server startup_timeout_ms]} {
+        require [expr {[automatic::is $server number startup_timeout_ms] &&
+            [regexp {^(0|[1-9][0-9]*)$} [huddle get_stripped $server startup_timeout_ms]]}] "unsafe legacy STDIO timeout"
+        if {![huddle exists $server startup_timeout_sec]} {
+            huddle set server startup_timeout_sec [huddle number [expr {[huddle get_stripped $server startup_timeout_ms] / 1000.0}]]
+        }
+        set server [huddle remove $server startup_timeout_ms]
+    }
+    foreach key {startup_timeout_sec tool_timeout_sec} {
+        if {![huddle exists $server $key]} { continue }
+        require [expr {[automatic::is $server number $key] && [huddle get_stripped $server $key] >= 0 &&
+            [huddle get_stripped $server $key] < Inf}] "unsafe STDIO timeout"
+        huddle set server $key [huddle number [expr {double([huddle get_stripped $server $key])}]]
+    }
+    foreach key {args env_vars enabled_tools disabled_tools} {
+        if {![huddle exists $server $key]} { continue }
+        require [automatic::is $server list $key] "unsafe STDIO list setting"
+        set list [huddle get $server $key]
+        for {set j 0} {$j < [huddle llength $list]} {incr j} {
+            set entry [huddle get $list $j]
+            if {$key eq "env_vars" && [automatic::is $entry dict]} {
+                foreach field [huddle keys $entry] {
+                    require [expr {$field in {name source} && [automatic::is $entry string $field]}] "unsafe STDIO environment inheritance"
+                }
+                require [expr {[automatic::text $entry name] ne ""}] "unsafe STDIO environment inheritance"
+                set entry [huddle get $entry name]
+            }
+            require [automatic::is $entry string] "unsafe STDIO list entry"
+            if {$key eq "env_vars"} {
+                require [expr {[huddle get_stripped $entry] ne "" &&
+                    [huddle get_stripped $entry] ne "CODEX_RETRY_MCP_GENERATION"}] "generation environment inheritance is unsupported"
+            }
+        }
+    }
+    if {[huddle exists $server env]} {
+        require [automatic::is $server dict env] "unsafe STDIO environment"
+        foreach key [huddle keys [huddle get $server env]] {
+            require [automatic::is $server string env $key] "unsafe STDIO environment value"
+        }
+    }
+    if {[huddle exists $server cwd]} { require [automatic::is $server string cwd] "unsafe STDIO directory" }
+    if {[huddle exists $server tools]} {
+        require [automatic::is $server dict tools] "unsafe STDIO tool settings"
+        foreach tool [huddle keys [huddle get $server tools]] {
+            require [automatic::is $server dict tools $tool] "unsafe STDIO tool policy"
+            set policy [huddle get $server tools $tool]
+            if {![nullable $policy approval_mode]} {
+                require [expr {[automatic::text $policy approval_mode] in {auto prompt writes approve}}] "unsafe STDIO tool approval"
+            }
+            if {![nullable $policy output_token_limit]} {
+                require [expr {[automatic::is $policy number output_token_limit] &&
+                    [regexp {^[1-9][0-9]*$} [huddle get_stripped $policy output_token_limit]]}] "unsafe STDIO tool output limit"
+            }
+        }
+    }
+    return $server
+}
+proc mcp_reload::select {result} {
+    require [expr {[automatic::is $result dict config] && [automatic::is $result dict origins] &&
+        [automatic::is $result list layers]}] "configuration provenance is unavailable"
+    set layers [huddle get $result layers]; set user ""
+    for {set i 0} {$i < [huddle llength $layers]} {incr i} {
+        set layer [huddle get $layers $i]
+        require [expr {[automatic::is $layer dict name] && [automatic::text $layer name type] ne "" &&
+            [automatic::is $layer dict config] && [automatic::text $layer version] ne ""}] "invalid configuration layer"
+        if {[automatic::text $layer name type] ne "user" || ![nullable $layer name profile]} { continue }
+        require [expr {$user eq "" && [nullable $layer disabledReason]}] "ambiguous or disabled user layer"
+        foreach key [huddle keys [huddle get $layer name]] {
+            require [expr {$key in {type file profile}}] "unsupported user-layer provenance"
+        }
+        set user $layer
+    }
+    require [expr {$user ne ""}] "writable base user layer is unavailable"
+    set file [automatic::text $user name file]
+    require [expr {$file ne "" && [file pathtype $file] eq "absolute" &&
+        [file normalize $file] eq $file && [file exists $file] && [file writable $file] &&
+        [file writable [file dirname $file]]}] "user configuration file is not safely writable"
+    require [automatic::is $result dict config mcp_servers] "no eligible user-layer STDIO MCP servers"
+    set names {}; set origins [huddle get $result origins]
+    foreach name [huddle keys [huddle get $result config mcp_servers]] {
+        set server [huddle get $result config mcp_servers $name]
+        require [automatic::is $server dict] "unsafe MCP server definition"
+        if {[huddle exists $server enabled]} {
+            require [automatic::is $server boolean enabled] "invalid MCP enabled setting"
+            if {![huddle get_stripped $server enabled]} { continue }
+        }
+        if {[huddle exists $server url]} {
+            require [expr {[automatic::text $server url] ne "" && ![huddle exists $server command]}] "ambiguous MCP transport"
+            continue
+        }
+        require [expr {[regexp {^[A-Za-z0-9_-]+$} $name] && [automatic::text $server command] ne "" &&
+            [automatic::is $user dict config mcp_servers $name]}] \
+            "STDIO definitions must be complete and effective in the base user layer"
+        require [huddle equal [definition $server] [definition [huddle get $user config mcp_servers $name]]] \
+            "STDIO definition differs from the base user layer"
+        # A definition in any other enabled layer is deliberately unsupported,
+        # even when a merge happens to produce the same effective values.
+        for {set i 0} {$i < [huddle llength $layers]} {incr i} {
+            set layer [huddle get $layers $i]
+            if {[huddle equal $layer $user] || ![nullable $layer disabledReason]} { continue }
+            require [expr {![huddle exists $layer config mcp_servers $name]}] "STDIO server has another configuration layer"
+        }
+        set prefix mcp_servers.$name; set found 0
+        foreach path [huddle keys $origins] {
+            if {$path ne "mcp_servers" && $path ne $prefix && [string first "$prefix." $path] != 0} { continue }
+            set origin [huddle get $origins $path]
+            require [expr {[automatic::is $origin dict name] &&
+                [huddle equal [huddle get $origin name] [huddle get $user name]] &&
+                [automatic::text $origin version] eq [automatic::text $user version]}] "STDIO effective provenance is overridden or invalid"
+            if {$path in [list mcp_servers $prefix $prefix.command]} { set found 1 }
+        }
+        require $found "STDIO effective provenance is missing"
+        lappend names $name
+    }
+    require [expr {[llength $names] > 0}] "no eligible user-layer STDIO MCP servers"
+    return [dict create file $file version [automatic::text $user version] names [lsort $names]]
+}
+proc mcp_reload::catalog {thread name {readiness 1}} {
+    set data [page mcpServerStatus/list [huddle create threadId [huddle string $thread] \
+        serverName [huddle string $name] detail [huddle string toolsAndAuthOnly]]]
+    require [expr {[huddle llength $data] == 1 && [automatic::text $data 0 name] eq $name}] \
+        "selected server is absent or ambiguous in captured thread"
+    set server [huddle get $data 0]
+    require [expr {[nullable $server pluginId] && [nullable $server httpOrigin]}] "thread server is not local user-layer STDIO"
+    set status [automatic::text $server runtimeStatus]
+    if {!$readiness} {
+        # Preflight establishes target identity; a failed or pending connection
+        # can still be reconnected. Only post-refresh evidence proves readiness.
+        require [expr {$status in {notStarted starting connected authenticationRequired failed cancelled} ||
+            [nullable $server runtimeStatus]}] "captured server is disabled or its runtime status is invalid"
+        return 1
+    }
+    require [expr {$status in {"" notStarted starting connected}}] "captured MCP connection failed, cancelled, disabled or requires authentication"
+    if {$status eq ""} {
+        require [nullable $server runtimeStatus] "invalid MCP runtime status"
+        return 0
+    }
+    if {$status ne "connected"} { return 0 }
+    require [expr {[automatic::is $server dict tools] && [automatic::is $server null toolsError] &&
+        [automatic::is $server list resources] && [automatic::is $server list resourceTemplates] &&
+        [automatic::is $server dict serverCapabilities] && [automatic::text $server serverInfo name] ne "" &&
+        [automatic::text $server serverInfo version] ne "" &&
+        [automatic::text $server authStatus] in {unknown unsupported bearerToken oAuth}}] \
+        "connected MCP server has no successful native catalog or metadata"
+    foreach key [huddle keys [huddle get $server tools]] {
+        require [expr {[automatic::text $server tools $key name] ne "" &&
+            [automatic::is $server dict tools $key inputSchema]}] "invalid native MCP tool catalog"
+    }
+    return 1
+}
+proc mcp_reload::force_run {} {
+    variable done; variable publication; variable wake
+    if {$done} { return }
+    try {
+        set captured [threads]
+        require [expr {[llength $captured] > 0}] "no loaded threads to verify; configuration unchanged"
+        set config [rpc config/read [huddle create includeLayers [huddle true] cwd [huddle null]]]
+        set selected [select $config]
+        set directories {}
+        foreach id $captured {
+            dict set directories $id [thread $id]
+            set local [rpc config/read [huddle create includeLayers [huddle true] cwd [huddle string [dict get $directories $id]]]]
+            set scope [select $local]
+            require [expr {$scope eq $selected}] "captured thread has unsupported configuration layers"
+            foreach name [dict get $selected names] {
+                require [huddle equal [huddle get $local config mcp_servers $name] [huddle get $config config mcp_servers $name]] \
+                    "captured thread has a different MCP definition"
+                catalog $id $name 0
+            }
+        }
+        set random [open /dev/urandom rb]
+        try { set generation [binary encode hex [read $random 16]] } finally { close $random }
+        require [expr {[string length $generation] == 32}] "generation creation failed"
+        set edits [huddle list]
+        foreach name [dict get $selected names] {
+            require [expr {[automatic::text $config config mcp_servers $name env CODEX_RETRY_MCP_GENERATION] ne $generation}] \
+                "generation did not rotate"
+            huddle append edits [huddle create keyPath [huddle string mcp_servers.$name.env.CODEX_RETRY_MCP_GENERATION] \
+                value [huddle string $generation] mergeStrategy [huddle string upsert]]
+        }
+        set publication uncertain
+        set written [rpc config/batchWrite [huddle create edits $edits filePath [huddle string [dict get $selected file]] \
+            expectedVersion [huddle string [dict get $selected version]] reloadUserConfig [huddle false]]]
+        if {[automatic::text $written status] in {ok okOverridden} &&
+            [automatic::text $written filePath] eq [dict get $selected file] && [automatic::text $written version] ne ""} {
+            set publication published
+        }
+        require [expr {$publication eq "published" && [automatic::text $written status] eq "ok" &&
+            [automatic::text $written version] ne [dict get $selected version] && [nullable $written overriddenMetadata]}] \
+            "configuration write was invalid, rejected or overridden"
+        set refreshed [rpc config/mcpServer/reload [huddle null]]
+        require [expr {![llength [huddle keys $refreshed]]}] "invalid reload acknowledgement"
+        # Confirm the published effective config before accepting connected catalogs.
+        set current [rpc config/read [huddle create includeLayers [huddle true] cwd [huddle null]]]
+        set effective [select $current]
+        require [expr {[dict get $effective file] eq [dict get $selected file] &&
+            [dict get $effective version] eq [automatic::text $written version] &&
+            [lsort [dict get $effective names]] eq [lsort [dict get $selected names]]}] "configuration changed during forced refresh"
+        set pending {}
+        foreach id $captured {
+            foreach name [dict get $selected names] {
+                require [expr {[automatic::text $current config mcp_servers $name env CODEX_RETRY_MCP_GENERATION] eq $generation}] \
+                    "published generation is not effective"
+                lappend pending [list $id $name]
+            }
+        }
+        for {set round 0} {$round < 20 && [llength $pending]} {incr round} {
+            set next {}
+            foreach pair $pending {
+                if {![catalog {*}$pair]} { lappend next $pair }
+            }
+            set pending $next
+            if {![llength $pending]} { break }
+            set wake 0
+            set timer [after 100 {set ::mcp_reload::wake 1}]
+            try { if {!$done} { vwait ::mcp_reload::wake } } finally { after cancel $timer }
+            require [expr {!$done}] "force transport stopped"
+        }
+        require [expr {![llength $pending]}] "native thread runtimeStatus remained unavailable, configuration-mismatched or pending; readiness cannot be verified"
+        set loaded [threads]
+        foreach id $captured {
+            require [expr {$id in $loaded}] "captured thread disappeared during refresh"
+            require [expr {[thread $id] eq [dict get $directories $id]}] "captured thread directory changed during refresh"
+        }
+        set final [rpc config/read [huddle create includeLayers [huddle true] cwd [huddle null]]]
+        set finalScope [select $final]
+        require [expr {[dict get $finalScope file] eq [dict get $selected file] &&
+            [dict get $finalScope version] eq [automatic::text $written version]}] "configuration changed during readiness verification"
+        foreach name [dict get $selected names] {
+            require [expr {[automatic::text $final config mcp_servers $name env CODEX_RETRY_MCP_GENERATION] eq $generation}] \
+                "generation changed during readiness verification"
+        }
+        require [expr {[clock milliseconds] < $::mcp_reload::deadline}] "transport deadline expired"
+        set done 1
+    } on error {reason options} {
+        if {[dict get $options -errorcode] ne {MCP_RELOAD SAFE}} { set reason "force operation failed" }
+        fail $reason
     }
 }
 
@@ -2966,7 +3284,21 @@ proc mcp_reload::event {channel type data} {
                     ![regexp {^-?(0|[1-9][0-9]*)$} [huddle get_stripped $object error code]] || \
                     ![automatic::is $object string error message])} { error "invalid RPC error" }
                 set id [json_dump [huddle get $object id]]
-                if {$phase eq "initialize" && $id eq "2"} { error "reload reply preceded initialization" }
+                set forceId [automatic::text $object id]
+                set ownedForce [regexp {^codex-retry-mcp-force-([1-9][0-9]*)$} $forceId -> forceSequence]
+                if {$phase eq "initialize" && ($id eq "2" || ($::mcp_reload::force && $ownedForce))} {
+                    error "reload reply preceded initialization"
+                }
+                if {$::mcp_reload::force && $phase ne "initialize"} {
+                    if {$ownedForce && ($forceSequence < 2 || $forceSequence > $::mcp_reload::sequence)} { error "force reply preceded its request" }
+                    if {$forceId ne "codex-retry-mcp-force-$::mcp_reload::sequence"} { return }
+                    if {[clock milliseconds] >= $deadline} { error "transport deadline expired" }
+                    if {$rejected} { error "$phase rejected by App Server (RPC [huddle get_stripped $object error code])" }
+                    if {![automatic::is $object dict result]} { error "invalid force response" }
+                    if {$::mcp_reload::reply ne ""} { error "duplicate force reply" }
+                    set ::mcp_reload::reply [huddle get $object result]
+                    return
+                }
                 if {$id ne [expr {$phase eq "initialize" ? "1" : "2"}]} { return }
                 if {[clock milliseconds] >= $deadline} { error "transport deadline expired" }
                 if {$rejected} { error "$phase rejected by App Server (RPC [huddle get_stripped $object error code])" }
@@ -2975,6 +3307,7 @@ proc mcp_reload::event {channel type data} {
                     if {[automatic::text $object result userAgent] eq ""} { error "invalid initialize acknowledgement" }
                     set phase reload
                     send [huddle create method [huddle string initialized]]
+                    if {$::mcp_reload::force} { after 0 mcp_reload::force_run; return }
                     send [huddle create id [huddle number 2] method [huddle string config/mcpServer/reload] \
                         params [huddle null]]
                 } else {
@@ -2994,9 +3327,11 @@ proc mcp_reload::ready {channel ready} {
     }
 }
 
-proc mcp_reload::run {} {
+proc mcp_reload::run {{forceMode 0}} {
     variable timeout; variable done; variable message; variable phase; variable deadline; variable backend
     set done 0; set message ""; set phase initialize
+    set ::mcp_reload::force $forceMode; set ::mcp_reload::sequence 1; set ::mcp_reload::reply ""
+    set ::mcp_reload::publication none
     set backend ""; set watchdog ""; set signals {}
     set deadline [expr {[clock milliseconds] + $timeout}]
     try {
@@ -3029,15 +3364,27 @@ proc mcp_reload::run {} {
         if {$backend ne ""} { close_backend $backend 1; set backend "" }
         dict for {signal previous} $signals { trap $previous $signal }
     }
-    if {$done != 1} { puts stderr "codex-retry reload-mcp: $message"; return 1 }
+    if {$done != 1} {
+        switch -- $::mcp_reload::publication {
+            published { append message "; generation published; readiness not verified" }
+            uncertain { append message "; generation publication uncertain; readiness not verified" }
+        }
+        puts stderr "codex-retry reload-mcp: $message"; return 1
+    }
+    if {$forceMode} {
+        puts "MCP generation published; refreshed STDIO connections and catalogs verified for captured loaded threads (server-wide refresh)."
+        return 0
+    }
     puts "MCP configuration reread; refresh queued for loaded threads (server-wide)."
     return 0
 }
 
 proc main {arguments} {
     if {[lindex $arguments 0] eq "reload-mcp"} {
-        if {[llength $arguments] != 1} { puts stderr "usage: codex-retry reload-mcp"; return 2 }
-        return [mcp_reload::run]
+        if {[llength $arguments] > 2 || ([llength $arguments] == 2 && [lindex $arguments 1] ne "--force")} {
+            puts stderr "usage: codex-retry reload-mcp ?--force?"; return 2
+        }
+        return [mcp_reload::run [expr {[llength $arguments] == 2}]]
     }
     global spawn_out tuiSpawn
     automatic::configure

@@ -10,14 +10,23 @@ On Debian/Ubuntu, install the Tcl dependencies with `sudo apt install expect tcl
 tDOM must be available through the normal Tcl package paths. A missing or older
 package stops startup before the wrapper starts the server or TUI.
 
-To reread MCP configuration from an existing conversation, an agent can run this
-exact command through its command tool; it needs no terminal:
+To reload MCP configuration or explicitly reconnect supported STDIO servers,
+run either helper without a terminal:
 
 ```sh
 codex-retry reload-mcp
+codex-retry reload-mcp --force
 ```
 
-No extra arguments are accepted. This explicit service command requires native
+From the native TUI, use its shell invocation syntax directly:
+
+```sh
+!codex-retry reload-mcp
+!codex-retry reload-mcp --force
+```
+
+These are shell commands, not custom native slash commands. Only the sole
+optional `--force` argument is accepted. Ordinary reload requires native
 `config/mcpServer/reload` support. It opens its own proxy connection, initializes
 it, and waits for the matching acknowledgement. Success means configuration was
 reread and refresh was **queued for all loaded threads on that server**. There is
@@ -27,6 +36,56 @@ History and existing TUI processes remain in place; this submits no model input.
 RPC errors, unsupported methods, malformed responses, disconnects and a fixed
 internal transport deadline return nonzero. Cleanup closes only this command's
 owned processes, leaving the shared server and other clients running.
+
+Ordinary reload never reads or writes configuration through the config API and
+never requires, adds, rotates, or removes a generation marker. Native Codex may
+reuse healthy unchanged MCP connections, so replacing a binary behind a stable
+command path alone does not guarantee reconnection.
+
+`--force` requires native `config/read`, version-checked `config/batchWrite`,
+thread metadata and thread-scoped `mcpServerStatus/list` support (API target:
+CLI 0.166.0). It creates or rotates `CODEX_RETRY_MCP_GENERATION` in each selected
+server's environment, using one atomic batch against the native user-layer
+version. It changes only those environment entries and explicitly leaves runtime
+settings reload disabled. A configuration conflict fails without an overwrite
+retry. All unrelated environment entries, commands, arguments, credentials,
+permission/model settings, disabled servers, and HTTP servers are preserved.
+Native defaults and timeout normalization are accounted for; standard per-tool
+approval and output limits and other untouched native settings are preserved.
+
+The supported scope is deliberately narrow: complete enabled local STDIO
+definitions supplied solely by one writable base user configuration layer, with
+server names containing only ASCII letters, digits, `_` or `-`. Selected
+definitions must match effective typed configuration and origin metadata, also
+when resolved from each captured thread's directory. Project, CLI/session,
+plugin, managed, profile, overridden or ambiguous STDIO definitions are refused;
+no partial user-layer definition is manufactured. Generation inheritance through
+`env_vars` is unsupported. Missing markers are valid. Unsupported setting shapes,
+no eligible servers, or no loaded verification targets fail before any write.
+An initially failed or pending connection can be reconnected when its
+configuration is eligible; it still has to pass the post-refresh readiness
+checks below.
+
+Force then requests the same **server-wide** refresh. It verifies every selected
+server in every thread captured from the fully paginated loaded-thread list.
+Thread-scoped native runtime status must be `connected`, with initialized server
+metadata and a successful tool catalog; RPC acceptance, a cached catalog alone,
+or elapsed time does not establish readiness. Native runtime status may be
+unavailable while configuration refresh is pending. Pending status gets at most
+20 observations separated by 100 ms, within the existing transport deadline;
+pagination is also bounded.
+Missing status, failed/cancelled initialization, authentication requirements,
+thread disappearance, malformed metadata, disconnection, or deadline exhaustion
+return nonzero. Newly loaded threads are outside the captured verification scope,
+although they are subject to the global refresh. A readiness receipt describes
+native connection/catalog verification, not proof of an arbitrary binary's
+identity. The private regression independently checks its fake server's version.
+
+If a generation write was published, or its outcome became uncertain before a
+later failure, the diagnostic says so and readiness remains unverified. The
+marker may remain in configuration; the helper makes no broad rollback attempt.
+Ordinary reload continues working with that marker unchanged. Force submits no
+model input and preserves loaded threads, history, and native asynchronous work.
 
 The helper runs only `codex app-server proxy`, preserving native environment-based
 server selection; it does not explicitly start or restart a daemon. With CLI
