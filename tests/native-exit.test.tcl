@@ -526,10 +526,10 @@ set pickerStage initial
 proc native_input {bytes} {
     control input data [js [binary encode base64 -maxlen 0 $bytes]]
 }
-proc clear_native {draft} {
+proc clear_native {draft {key "\025"}} {
     check {[screen::composer $draft]} "native never entered interactive mode after rendering history"
     set state [list $draft [expr {$::screen::x - [string length $draft]}] $::screen::frames]
-    native_input "\025"
+    native_input $key
     return $state
 }
 proc native_type {text {done {}}} {
@@ -602,9 +602,22 @@ proc observe {event} {
             select_picker
             if {$::reconnectStage eq "editing" && \
                 [screen::composer RECONNECT_DRAF!]} {
-                set ::reconnectStage clearing
-                token_usage
-                set ::clearState [clear_native RECONNECT_DRAF!]
+                # Without job control, native releases its terminal on Ctrl+Z and
+                # the wrapper continues it; only then does native probe its cursor.
+                set ::reconnectStage suspending
+                set ::suspendOffset [string length $::output]
+                native_input "\032"
+            }
+            if {$::reconnectStage eq "suspending"} {
+                set release [string first $::disablePaste $::output $::suspendOffset]
+                set reentry [expr {$release < 0 ? -1 : [string first $::enablePaste $::output $release]}]
+                if {$reentry >= 0 && [string first "\033\[6n" $::output $reentry] >= 0 && \
+                    [screen::composer RECONNECT_DRAF!]} {
+                    set ::reconnectStage clearing
+                    token_usage
+                    # An idle Ctrl+C clears the retained draft rather than exiting.
+                    set ::clearState [clear_native RECONNECT_DRAF! "\003"]
+                }
             }
             if {$::reconnectStage eq "clearing" && [screen::cleared {*}$::clearState]} {
                 set ::reconnectStage verified

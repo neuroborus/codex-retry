@@ -132,12 +132,25 @@ Recovery decisions use structured events exclusively. By default, only the
 overload/transport retry below is enabled; the optional recovery modes submit a new
 `continue` turn only when explicitly configured.
 Terminal input/output, window resizing, and TUI exit status pass through.
-`Ctrl+C` stays under native TUI control, including stopping an active turn and
-its normal repeat-to-exit behavior. If it arrives as `SIGINT`, the wrapper
-forwards a Ctrl+C keystroke to the TUI. Before the TUI starts, `SIGINT` cancels
-startup; `SIGTERM` and `SIGHUP` still close the wrapper.
-If wrapper input closes, it disconnects and drains the TUI's final output before
-reaping the child and restoring the terminal.
+`Ctrl+C` stays under native TUI control. While a turn is running, each press
+interrupts it. Otherwise a press clears a draft or closes an open prompt, and
+with nothing to clear it quits Codex; `/quit`, `/exit` and `Ctrl+D` in an empty
+composer quit as well. If Ctrl+C arrives as `SIGINT`, the wrapper forwards a
+Ctrl+C keystroke to the TUI. Before the TUI starts, `SIGINT` cancels startup;
+`SIGTERM` and `SIGHUP` still close the wrapper. Offline checks interrupt a
+running fake turn and quit with a second press, in raw and signal-generating
+terminal modes, also after a failed in-session `reload-mcp --force`. A report of
+Ctrl+C not closing a real session remains unreproduced; native `/quit` is the
+alternative. If wrapper input closes, it disconnects and drains the TUI's final
+output before reaping the child and restoring the terminal.
+
+`Ctrl+Z` suspends Codex together with `codex-retry` and returns the terminal to
+your shell in its original mode; `fg` resumes the same session. The shared
+server, its connections and background work keep running meanwhile. Without
+job control, the stop is discarded as it is for native Codex, which redraws and
+continues. An external editor that keeps the terminal in line mode receives
+Ctrl+Z as ordinary input.
+
 JSON decoding uses tDOM's public `dom parse -json -jsonroot`, `documentElement`,
 `jsonType`, `childNodes`, `nodeName` and `nodeValue` APIs, available in 0.9.3;
 newer conversion helpers are not required. The adapter preserves Huddle types
@@ -293,7 +306,10 @@ including a fresh explicit-YOLO launch with verified startup rights followed by
 selection of an unloaded synthetic saved session with native permissions.
 The wrapped native fixture also replaces a synthetic server connection and checks
 reauthentication, repeated initialization, same-session resume and draft retention,
-with every work request rejected before execution.
+with every work request rejected before execution. It suspends and resumes the
+native TUI without job control and clears a draft with Ctrl+C before exiting.
+Fake PTY checks cover Ctrl+Z under a job-control shell and without one; a
+signal-free check covers handoffs that must not proceed or whose stop fails.
 These checks do not verify real stored-session resume behavior or cover every
 Codex flag or subcommand. App Server is experimental, so check compatibility when
 upgrading Codex.

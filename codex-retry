@@ -2667,7 +2667,14 @@ proc close_backend {channel {descendants 0}} {
 
 # Restore the outer terminal even when the child could not run its exit code.
 # Mouse modes live in the emulator, independently of the saved termios state.
-namespace eval terminal { variable saved "" }
+namespace eval terminal {
+    variable saved ""
+    variable suspending 0
+    variable pending ""
+    # Ctrl+Z presses native decodes in its CSI-u and modifyOtherKeys modes. Only
+    # the TUI's raw mode enables them; the legacy byte is matched separately.
+    variable suspendKeys {\x1b\[(?:122(?::[0-9]*){0,2};(?:5|69|133|197)(?::[12])?u|27;5;122~)}
+}
 proc terminal::restore {} {
     variable saved
     if {$saved eq ""} { return }
@@ -2689,9 +2696,86 @@ proc terminal::interrupt {} {
     shutdown 130
 }
 
-# Owned pipe children must survive a terminal's foreground-group SIGINT.
+# A default stop returns the terminal to a job-control shell. As for native,
+# the kernel discards it when this process group is orphaned.
+proc terminal::stop {} {
+    set action [trap SIGTSTP]
+    trap SIG_DFL SIGTSTP
+    catch {exec kill -TSTP [pid]}
+    trap $action SIGTSTP
+}
+
+# The TUI keeps its terminal in raw mode except while it has released it.
+proc terminal::cooked {} {
+    expr {![catch {exec stty -a < $::spawn_out(slave,name)} modes] &&
+        [regexp {(?:^|\s)icanon(?:\s|$)} $modes]}
+}
+
+# Native Ctrl+Z restores its terminal, stops its own process group and waits
+# about a second for SIGCONT. Expect gives the TUI its own session, where the
+# kernel discards that stop, so suspend this job on its behalf. A given key is
+# forwarded here and is ordinary input to an already released terminal, such
+# as an external editor's; the other key encodings were already forwarded.
+proc terminal::suspend {{key ""}} {
+    variable suspending; variable pending; variable saved
+    if {![info exists ::tuiPid] || ![info exists ::tuiSpawn]} { stop; return }
+    if {$suspending} { return }
+    set suspending 1
+    set pending ""; set traps {}; set stopped 0; set blocking ""; set raw ""; set outer $saved
+    try {
+        if {$key ne ""} {
+            set editing [cooked]
+            catch {send -i $::tuiSpawn -- $key}
+            if {$editing} { return }
+        }
+        # Hand off only once the TUI has released its own terminal.
+        set released 0
+        for {set i 0} {$i < 30 && !$released} {incr i} {
+            after 10
+            set released [cooked]
+        }
+        if {!$released} { return }
+        # Signal the TUI's group only while the TUI leads its own session and is
+        # still this process's live, unreaped child, so its PID was not reused.
+        set tui [owned::identity $::tuiPid]
+        if {![owned::live $tui] || [lindex $tui 2] != [pid] || [lindex $tui 4] != [lindex $tui 0]} { return }
+        # Shutdown signals received while stopped wait until the TUI can exit.
+        foreach signal {SIGHUP SIGTERM} {
+            dict set traps $signal [trap $signal]
+            trap [list set ::terminal::pending $signal] $signal
+        }
+        if {[catch {exec kill -STOP -- -[lindex $tui 0]}]} { return }
+        set stopped 1
+        # Present the restoration bytes native wrote before it was stopped.
+        catch {
+            set blocking [fconfigure $::tuiSpawn -blocking]
+            fconfigure $::tuiSpawn -blocking 0
+            presentation::feed [read $::tuiSpawn]
+        }
+        catch {set raw [exec stty -g <@stdin]}
+        restore
+        stop
+    } finally {
+        # Undo whichever handoff steps ran, then resume only the stopped TUI.
+        if {$blocking ne ""} { catch {fconfigure $::tuiSpawn -blocking $blocking} }
+        set saved $outer
+        if {$raw ne ""} { catch {exec stty $raw <@stdin} }
+        if {$stopped} {
+            resize
+            if {[lrange [owned::identity [lindex $tui 0]] 0 1] eq [lrange $tui 0 1]} {
+                catch {exec kill -CONT -- -[lindex $tui 0]}
+            }
+        }
+        dict for {signal action} $traps { trap $action $signal }
+        set suspending 0
+        if {$pending ne ""} { uplevel #0 [dict get $traps $pending] }
+    }
+}
+
+# Owned pipe children must survive a terminal's foreground-group SIGINT and
+# SIGTSTP, so only the TUI and this process take part in job control.
 proc terminal::pipe {command mode} {
-    open [linsert $command 1 sh -c {trap '' INT; exec "$@"} codex-retry] $mode
+    open [linsert $command 1 sh -c {trap '' INT TSTP; exec "$@"} codex-retry] $mode
 }
 
 proc shutdown {status} {
@@ -3474,6 +3558,7 @@ proc main {arguments} {
     trap {shutdown 143} SIGTERM
     trap {shutdown 129} SIGHUP
     trap terminal::interrupt SIGINT
+    trap [list terminal::suspend \x1a] SIGTSTP
     lassign [chan pipe] ::diagnostics::channel ::diagnostics::writer
     fconfigure $::diagnostics::channel -blocking 0 -encoding binary -translation binary
     fileevent $::diagnostics::channel readable diagnostics::drain
@@ -3507,7 +3592,8 @@ proc main {arguments} {
             catch {exec kill -TERM $::tuiPid}
             # Keep draining the PTY during graceful exit and after forced exit.
             set killTimer [after 500 [list catch [list exec kill -KILL $::tuiPid]]]
-        } -output $tuiSpawn -input $tuiSpawn -re {[^\x00]+} {
+        } \x1a {terminal::suspend \x1a} -nobuffer -re $::terminal::suspendKeys terminal::suspend \
+            -output $tuiSpawn -input $tuiSpawn -re {[^\x00]+} {
             presentation::feed $interact_out(0,string)
         } null { presentation::feed "\x00" } -output $::user_spawn_id
     } finally {

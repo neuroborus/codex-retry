@@ -5721,6 +5721,53 @@ append pipeFixture {
         unset ::tuiSpawn
         terminal::interrupt
         if {$::interruptedStartup != 130} { error "SIGINT did not cancel startup" }
+        # Suspension decisions use recorded processes and modes; no signal is sent.
+        rename exec native_exec
+        proc exec {args} {
+            lappend ::calls $args
+            switch -- [lrange $args 0 1] {
+                {stty -a} { return [lindex $::modes [expr {min([incr ::probes], [llength $::modes]) - 1}]] }
+                {stty -g} { return fixture-raw }
+                {stty size} { return {24 80} }
+                {kill -STOP} { if {$::stopFails} { error "fixture: TUI group disappeared" } }
+                {kill -TSTP} { if {$::hangup} { uplevel #0 [trap SIGHUP] } }
+            }
+        }
+        proc send {args} { lappend ::calls [list send {*}$args] }
+        proc owned::identity {child} { return [lindex $::records [expr {$child != 4242}]] }
+        set ::tuiSpawn fixture-tui
+        set ::tuiPid 4242
+        set ::spawn_out(slave,name) fixture-slave
+        set ::terminal::saved fixture-outer
+        trap {lappend ::calls HUP_HANDLED} SIGHUP
+        trap {lappend ::calls TERM_HANDLED} SIGTERM
+        set handlers [list [trap SIGHUP] [trap SIGTERM]]
+        foreach {scenario modes stopFails hangup records} [list \
+            editor {icanon} 0 0 [list [list 4242 7 [pid] S 4242]] \
+            held {-icanon} 0 0 [list [list 4242 7 [pid] S 4242]] \
+            foreign {-icanon icanon} 0 0 [list [list 4242 7 1 S 4242]] \
+            vanished {-icanon icanon} 1 0 [list [list 4242 7 [pid] S 4242]] \
+            suspended {-icanon icanon} 0 1 [list [list 4242 7 [pid] S 4242]]] {
+            set calls {}; set probes 0
+            terminal::suspend "\032"
+            set signals [lsearch -all -inline -glob $calls {kill *}]
+            if {[lindex $calls 1] ne [list send -i fixture-tui -- "\032"] || \
+                [list [trap SIGHUP] [trap SIGTERM]] ne $handlers || $::terminal::suspending || \
+                $::terminal::saved ne "fixture-outer"} {
+                error "$scenario suspension leaked key, handler or terminal state: $calls"
+            }
+            set expected {}
+            if {$scenario in {vanished suspended}} { lappend expected {kill -STOP -- -4242} }
+            if {$scenario eq "suspended"} { lappend expected [list kill -TSTP [pid]] {kill -CONT -- -4242} }
+            if {$signals ne $expected || ($scenario ne "suspended" && [lsearch -glob $calls {stty -g*}] >= 0)} {
+                error "$scenario suspension signaled or released an unowned or running TUI: $calls"
+            }
+            set raw [lsearch -exact $calls {stty fixture-raw <@stdin}]
+            if {$scenario eq "suspended" && ([lindex $calls end] ne "HUP_HANDLED" || $raw < 0 || \
+                $raw > [lsearch -exact $calls {kill -CONT -- -4242}])} {
+                error "resumed TUI lost the raw terminal or a deferred hangup: $calls"
+            }
+        }
     } message]} { puts stderr $message; exit 1 }
 }
 set failed [catch {exec expect -c $pipeFixture 2>@1} message]
@@ -6304,11 +6351,17 @@ puts $channel {
     if {[lrange $argv 0 2] eq {app-server daemon start}} { exit 0 }
     if {[lindex $argv 0] eq "app-server"} {
         if {[lindex $argv 1] ne "proxy"} { exit 90 }
+        if {[info exists env(DIAGNOSTIC_RELOAD)]} {
+            # The in-session headless helper's backend never answers it.
+            proc ignore {args} {}
+            fixture::start ignore
+            vwait forever
+        }
         puts stderr BACKEND_START
         flush stderr
         trap SIG_IGN SIGTERM
         # Expect installs its own SIGINT trap, overriding the inherited ignore.
-        if {$mode eq "ctrl-c-isig"} { trap SIG_IGN SIGINT }
+        if {$mode in {ctrl-c-isig ctrl-c-reload-isig}} { trap SIG_IGN SIGINT }
         if {$mode eq "shutdown"} {
             trap {puts -nonewline stderr BACKEND_SHUTDOWN; flush stderr; exit 23} SIGTERM
         }
@@ -6385,6 +6438,7 @@ puts $channel {
     puts $identity [pid]
     close $identity
     if {[string match signal-* $mode]} { trap SIG_IGN SIGTERM }
+    if {[string match ctrl-z* $mode]} { trap {set ::continued 1} SIGCONT }
     set terminalMode [exec stty -g <@stdin]
     exec stty raw -echo <@stdin
     puts "\033\[?1003h\033\[?1006h\033\[?2004hLIVE_BEGIN\nDisconnected from this task. Any running work continues.\nTo reconnect, run:\nLIVE_LOOKALIKE\nLIVE_END"
@@ -6458,7 +6512,26 @@ puts $channel {
             return
         }
         if {$character eq ""} { set character [read stdin 1] }
-        if {$character eq "\003" && $::mode in {ctrl-c ctrl-c-isig signal-int}} {
+        if {$character eq "\032" && [string match ctrl-z* $::mode]} {
+            # Like native: release the terminal, stop the own (orphaned) process
+            # group, then wait about a second, counting steps rather than time.
+            puts -nonewline "\033\[?2004l"
+            flush stdout
+            exec stty $::terminalMode <@stdin
+            set ::continued 0
+            catch {exec kill -TSTP 0}
+            set longest 0
+            for {set i 0} {$i < 100 && !$::continued} {incr i} {
+                set start [clock milliseconds]
+                after 10
+                set longest [expr {max($longest, [clock milliseconds] - $start)}]
+            }
+            exec stty raw -echo <@stdin
+            puts "\033\[?2004hTUI_RESUMED continued=$::continued longest=$longest"
+            flush stdout
+            return
+        }
+        if {$character eq "\003" && $::mode in {ctrl-c ctrl-c-isig ctrl-c-reload ctrl-c-reload-isig signal-int}} {
             if {![info exists ::interrupted]} {
                 set ::interrupted 1
                 websocket::send $::socket text {{"id":9,"method":"turn/interrupt","params":{"threadId":"confirmed-session","turnId":"fixture-turn"}}}
@@ -6479,6 +6552,16 @@ puts $channel {
                 puts -nonewline stdout "\033\[?2004l\033\[?25hEDITOR_PROMPT> "
                 flush stdout
                 return
+            }
+            if {[string match ctrl-c-reload* $::mode]} {
+                # The reported sequence: a forced reload fails inside the session.
+                set ::env(DIAGNOSTIC_RELOAD) 1
+                set helper "set argv0 reload-deadline\n[list source $::env(DIAGNOSTIC_WRAPPER)]\nset ::mcp_reload::timeout 500\nexit \[main {reload-mcp --force}\]"
+                set failed [catch {exec expect -c $helper < /dev/null 2>@1} result]
+                unset ::env(DIAGNOSTIC_RELOAD)
+                if {!$failed || [string first "no correlated reply within 0.5 seconds during" $result] < 0} { exit 13 }
+                puts RELOAD_FAILED
+                flush stdout
             }
             websocket::send $::socket text {{"id":2,"method":"fixture/ping","params":{}}}
         } elseif {$character eq "r"} {
@@ -6527,6 +6610,11 @@ set diagnosticFixture {
         puts $channel {{"auto_reset_limit":true,"auto_continue_after_stop":true}}
         close $channel
     }
+    if {[string match ctrl-z* $env(DIAGNOSTIC_MODE)]} {
+        set channel [open $env(DIAGNOSTIC_WRAPPER_PID) w]
+        puts $channel [pid]
+        close $channel
+    }
     set terminalMode [exec stty -g <@stdin]
     rename wait native_wait
     proc wait {args} {
@@ -6566,8 +6654,11 @@ set diagnosticDriver {
     set sentEditorInput 0
     set sentBurstInput 0
     set sentInterrupt 0
+    set sentSuspend 0
+    set sentResume 0
     set sentExit 0
     set mode $env(DIAGNOSTIC_MODE)
+    set interrupts {ctrl-c ctrl-c-isig ctrl-c-reload ctrl-c-reload-isig signal-int}
     set active [expr {$mode ni {launchfail launchfail-closed missing}}]
     set failed [catch {
         expect {
@@ -6607,9 +6698,28 @@ set diagnosticDriver {
                     send -- "edited\r"
                     set sentEditorInput 1
                 }
+                # Native Ctrl+Z follows the first protocol round trip. A job-control
+                # shell regains the outer terminal in its original mode.
+                if {[string match ctrl-z* $mode] && !$sentSuspend && [regexp {(^|\n)PROTOCOL_OK\r*\n} $output]} {
+                    if {$mode eq "ctrl-z-isig"} { exec stty isig < $terminalPath }
+                    send -- "\032"
+                    set sentSuspend 1
+                }
+                if {$mode in {ctrl-z ctrl-z-isig} && !$sentResume && \
+                    [regexp {JOB_STOPPED=(\d+) OUTER_MODE=(\S+)} $output -> status outer]} {
+                    if {![regexp {BEFORE_MODE=(\S+)} $output -> before] || $outer ne $before || \
+                        $status != 128 + [exec kill -l TSTP]} {
+                        error "suspended job did not return the original outer terminal: $status"
+                    }
+                    # Keep the job stopped long enough to show the TUI stopped with it.
+                    after 400
+                    send -- "\r"
+                    set sentResume 1
+                }
                 if {!$sentBurstInput && ([string first BURST_READY $output] >= 0 || \
                     ($mode eq "recovery-stop" && [string first RECOVERY_EXACT $output] >= 0) || \
-                    ($mode in {ctrl-c ctrl-c-isig signal-int} && [string first TURN_INTERRUPTED $output] >= 0))} {
+                    ([string match ctrl-z* $mode] && [string first TUI_RESUMED $output] >= 0) || \
+                    ($mode in $interrupts && [string first TURN_INTERRUPTED $output] >= 0))} {
                     send -- r
                     set sentBurstInput 1
                 }
@@ -6617,7 +6727,8 @@ set diagnosticDriver {
                     ($mode ni {burst recovery-stop} || ([string first BURST_INPUT_OK $output] >= 0 && \
                         [string first BURST_PROTOCOL_OK $output] >= 0)) && \
                     ($mode ne "backend-eof" || [string first TUI_DISCONNECTED $output] >= 0) && \
-                    ($mode ni {ctrl-c ctrl-c-isig signal-int} || !$sentInterrupt || \
+                    (![string match ctrl-z* $mode] || [string first BURST_PROTOCOL_OK $output] >= 0) && \
+                    ($mode ni $interrupts || !$sentInterrupt || \
                         [string first BURST_PROTOCOL_OK $output] >= 0)} {
                     if {[string first CHAR_FORWARDED $output] < 0} { error "protocol response preceded input" }
                     if {$mode eq "recovery-no-credit" && \
@@ -6631,9 +6742,9 @@ set diagnosticDriver {
                          [string first RECOVERY_WARNING $output] >= 0)} {
                         error "repeated recovery hid native failures, changed input, or failed to end successfully"
                     }
-                    if {$mode in {ctrl-c ctrl-c-isig signal-int}} {
+                    if {$mode in $interrupts} {
                         foreach child [list $wrapper $backend $tui] { exec kill -0 $child }
-                        if {$mode eq "ctrl-c-isig"} { exec stty isig < $terminalPath }
+                        if {$mode in {ctrl-c-isig ctrl-c-reload-isig}} { exec stty isig < $terminalPath }
                         if {$mode eq "signal-int"} {
                             exec kill -INT $wrapper
                         } else { send -- "\003" }
@@ -6675,14 +6786,28 @@ set diagnosticDriver {
         if {$active && (!$sentExit || (!$::actualLaunch && [string first NATIVE_WAIT_COMPLETE $output] < 0))} {
             error "native input, wait, or terminal restoration was lost: $output"
         }
-        if {$mode in {ctrl-c ctrl-c-isig signal-int} && \
+        if {$mode in $interrupts && \
             (!$sentInterrupt || [regexp -all {TURN_INTERRUPTED} $output] != 1 || \
              [string first BURST_INPUT_OK $output] < 0 || [string first BURST_PROTOCOL_OK $output] < 0)} {
             error "first interrupt closed the TUI or broke input/protocol forwarding: $output"
         }
+        if {[string match ctrl-c-reload* $mode] && [string first RELOAD_FAILED $output] < 0} {
+            error "failed in-session reload was not exercised: $output"
+        }
+        if {[string match ctrl-z* $mode]} {
+            # A stopped TUI spends the held interval inside one waiting step.
+            if {!$sentSuspend || ![regexp {TUI_RESUMED continued=1 longest=(\d+)} $output -> longest] || \
+                [string first BURST_INPUT_OK $output] < 0 || [string first BURST_PROTOCOL_OK $output] < 0} {
+                error "suspended TUI did not resume its session, input and protocol: $output"
+            }
+            if {$mode ne "ctrl-z-orphan" && (!$sentResume || $longest < 300 || \
+                ![regexp {JOB_EXIT=7\r?\n} $output])} {
+                error "TUI did not stop and resume with its job: $output"
+            }
+        }
         if {$mode ne "missing"} {
             set enabled [string first "\033\[?1006h" $output]
-            set restored [string first "\033\[?1006l" $output]
+            set restored [string last "\033\[?1006l" $output]
             if {$enabled < 0 || $restored < $enabled} { error "mouse reporting survived TUI exit" }
             foreach text {{To resume this session, run:} {To choose a saved session, run:} {background app-server diagnostics} {codex-retry: fixture TUI launch failure}} {
                 set index [string first $text $output]
@@ -6770,7 +6895,7 @@ set diagnosticDriver {
         if {$mode in {closed launchfail-closed} && [string first BACKEND_ $output] >= 0} {
             error "closed stderr was bypassed"
         }
-        foreach identity [list $env(DIAGNOSTIC_PID) $env(DIAGNOSTIC_TUI_PID)] {
+        foreach identity [list $env(DIAGNOSTIC_PID) $env(DIAGNOSTIC_TUI_PID) $env(DIAGNOSTIC_WRAPPER_PID)] {
             if {![file exists $identity]} { continue }
             set channel [open $identity r]
             set child [string trim [read $channel]]
@@ -6783,7 +6908,7 @@ set diagnosticDriver {
         catch {exec kill -TERM $wrapper}
         catch {expect -timeout 2 eof}
         catch {exec kill -KILL $wrapper}
-        foreach identity [list $env(DIAGNOSTIC_PID) $env(DIAGNOSTIC_TUI_PID)] {
+        foreach identity [list $env(DIAGNOSTIC_PID) $env(DIAGNOSTIC_TUI_PID) $env(DIAGNOSTIC_WRAPPER_PID)] {
             catch {
                 set channel [open $identity r]
                 set child [string trim [read $channel]]
@@ -6819,17 +6944,34 @@ proc diagnostic_batch {channels} {
 }
 set jobs {}
 set failed [catch {
-    foreach mode {normal error burst shutdown closed backend-eof signal-term signal-hup signal-int ctrl-c ctrl-c-isig child-death launchfail launchfail-closed missing no-thread activation-error switched installed quoted external-editor recovery-no-credit recovery-stop} {
+    foreach mode {normal error burst shutdown closed backend-eof signal-term signal-hup signal-int ctrl-c ctrl-c-isig
+        ctrl-c-reload ctrl-c-reload-isig ctrl-z ctrl-z-isig ctrl-z-orphan child-death launchfail launchfail-closed missing
+        no-thread activation-error switched installed quoted external-editor recovery-no-credit recovery-stop} {
         set env(DIAGNOSTIC_MODE) $mode
         set env(DIAGNOSTIC_PID) [file join $scratch $mode.backend.pid]
         set env(DIAGNOSTIC_TUI_PID) [file join $scratch $mode.tui.pid]
+        set env(DIAGNOSTIC_WRAPPER_PID) [file join $scratch $mode.wrapper.pid]
         set launchedWrapper $wrapper
         set expectedLauncher codex-retry
         if {$mode eq "quoted"} { set launchedWrapper $quotedWrapper; set expectedLauncher $quotedWrapper }
+        set env(DIAGNOSTIC_WRAPPER) $launchedWrapper
         set configuredFixture "$diagnosticFixture\n[list set argv0 $launchedWrapper]\n[list source $launchedWrapper]\n"
         set actualLaunch [expr {$mode in {installed quoted}}]
         set launch [list expect -c $configuredFixture]
         if {$actualLaunch} { set launch [list $expectedLauncher --yolo] }
+        if {$mode in {ctrl-z ctrl-z-isig}} {
+            # A job-control shell owns the outer terminal around the wrapper job.
+            set env(DIAGNOSTIC_FIXTURE) $configuredFixture
+            set launch [list sh -c {set -m
+printf 'BEFORE_MODE=%s\n' "$(stty -g)"
+expect -c "$DIAGNOSTIC_FIXTURE"
+printf 'JOB_STOPPED=%s OUTER_MODE=%s\n' "$?" "$(stty -g)"
+read line
+fg >/dev/null
+status=$?
+printf 'JOB_EXIT=%s\n' "$status"
+exit "$status"}]
+        }
         set configuredDriver "set timeout 6\n[list set expectedLauncher $expectedLauncher]\n[list set launcherPath $launchedWrapper]\n[list set actualLaunch $actualLaunch]\n[list cd $scratch]\n[list spawn -noecho {*}$launch]\n$diagnosticDriver"
         lappend jobs [open [list | expect -c $configuredDriver 2>@1] r]
         if {[llength $jobs] == 8} {
@@ -6844,7 +6986,8 @@ set failed [catch {
 } message]
 if {[llength $jobs]} { catch {diagnostic_batch $jobs} }
 set env(PATH) $savedPath
-unset -nocomplain env(DIAGNOSTIC_MODE) env(DIAGNOSTIC_PID) env(DIAGNOSTIC_TUI_PID) env(DIAGNOSTIC_EMPTY_PATH)
+unset -nocomplain env(DIAGNOSTIC_MODE) env(DIAGNOSTIC_PID) env(DIAGNOSTIC_TUI_PID) env(DIAGNOSTIC_EMPTY_PATH) \
+    env(DIAGNOSTIC_WRAPPER_PID) env(DIAGNOSTIC_WRAPPER) env(DIAGNOSTIC_FIXTURE)
 file delete -force $scratch
 check {!$failed} "fake backend diagnostic isolation failed: $message"
 
