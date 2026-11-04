@@ -42,8 +42,13 @@ try {
         proc latency {direction} {
             # Escapes, Unicode, number spelling, unknown fields and envelope order
             # must survive unchanged in both directions, without a fake JSON decoder.
-            set envelope {"method" : "fixture/metadata"}
-            if {$direction eq "request"} { set envelope {"id" : 41, "method" : "fixture/echo"} }
+            if {$direction eq "notification"} {
+                # A dense structured tool result exercises the real item decoder.
+                set entry {{"text":"Neutral \" \\ \u0000 \u00e9 λ.","number":5.03e2,"large":9007199254740993123456789,"unknown":[],"empty":{}}}
+                return [format { { "params" : {"threadId":"latency-thread","turnId":"latency-turn","item":{"type":"mcpToolCall","id":"latency-tool","result":{"structuredContent":[%s]},"unknown":{}}}, "method" : "item/completed" } } \
+                    [join [lrepeat 25000 $entry] ,]]
+            }
+            set envelope {"id" : 41, "method" : "fixture/echo"}
             return [format { { "params" : {"text":"%s","number":5.03e2,"large":9007199254740993123456789,"unknown":[]}, %s } } \
                 [string repeat {Neutral \" \\ \u0000 \u00e9 λ. } 100000] $envelope]
         }

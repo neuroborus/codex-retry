@@ -159,6 +159,16 @@ requires a complete document, and deletes each temporary DOM even on rejection.
 Tcllib still provides WebSocket framing, Huddle containers and JSON writing.
 Unrelated two-field replies skip Huddle conversion after complete-document
 parsing and recursive duplicate checks through the same typed nodes.
+Backend `item/started` and `item/completed` notifications whose item has a
+string type other than `userMessage` keep only that item `type` for routing.
+After the whole document is validated, the other item members are deleted
+from the temporary DOM with the public node `delete` method. This avoids
+building Huddle values and the plain Tcl routing copy of tool results and
+other opaque item bodies. Complete-document parsing, strict validation
+(complete document, scalar types, number spellings and recursive
+decoded-duplicate checks, including in omitted payloads) and DOM deletion
+still run synchronously. User messages, turn snapshots, responses, settings,
+goals and failure classifier inputs are still converted in full.
 Validated messages pass through with their original JSON unless the wrapper
 changes them, such as the launch permission or directory adjustments.
 
@@ -166,11 +176,19 @@ Local synthetic characterization on Ubuntu tDOM 0.9.3 measured a
 1.85-million-character document at about 3.2 ms for parsing and Huddle conversion,
 compared with about 1919 ms for the previous strict decoder. An escaped-string
 fixture measured about 1.5 ms versus 655 ms, and 5000 objects took about 86 ms
-including conversion. These are local measurements, not portable timing promises
-or a profile proving the cause of every live input stall. Parsing and conversion
-still run synchronously; large or deeply nested documents can occupy the event
-loop. Offline fake-Codex PTY checks cover keyboard echo during multi-megabyte
-traffic, exact forwarding and cleanup.
+including conversion. A synthetic 3.81 MB `item/completed` notification with
+a nested tool result took about 3.2 s to decode and copy before item
+projection. A similar 3.78 MB fixture measured about 3.0 to 3.6 s with full
+conversion and about 0.4 to 0.5 s with projection on the same machine.
+These are local measurements, not portable timing promises or a profile
+proving the cause of every live input stall. Parsing, validation and the
+remaining conversion share the terminal's event loop: frames up to the
+128 MiB limit, large turn snapshots or large responses can still delay
+input, and Tcllib reads each frame synchronously. Native App Server 0.166.0
+limits each connection's outbound queue by message count, without a byte
+budget; this wrapper change neither fixes nor explains native memory growth.
+Offline fake-Codex PTY checks cover keyboard echo during multi-megabyte
+traffic, including a dense item notification, exact forwarding and cleanup.
 Dependency and source changes apply to new wrapper processes. Installing tDOM
 does not update interpreters or sessions that are already running.
 WebSocket messages are bounded to 128 MiB, matching the native Codex

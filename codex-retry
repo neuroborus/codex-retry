@@ -347,7 +347,7 @@ proc json_node {node {convert 1}} {
             # Scalar object properties have one typed text child in tDOM 0.9.3.
             set children [$node childNodes]
             if {[llength $children] != 1} { error "ambiguous JSON value" }
-            return [json_node [lindex $children 0]]
+            return [json_node [lindex $children 0] $convert]
         }
         STRING { return [huddle string [$node nodeValue]] }
         NUMBER { return [huddle number [$node nodeValue]] }
@@ -357,7 +357,7 @@ proc json_node {node {convert 1}} {
         default { error "unknown JSON node type" }
     }
 }
-proc json_decode {json {filter ""}} {
+proc json_decode {json {filter ""} {projection ""}} {
     # Tcl strings encode literal NUL specially; only escaped NUL is valid JSON.
     if {[string first "\u0000" $json] >= 0} { error "invalid JSON character" }
     set document [dom parse -json -jsonroot root -- $json]
@@ -368,11 +368,19 @@ proc json_decode {json {filter ""}} {
             json_node $root 0
             return ""
         }
+        if {$projection ne ""} {
+            set omitted [$projection $root]
+            if {[llength $omitted]} {
+                # Validate the complete document before omitting unread members.
+                json_node $root 0
+                foreach node $omitted { $node delete }
+            }
+        }
         return [json_node $root]
     } finally { $document delete }
 }
-proc automatic::decode {json {filter ""}} {
-    set object [json_decode $json $filter]
+proc automatic::decode {json {filter ""} {projection ""}} {
+    set object [json_decode $json $filter $projection]
     if {$filter ne "" && $object eq ""} { return "" }
     if {[huddle type $object] ne "dict"} { error "expected one object" }
     return $object
@@ -1956,8 +1964,9 @@ proc retry::fire {} {
     backend_send [json_dump $request]
 }
 
-# Keep unrelated catalogs out of Huddle conversion after tDOM validates the
-# complete document. Inspect only a two-field response through public DOM nodes.
+# Keep unrelated catalogs and opaque item bodies out of Huddle conversion after
+# tDOM validates the complete document. Inspect only a two-field response, or an
+# item notification's routing fields, through public DOM nodes.
 proc retry::unrelated {node} {
     if {[$node jsonType] ne "OBJECT" || [llength [$node childNodes]] != 2} { return 0 }
     set id ""
@@ -1984,11 +1993,38 @@ proc retry::unrelated {node} {
         $id ne [field $::automatic::current rpcId] && ![dict exists $::automatic::ids $id] && \
         ($::retry::current eq "" || $id ne [field $::retry::current rpcId])}]
 }
+proc retry::members {node} {
+    set members {}
+    if {[$node jsonType] eq "OBJECT"} {
+        foreach child [$node childNodes] { dict set members [$child nodeName] $child }
+    }
+    return $members
+}
+proc retry::scalar {node} {
+    set children [$node childNodes]
+    if {[$node jsonType] ne "NONE" || [llength $children] != 1} { return "" }
+    set child [lindex $children 0]
+    return [list [$child jsonType] [$child nodeValue]]
+}
+# Routing reads only the type of a non-user item; user messages stay complete.
+proc retry::opaque {node} {
+    set message [members $node]
+    if {[dict exists $message id] || ![dict exists $message method] || ![dict exists $message params] || \
+        [scalar [dict get $message method]] ni {{STRING item/started} {STRING item/completed}}} { return }
+    set params [members [dict get $message params]]
+    if {![dict exists $params item]} { return }
+    set item [members [dict get $params item]]
+    if {![dict exists $item type]} { return }
+    set type [scalar [dict get $item type]]
+    if {[lindex $type 0] ne "STRING" || [lindex $type 1] eq "userMessage"} { return }
+    dict unset item type
+    return [dict values $item]
+}
 
 # Hide internal replay replies and unconfirmed startup success; forward other traffic.
 proc retry::server {json} {
     variable current; variable internal; variable finished
-    if {[catch {automatic::decode $json retry::unrelated} object options]} {
+    if {[catch {automatic::decode $json retry::unrelated retry::opaque} object options]} {
         goal::reconcile
         set ::automatic::selection {}
         set ::recovery::helpers {}

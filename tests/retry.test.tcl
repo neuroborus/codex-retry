@@ -3817,9 +3817,13 @@ rename automatic::notify {}
 rename automatic::native_notify automatic::notify
 
 set unitPhase 11
-# Large startup catalogs must not stall keyboard forwarding in the event loop.
+# Large startup catalogs and dense tool results must not stall keyboard
+# forwarding in the event loop.
 set catalogItem {{"name":"fixture","id":"fixture","nested":{"description":"sample \"text\" {} []","method":"fixture/request","enabled":true,"values":[1,2,3]}}}
 set catalog "{\"id\":99,\"result\":{\"items\":\[[join [lrepeat 30000 $catalogItem] ,]\]}}"
+set denseEntry {{"kind":"fixture","text":"\" \u00e9 λ","values":[5.03e2,9007199254740993123456789,null],"empty":{},"list":[],"unknown":[{}]}}
+set denseItem [format {{"type":"mcpToolCall","id":"dense-tool","server":"fixture","tool":"sample","status":"completed","arguments":{},"result":{"structuredContent":{"items":[%s]},"unknown":[]}}} \
+    [join [lrepeat 30000 $denseEntry] ,]]
 foreach active {0 1 2 3} {
     retry::reset
     if {$active == 1} { begin 0 }
@@ -3834,6 +3838,9 @@ foreach active {0 1 2 3} {
     set before [clock milliseconds]
     check {[retry::server $catalog] == 1} "an unrelated startup catalog was hidden"
     check {[clock milliseconds] - $before < 1000} "startup catalog processing stalled terminal input"
+    set before [clock milliseconds]
+    check {[user_event item/completed $denseItem other-turn other-thread] == 1} "a dense tool result was hidden"
+    check {[clock milliseconds] - $before < 1000} "dense tool result processing stalled terminal input"
     if {$active} {
         check {$retry::current eq $previous && $resume::pending eq $previousResume && [dict size $timers] == 0} "an unrelated response changed the tracked request"
         check {$recovery::pending eq $previousRecovery} "an unrelated response changed recovery correlation"
@@ -3841,10 +3848,55 @@ foreach active {0 1 2 3} {
     resume::reset
     set recovery::pending {}
 }
-unset catalog catalogItem
-foreach invalid {{{"id":99,"result":{"nested":[{"a":1,"\u0061":2}]}}} {{"id":99,"result":{}} trailing} {{"id":99,"result":{/* comment */}}}} {
-    check {[catch {retry::server $invalid}]} "unrelated response bypassed strict JSON validation"
+unset catalog catalogItem denseEntry
+# Omitted tool output remains observable progress for the tracked turn.
+begin
+user_event item/completed $denseItem
+completed turn1
+check {[dict size $timers] == 0} "a dense tool result lost turn progress"
+set domCommands [lsort [info commands ::dom*]]
+foreach invalid {
+    {{"id":99,"result":{"nested":[{"a":1,"\u0061":2}]}}} {{"id":99,"result":{}} trailing} {{"id":99,"result":{/* comment */}}}
+    {{"method":"item/completed","params":{"threadId":"t1","turnId":"turn1","item":{"type":"mcpToolCall","result":{"nested":[{"a":1,"\u0061":2}]}}}}}
+    {{"method":"item/completed","params":{"threadId":"t1","turnId":"turn1","item":{"type":"userMessage","\u0074ype":"mcpToolCall","result":{}}}}}
+    {{"method":"item/completed","params":{"threadId":"t1","turnId":"turn1","item":{"type":"userMessage"},"item":{"type":"mcpToolCall","result":{}}}}}
+    {{"method":"item/completed","params":{"threadId":"t1","turnId":"turn1","item":{"type":"mcpToolCall","result":{}}}} trailing}
+} {
+    check {[catch {retry::server $invalid}]} "an omitted payload bypassed strict JSON validation"
 }
+check {[lsort [info commands ::dom*]] eq $domCommands} "rejected omitted payloads leaked DOM commands"
+unset domCommands
+
+# Item projection keeps typed user echoes, routing and classifier inputs complete.
+set opaqueUser [string map {{"type":"userMessage"} {"\u0074ype":"userMessage","opaque":{"nested":[{},[]],"number":5.03e2}}} $userItem]
+foreach {item expected} [list $opaqueUser 1 [string map {{"text":"original} {"text":"foreign}} $opaqueUser] 0] {
+    begin 0
+    user_event item/started $item
+    started turn1
+    completed turn1
+    reply 7 turn1
+    check {[dict size $timers] == $expected} "opaque user item members changed echo correlation"
+}
+begin
+completed turn1
+fire
+reply [json_dump [huddle get [::huddle::json2huddle [lindex $sent end]] id]] turn2
+set previous $retry::current
+user_event item/completed {{"type":"commandExecution","id":"stale-tool","output":{"nested":[{}]}}} turn1
+user_event item/completed {{"type":"commandExecution","id":"foreign-tool","output":{"nested":[{}]}}} turn2 other-thread
+check {$retry::current eq $previous && [dict size $timers] == 0} "a stale or foreign tool item changed the retry"
+started manual-turn
+check {$retry::current eq ""} "a manual turn change after tool items kept the retry"
+foreach {error expected} {
+    {"message":"synthetic failure","codexErrorInfo":"serverOverloaded"} 1
+    {"message":"synthetic failure","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":503,"unknown":null}}} 0
+} {
+    begin
+    user_event item/completed $denseItem turn1 other-thread
+    retry::server [format {{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"turn1","status":"failed","items":[],"error":{%s}}}}} $error]
+    check {[dict size $timers] == $expected} "a foreign tool result changed failure classification"
+}
+unset denseItem opaqueUser item expected previous error
 
 begin
 check {[retry::server {{"id":99,"result":{}}}] == 1} "empty JSON objects broke protocol forwarding"
